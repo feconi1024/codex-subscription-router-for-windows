@@ -16,6 +16,8 @@ auth.json
 control-token
 state.json
 
+AGENTS.md
+
 # Signing and local credentials must never enter source control.
 .env
 .env.*

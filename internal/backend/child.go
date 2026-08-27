@@ -190,6 +190,7 @@ func (c *Child) removePending(key string) {
 }
 
 func withEnvironment(environment []string, key, value string) []string {
+	prefix := key + "="
 	result := make([]string, 0, len(environment)+1)
 	for _, entry := range environment {
 		if !environmentEntryHasKey(entry, key) {
