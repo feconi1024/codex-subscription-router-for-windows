@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/b-nnett/codex-subscription-router/internal/control"
@@ -60,7 +59,7 @@ func run() error {
 		return err
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := signal.NotifyContext(context.Background(), shutdownSignals()...)
 	defer cancel()
 	multiplexer, err := mux.New(mux.Options{
 		RealExecutable: realExecutable,
@@ -124,18 +123,22 @@ func run() error {
 }
 
 func resolveRealExecutable() (string, error) {
-	if configured := os.Getenv("CODEX_MUX_REAL_CODEX"); configured != "" {
-		return configured, nil
+	realExecutable := os.Getenv("CODEX_MUX_REAL_CODEX")
+	if realExecutable == "" {
+		executable, err := os.Executable()
+		if err != nil {
+			return "", fmt.Errorf("resolve wrapper executable: %w", err)
+		}
+		realExecutable = realExecutablePath(executable)
 	}
-	executable, err := os.Executable()
-	if err != nil {
-		return "", fmt.Errorf("resolve wrapper executable: %w", err)
-	}
-	realExecutable := filepath.Join(filepath.Dir(executable), "codex.real")
 	if _, err := os.Stat(realExecutable); err != nil {
-		return "", fmt.Errorf("find bundled codex.real: %w", err)
+		return "", fmt.Errorf("find real Codex executable %q: %w", realExecutable, err)
 	}
 	return realExecutable, nil
+}
+
+func realExecutablePath(wrapperExecutable string) string {
+	return filepath.Join(filepath.Dir(wrapperExecutable), defaultRealExecutableName())
 }
 
 func isInteractiveAppServer(args []string) bool {

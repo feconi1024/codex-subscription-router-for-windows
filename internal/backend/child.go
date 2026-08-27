@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -140,7 +139,7 @@ func (c *Child) Close() error {
 	if c.command.Process == nil {
 		return nil
 	}
-	return c.command.Process.Signal(os.Interrupt)
+	return terminateProcess(c.command.Process)
 }
 
 func (c *Child) readLoop(stdout io.Reader) {
@@ -191,10 +190,9 @@ func (c *Child) removePending(key string) {
 }
 
 func withEnvironment(environment []string, key, value string) []string {
-	prefix := key + "="
 	result := make([]string, 0, len(environment)+1)
 	for _, entry := range environment {
-		if !strings.HasPrefix(entry, prefix) {
+		if !environmentEntryHasKey(entry, key) {
 			result = append(result, entry)
 		}
 	}
