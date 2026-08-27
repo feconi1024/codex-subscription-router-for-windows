@@ -11,10 +11,15 @@ __pycache__/
 *.pkg
 *.pfx
 *.zip
+*.exe
 .codex-mux/
 auth.json
 control-token
 state.json
+
+# Windows Desktop MVP local staging and packaging outputs.
+.codex-router-windows-*/
+Codex Subscription Router/
 
 AGENTS.md
 

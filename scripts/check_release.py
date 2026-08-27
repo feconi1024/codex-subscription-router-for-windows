@@ -86,7 +86,9 @@ def main() -> int:
         fail("package-lock.json does not match the declared @electron/asar version")
     if package.get("license") != "MIT":
         fail("package.json license does not match LICENSE")
-    if not ((ROOT / "install.sh").stat().st_mode & 0o111):
+    # Windows checkouts do not expose the Git executable bit through NTFS
+    # permissions; the macOS/Linux release job remains the authority for it.
+    if sys.platform != "win32" and not ((ROOT / "install.sh").stat().st_mode & 0o111):
         fail("install.sh is not executable")
 
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
@@ -116,7 +118,8 @@ def main() -> int:
             fail(f"curated screenshot is not a PNG: {relative}")
 
     tracked_output = subprocess.check_output(
-        ["git", "ls-files", "-z"], cwd=ROOT
+        ["git", "-c", f"safe.directory={ROOT.as_posix()}", "ls-files", "-z"],
+        cwd=ROOT,
     )
     tracked = [Path(value.decode("utf-8")) for value in tracked_output.split(b"\0") if value]
     for relative in tracked:

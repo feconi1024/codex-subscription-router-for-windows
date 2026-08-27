@@ -72,5 +72,23 @@ jobs:
       - name: Vet Go packages
         run: go vet ./...
 
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "22.12"
+          package-manager-cache: false
+
+      - name: Install ASAR build dependency
+        run: npm ci --ignore-scripts
+
       - name: Build codex-mux
         run: go build ./cmd/codex-mux
+
+      - name: Build Windows launcher
+        run: go build ./cmd/codex-router-launcher
+
+      - name: Check Windows patcher syntax
+        run: python -m compileall -q scripts
+
+      - name: Test Windows patcher helpers
+        run: python -m unittest discover -s scripts/tests -p "test_*.py"
