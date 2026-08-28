@@ -13,20 +13,35 @@ from scripts.patch_common import (
     ensure_asar_tool,
     patch_renderer,
 )
-from scripts.patch_app_windows import pack_asar, verify_asar_listing
+from scripts.patch_app_windows import audit_windows_source, pack_asar, verify_asar_listing
 from scripts.windows.compatibility import load_compatibility_records
 from scripts.windows.bootstrap import patch_bootstrap
 from scripts.windows.discovery import (
     AuthenticodeMetadata,
+    DesktopSource,
+    PackageMetadata,
+    RunningProcessCandidate,
+    SourceDiagnostics,
+    SourceProbeResult,
     copy_byte_identical,
+    desktop_source_from_executable,
     discover_real_codex,
+    format_source_diagnostics,
     locate_desktop_source,
+    parse_appx_block_map,
+    read_appx_manifest_aumids,
+    read_appx_manifest_metadata,
+    recognize_start_app_aumids,
+    select_running_process,
 )
 from scripts.windows.fuses import SENTINEL, disable_asar_integrity_validation, read_fuses
 from scripts.windows.mirror import (
+    DirectoryEnumerationBlockedError,
+    PackagingBlockedError,
     derive_unpack_directories,
     derive_unpack_files,
     mirror_directory,
+    mirror_desktop_source,
     should_exclude,
 )
 
@@ -75,6 +90,237 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                 source = locate_desktop_source(root)
             self.assertEqual(source.executable.name, "ChatGPT.exe")
             self.assertEqual(source.app_asar, resources / "app.asar")
+
+    def test_running_process_selection_prefers_official_chatgpt_path(self) -> None:
+        candidates = [
+            RunningProcessCandidate(
+                pid=10,
+                name="codex.exe",
+                executable=Path(r"C:\Users\test\.vscode\extensions\codex.exe"),
+            ),
+            RunningProcessCandidate(
+                pid=11,
+                name="ChatGPT.exe",
+                executable=Path(r"C:\Users\test\AppData\Local\OpenAI\ChatGPT\ChatGPT.exe"),
+            ),
+            RunningProcessCandidate(
+                pid=12,
+                name="ChatGPT.exe",
+                executable=Path(r"C:\Program Files\WindowsApps\OpenAI.Codex_1.0.0.0_x64__publisher\app\ChatGPT.exe"),
+            ),
+        ]
+        selected = select_running_process(candidates)
+        self.assertIsNotNone(selected)
+        self.assertIn("WindowsApps", str(selected.executable))
+
+        legacy = select_running_process(
+            [
+                RunningProcessCandidate(
+                    pid=13,
+                    name="codex.exe",
+                    executable=Path(r"C:\Users\test\AppData\Local\OpenAI\Codex\Codex.exe"),
+                )
+            ]
+        )
+        self.assertEqual(legacy.name, "codex.exe")
+
+    def test_known_executable_derives_package_layout_without_parent_enumeration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            package_root = Path(temporary) / "OpenAI.Codex_1.0.0.0_x64__publisher"
+            app = package_root / "app"
+            (app / "resources").mkdir(parents=True)
+            executable = app / "ChatGPT.exe"
+            executable.write_bytes(b"desktop")
+            (app / "resources" / "app.asar").write_bytes(b"asar")
+            package = PackageMetadata(
+                name="OpenAI.Codex",
+                package_full_name=package_root.name,
+                version="1.0.0.0",
+                install_location=package_root,
+                architecture="X64",
+            )
+            with patch("scripts.windows.discovery.read_file_version", return_value="1.2.3"), patch(
+                "pathlib.Path.iterdir", side_effect=AssertionError("source parent enumeration is forbidden")
+            ):
+                source = desktop_source_from_executable(
+                    executable,
+                    package=package,
+                    source_kind="running-process",
+                )
+            self.assertEqual(source.source_root, package_root)
+            self.assertEqual(source.app_dir, app)
+            self.assertEqual(source.app_asar, app / "resources" / "app.asar")
+
+    def test_start_apps_recognition_uses_aumid_not_display_name(self) -> None:
+        rows = [
+            {"Name": "Localized product name", "AppID": "OpenAI.Codex_2p2nqsd0c76g0!App"},
+            {"Name": "ChatGPT", "AppID": "OpenAI.ChatGPT_2p2nqsd0c76g0!App"},
+            {"Name": "Codex", "AppID": "Vendor.Codex_other!App"},
+            {"Name": "OpenAI", "AppID": "OpenAI.Codex_2p2nqsd0c76g0!Other"},
+        ]
+        self.assertEqual(
+            recognize_start_app_aumids(rows),
+            ("OpenAI.ChatGPT_2p2nqsd0c76g0!App", "OpenAI.Codex_2p2nqsd0c76g0!App"),
+        )
+
+    def test_manifest_metadata_and_aumid_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            package_root = Path(temporary) / "OpenAI.Codex_26.820.7780.0_x64__2p2nqsd0c76g0"
+            package_root.mkdir()
+            (package_root / "AppxManifest.xml").write_text(
+                "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
+                "<Identity Name=\"OpenAI.Codex\" Publisher=\"CN=publisher\" "
+                "Version=\"26.820.7780.0\" ProcessorArchitecture=\"x64\"/>"
+                "<Applications><Application Id=\"App\" Executable=\"app/ChatGPT.exe\"/>"
+                "<Application Id=\"Updater\" Executable=\"app/Updater.exe\"/></Applications></Package>",
+                encoding="utf-8",
+            )
+            metadata, error = read_appx_manifest_metadata(package_root)
+            self.assertIsNone(error)
+            self.assertEqual(metadata.publisher, "CN=publisher")
+            self.assertEqual(
+                read_appx_manifest_aumids(package_root, metadata),
+                ("OpenAI.Codex_2p2nqsd0c76g0!App", "OpenAI.Codex_2p2nqsd0c76g0!Updater"),
+            )
+
+    def test_appx_block_map_rejects_parent_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "AppxBlockMap.xml"
+            path.write_text(
+                "<BlockMap><File Name=\"app/../outside.exe\"><Block Hash=\"x\"/></File></BlockMap>",
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError):
+                parse_appx_block_map(path)
+
+    def test_block_map_mirror_is_used_after_directory_enumeration_denial(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package_root = root / "package"
+            app = package_root / "app"
+            resources = app / "resources"
+            resources.mkdir(parents=True)
+            (app / "ChatGPT.exe").write_bytes(b"desktop")
+            (app / "resources.pak").write_bytes(b"pak")
+            (resources / "app.asar").write_bytes(b"asar")
+            (resources / "cua_node").mkdir()
+            (resources / "cua_node" / "node.exe").write_bytes(b"optional")
+            (package_root / "AppxBlockMap.xml").write_text(
+                "<BlockMap>"
+                "<File Name=\"app/ChatGPT.exe\"/><File Name=\"app/resources.pak\"/>"
+                "<File Name=\"app/resources/app.asar\"/>"
+                "<File Name=\"app/resources/cua_node/node.exe\"/>"
+                "</BlockMap>",
+                encoding="utf-8",
+            )
+            source = DesktopSource(
+                source_root=package_root,
+                app_dir=app,
+                executable=app / "ChatGPT.exe",
+                resources_dir=resources,
+                app_asar=resources / "app.asar",
+                package=PackageMetadata(name="OpenAI.Codex"),
+                source_kind="appx",
+                file_version="1.0.0",
+            )
+            destination = root / "mirror"
+            with patch(
+                "scripts.windows.mirror.mirror_directory",
+                side_effect=DirectoryEnumerationBlockedError("access denied"),
+            ):
+                report = mirror_desktop_source(source, destination)
+            self.assertEqual(report.strategy, "appx-block-map")
+            self.assertTrue((destination / "ChatGPT.exe").is_file())
+            self.assertTrue((destination / "resources.pak").is_file())
+            self.assertTrue((destination / "resources" / "app.asar").is_file())
+            self.assertFalse((destination / "resources" / "cua_node").exists())
+            self.assertTrue(any("cua_node" in item for item in report.excluded))
+
+    def test_required_mirror_copy_failure_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "ChatGPT.exe").write_bytes(b"desktop")
+            with patch(
+                "scripts.windows.mirror.shutil.copy2",
+                side_effect=OSError("access denied"),
+            ):
+                with self.assertRaises(PackagingBlockedError):
+                    mirror_directory(source, root / "destination")
+
+    def test_source_probe_output_is_structured_and_non_sensitive(self) -> None:
+        diagnostics = SourceDiagnostics(
+            probes=[SourceProbeResult("test-method", "PASS", ("C:/candidate",))]
+        )
+        rendered = format_source_diagnostics(diagnostics)
+        self.assertIn("test-method: PASS", rendered)
+        self.assertEqual(diagnostics.to_dict()["probes"][0]["status"], "PASS")
+
+    def test_audit_only_does_not_modify_source_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / "app"
+            resources = app / "resources"
+            resources.mkdir(parents=True)
+            executable = app / "ChatGPT.exe"
+            executable.write_bytes(b"desktop")
+            asar = resources / "app.asar"
+            asar.write_bytes(b"asar")
+            (root / "AppxManifest.xml").write_text("<Package><Identity Name=\"OpenAI.Codex\"/></Package>", encoding="utf-8")
+            (root / "AppxBlockMap.xml").write_text(
+                "<BlockMap><File Name=\"app/ChatGPT.exe\"/><File Name=\"app/resources/app.asar\"/></BlockMap>",
+                encoding="utf-8",
+            )
+            source = DesktopSource(
+                source_root=root,
+                app_dir=app,
+                executable=executable,
+                resources_dir=resources,
+                app_asar=asar,
+                package=PackageMetadata(name="OpenAI.Codex"),
+                source_kind="fixture",
+                file_version="1.0.0",
+            )
+            executable_before = executable.read_bytes()
+            asar_before = asar.read_bytes()
+            with patch("scripts.patch_app_windows.ensure_asar_tool", return_value=Path("asar")), patch(
+                "scripts.patch_app_windows.read_file_versions",
+                return_value={"FileVersion": "1.0.0", "ProductVersion": "1.0.0"},
+            ), patch(
+                "scripts.patch_app_windows.read_authenticode",
+                return_value=AuthenticodeMetadata("Valid", "CN=OpenAI"),
+            ), patch(
+                "scripts.patch_app_windows.read_fuses",
+                side_effect=RuntimeError("fixture has no fuse sentinel"),
+            ), patch("scripts.patch_app_windows.run"), patch(
+                "scripts.patch_app_windows.audit_renderer_anchors", return_value=[]
+            ):
+                result = audit_windows_source(source)
+            self.assertEqual(result["electron_fuses"]["status"], "UNAVAILABLE")
+            self.assertEqual(executable.read_bytes(), executable_before)
+            self.assertEqual(asar.read_bytes(), asar_before)
+
+    def test_semantic_renderer_counterpart_is_not_patchable_by_old_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            extracted = Path(temporary)
+            webview = extracted / "webview"
+            assets = webview / "assets"
+            assets.mkdir(parents=True)
+            (webview / "index.html").write_text("connect-src &#39;self&#39;", encoding="utf-8")
+            (assets / "app-initial-current.js").write_text(
+                "function QLs(e){return e}"
+                "function c6s(e){let t=(0,u6s.c)(28),{defaultResetCreditsOpen:n,"
+                "errorMessage:r,initialAvailableCount:i,isResetting:a,onClose:o,"
+                "onResetCredit:s}=e,{data:c}=lH(),{data:l}=J(BO),"
+                "{data:u,isLoading:d}=WAa()",
+                encoding="utf-8",
+            )
+            audit = audit_renderer_anchors(extracted)
+            usage = next(item for item in audit if item.name == "native usage modal")
+            self.assertEqual(usage.status, "SEMANTICALLY_CHANGED")
+            with self.assertRaises(RuntimeError):
+                patch_renderer(extracted, "c" * 64)
 
     def test_real_codex_prefers_valid_openai_signature(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -313,7 +559,7 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             self.assertEqual(statuses["Plugins settings content"], "MOVED")
             self.assertEqual(statuses["usage-window selection"], "UNCHANGED")
             self.assertFalse(
-                any(item.status in {"NO LONGER PRESENT", "AMBIGUOUS"} for item in audit),
+                any(item.status in {"MISSING", "SEMANTICALLY_CHANGED", "AMBIGUOUS"} for item in audit),
                 audit,
             )
             patch_renderer(extracted, "b" * 64)

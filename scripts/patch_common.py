@@ -92,6 +92,7 @@ def _variant(
     asset: str,
     current: str,
     renamed: str | None = None,
+    semantic: str | None = None,
 ) -> AnchorAudit:
     current_count = text.count(current)
     if current_count == 1:
@@ -104,7 +105,13 @@ def _variant(
             return AnchorAudit(name, asset, "RENAMED", "renamed", renamed_count)
         if renamed_count > 1:
             return AnchorAudit(name, asset, "AMBIGUOUS", "renamed", renamed_count)
-    return AnchorAudit(name, asset, "NO LONGER PRESENT", None, 0)
+    if semantic is not None:
+        semantic_count = text.count(semantic)
+        if semantic_count == 1:
+            return AnchorAudit(name, asset, "SEMANTICALLY_CHANGED", "semantic", semantic_count)
+        if semantic_count > 1:
+            return AnchorAudit(name, asset, "AMBIGUOUS", "semantic", semantic_count)
+    return AnchorAudit(name, asset, "MISSING", None, 0)
 
 
 def _asset_with_anchor(
@@ -119,7 +126,7 @@ def _asset_with_anchor(
         return matching[0][0], AnchorAudit(name, glob_label, "UNCHANGED", str(matching[0][0].name), 1)
     if len(matching) > 1 or any(count > 1 for _, count in matching):
         return None, AnchorAudit(name, glob_label, "AMBIGUOUS", None, sum(count for _, count in matching))
-    return None, AnchorAudit(name, glob_label, "NO LONGER PRESENT", None, 0)
+    return None, AnchorAudit(name, glob_label, "MISSING", None, 0)
 
 
 def _require_unique(text: str, anchor: str, message: str) -> None:
@@ -311,13 +318,98 @@ def _renderer_variant_values(bundle: str) -> dict[str, object]:
     }
 
 
+def _observed_renderer_semantic_anchors(bundle: str) -> dict[str, str]:
+    """Identify exact semantic counterparts seen in the acquired 26.820 build.
+
+    These are audit evidence only. They deliberately do not make that build
+    patchable: the replacement code still requires the historical exact
+    anchors, and ``patch_renderer`` fails closed for every semantic change.
+    """
+    return {
+        "native profile menu": (
+            "function Jyl(e){let t=(0,Yyl.c)(33),{accountIcon:n,accountLabel:r,"
+            "additionalItems:i,displayName:a,identityItems:o,isPetVisible:s,"
+            "onCopyUserId:c,onLogOut:l,onOpenProfile:u,onOpenSettings:d,"
+            "onOpenWorkspaceSettings:f,onTogglePet:p,settingsShortcut:m,"
+            "usageItems:h,workspaceSettingsRightIcon:g}=e"
+        ),
+        "app-server request bridge": (
+            "function qg(e,t){let n=e.get(Jg);if(n==null)throw Error("
+            "`AppServerManager RPC is not connected`);return n.forHost(t)}"
+        ),
+        "profile statistics request": (
+            "async function n2a(){let e=await Ob.safeGet(`/wham/profiles/me`);"
+            "return{activityInsights:u2a(e.stats)"
+        ),
+        "native usage modal": (
+            "function c6s(e){let t=(0,u6s.c)(28),{defaultResetCreditsOpen:n,"
+            "errorMessage:r,initialAvailableCount:i,isResetting:a,onClose:o,"
+            "onResetCredit:s}=e,{data:c}=lH(),{data:l}=J(BO),"
+            "{data:u,isLoading:d}=WAa()"
+        ),
+        "reset-credit query": (
+            "function WAa(){let e=(0,uH.c)(1),t;return e[0]==="
+            "Symbol.for(`react.memo_cache_sentinel`)?(t={queryKey:["
+            "`rate-limit-reset-credits`],queryFn:GAa"
+        ),
+        "reset-credit mutation": (
+            "function KAa(){let e=(0,uH.c)(3),t=lt(),n=AS(),r;return "
+            "e[0]!==n||e[1]!==t?(r={mutationFn:qAa"
+        ),
+        "usage sheet header": (
+            "id:`codex.rateLimitResetPromptModal.usageTrackingHeading`,"
+            "defaultMessage:`Usage`"
+        ),
+        "usage menu slot": "usageItems:wt",
+        "list-apps RPC mapping": (
+            "async function g9r({scope:e,forceRefetch:t,hostId:n}){try{"
+            "let r=async(i,a)=>{let o=await qg(e,n).sendRequest(`app/list`"
+        ),
+        "list-installed-apps RPC mapping": (
+            "async function h9r({scope:e,forceRefresh:t=!1,hostId:n}){try{"
+            "let r=(await qg(e,n).sendRequest(`app/installed`"
+        ),
+        "read-apps RPC mapping": "qg(e,n).sendRequest(`app/read`,{appIds:t})",
+        "login-mcp-server RPC mapping": "sendRequest(`mcpServer/oauth/login`,e)",
+        "list-mcp-server-status RPC mapping": (
+            "async function exn(e,t,n,r,i=null){let a=await qg(e,t).listMcpServers"
+        ),
+        "profile menu open-state hook 1": (
+            "open:s,side:`top`,sideOffset:6,triggerButton:Ot,onOpenChange:l"
+        ),
+    }
+
+
+def _observed_profile_semantic_anchors() -> dict[str, str]:
+    """Exact profile-page counterparts found in the acquired renderer asset."""
+    return {
+        "Profile avatar": (
+            'avatar:(0,$.jsxs)($.Fragment,{children:[(0,$.jsxs)(`label`,'
+            '{"aria-disabled":I.isPending'
+        ),
+        "Profile display name": "displayName:Ye??(0,$.jsx)(J,{id:`profile.nameFallback`",
+        "Profile username and plan": "username:qe==null?null:(0,$.jsx)(J,{id:`profile.usernameValue`",
+    }
+
+
+def _semantic_variant(text: str, name: str, asset: str, semantic: str | None) -> AnchorAudit:
+    if semantic is None:
+        return AnchorAudit(name, asset, "MISSING", None, 0)
+    count = text.count(semantic)
+    if count == 1:
+        return AnchorAudit(name, asset, "SEMANTICALLY_CHANGED", "semantic", count)
+    if count > 1:
+        return AnchorAudit(name, asset, "AMBIGUOUS", "semantic", count)
+    return AnchorAudit(name, asset, "MISSING", None, 0)
+
+
 def audit_renderer_anchors(extracted: Path) -> list[AnchorAudit]:
     """Audit exact semantic hooks without changing the extracted ASAR."""
     webview = extracted / "webview"
     assets = webview / "assets"
     index_path = webview / "index.html"
     if not index_path.is_file():
-        return [AnchorAudit("renderer CSP", "webview/index.html", "NO LONGER PRESENT", None, 0)]
+        return [AnchorAudit("renderer CSP", "webview/index.html", "MISSING", None, 0)]
     index = index_path.read_text(encoding="utf-8")
     initial_bundles = list(assets.glob("app-initial-*.js"))
     if len(initial_bundles) != 1:
@@ -325,24 +417,35 @@ def audit_renderer_anchors(extracted: Path) -> list[AnchorAudit]:
     bundle_path = initial_bundles[0]
     bundle = bundle_path.read_text(encoding="utf-8")
     values = _renderer_variant_values(bundle)
+    semantic_anchors = _observed_renderer_semantic_anchors(bundle)
     old_values = _renderer_variant_values(bundle.replace("function Icl(e){let t=(0,Vcl.c)(248),", "function wXc({sidebarFooter:e,triggerButton:t})"))
     build_6662 = bool(values["build_6662"])
     audit: list[AnchorAudit] = [
         AnchorAudit(
             "renderer CSP",
             "webview/index.html",
-            "UNCHANGED" if index.count("connect-src &#39;self&#39;") == 1 else "NO LONGER PRESENT",
+            "UNCHANGED" if index.count("connect-src &#39;self&#39;") == 1 else "MISSING",
             "connect-src &#39;self&#39;" if index.count("connect-src &#39;self&#39;") == 1 else None,
             index.count("connect-src &#39;self&#39;"),
         )
     ]
-    def add_variant(name: str, current: str, renamed: str | None = None) -> None:
-        audit.append(_variant(bundle, name, bundle_path.name, current, renamed))
+    def add_variant(
+        name: str,
+        current: str,
+        renamed: str | None = None,
+        *,
+        prefer_semantic: bool = False,
+    ) -> None:
+        semantic = semantic_anchors.get(name)
+        if prefer_semantic and semantic is not None and bundle.count(semantic) > 0:
+            audit.append(_semantic_variant(bundle, name, bundle_path.name, semantic))
+        else:
+            audit.append(_variant(bundle, name, bundle_path.name, current, renamed, semantic))
 
     def add_key_variant(name: str, key: str) -> None:
         current = str(old_values[key] if build_6662 else values[key])
         renamed = str(values[key]) if build_6662 else None
-        add_variant(name, current, renamed)
+        add_variant(name, current, renamed, prefer_semantic=name == "native usage modal")
 
     add_key_variant("native profile menu", "component_anchor")
     add_key_variant("app-server request bridge", "app_server_anchor")
@@ -386,6 +489,7 @@ def audit_renderer_anchors(extracted: Path) -> list[AnchorAudit]:
                 bundle_path.name,
                 old_mapping if build_6662 else current_mapping,
                 current_mapping if build_6662 else None,
+                semantic_anchors.get(name),
             )
         )
 
@@ -398,6 +502,7 @@ def audit_renderer_anchors(extracted: Path) -> list[AnchorAudit]:
                 bundle_path.name,
                 old_anchor if build_6662 else anchor,
                 anchor if build_6662 else None,
+                semantic_anchors.get(f"profile menu open-state hook {index + 1}"),
             )
         )
     for message in (
@@ -410,6 +515,7 @@ def audit_renderer_anchors(extracted: Path) -> list[AnchorAudit]:
     profile_assets = list(assets.glob("profile-*.js"))
     profile_path = profile_assets[0] if len(profile_assets) == 1 else None
     profile_text = profile_path.read_text(encoding="utf-8") if profile_path else ""
+    profile_semantic_anchors = _observed_profile_semantic_anchors()
     for name, key in (
         ("Profile avatar", "profile_avatar"),
         ("Profile display name", "profile_name"),
@@ -417,7 +523,16 @@ def audit_renderer_anchors(extracted: Path) -> list[AnchorAudit]:
     ):
         current = str(old_values[key] if build_6662 else values[key])
         renamed = str(values[key]) if build_6662 else None
-        audit.append(_variant(profile_text, name, profile_path.name if profile_path else "profile-*.js", current, renamed))
+        audit.append(
+            _variant(
+                profile_text,
+                name,
+                profile_path.name if profile_path else "profile-*.js",
+                current,
+                renamed,
+                profile_semantic_anchors.get(name),
+            )
+        )
 
     plugin_assets = list(assets.glob(str(values["plugin_glob"])))
     plugin_path: Path | None = None
@@ -435,7 +550,7 @@ def audit_renderer_anchors(extracted: Path) -> list[AnchorAudit]:
             str(values["plugin_glob"]),
             str(values["plugin_anchor"]),
         )
-        if new_plugin_audit.status == "UNCHANGED" and old_plugin_audit.status == "NO LONGER PRESENT":
+        if new_plugin_audit.status == "UNCHANGED" and old_plugin_audit.status == "MISSING":
             plugin_audit = AnchorAudit(
                 "Plugins settings content",
                 str(values["plugin_glob"]),
@@ -476,7 +591,7 @@ def audit_renderer_anchors(extracted: Path) -> list[AnchorAudit]:
             "local-conversation-thread-*.js",
             str(values["thread_anchor"]),
         )
-        if new_thread_audit.status == "UNCHANGED" and old_thread_audit.status == "NO LONGER PRESENT":
+        if new_thread_audit.status == "UNCHANGED" and old_thread_audit.status == "MISSING":
             thread_audit = AnchorAudit(
                 "thread summary source component",
                 "local-conversation-thread-*.js",
@@ -519,7 +634,9 @@ def patch_renderer(extracted: Path, token: str) -> list[AnchorAudit]:
     """Patch renderer account/routing surfaces after exact semantic validation."""
     audit = audit_renderer_anchors(extracted)
     failed_audit = [
-        item for item in audit if item.status in {"NO LONGER PRESENT", "AMBIGUOUS"}
+        item
+        for item in audit
+        if item.status in {"MISSING", "SEMANTICALLY_CHANGED", "AMBIGUOUS"}
     ]
     if failed_audit:
         details = "; ".join(

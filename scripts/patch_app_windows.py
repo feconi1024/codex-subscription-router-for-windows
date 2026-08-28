@@ -26,18 +26,29 @@ try:
     from .windows.discovery import (
         DesktopSource,
         RealCodexCandidate,
+        SourceDiagnostics,
+        discover_desktop_source,
         copy_byte_identical,
         discover_real_codex,
+        format_source_diagnostics,
         locate_desktop_source,
+        package_to_dict,
+        parse_appx_block_map,
+        read_authenticode,
+        read_file_version,
+        read_file_versions,
         sha256_file,
+        source_access_probes,
+        is_windowsapps_path,
     )
-    from .windows.fuses import disable_asar_integrity_validation
+    from .windows.fuses import FuseSnapshot, disable_asar_integrity_validation, read_fuses
     from .windows.mirror import (
+        MirrorReport,
         PackagingBlockedError,
         copy_unpacked_tree,
         derive_unpack_directories,
         derive_unpack_files,
-        mirror_directory,
+        mirror_desktop_source,
         verify_desktop_mirror,
     )
 except ImportError:
@@ -53,18 +64,29 @@ except ImportError:
     from windows.discovery import (
         DesktopSource,
         RealCodexCandidate,
+        SourceDiagnostics,
+        discover_desktop_source,
         copy_byte_identical,
         discover_real_codex,
+        format_source_diagnostics,
         locate_desktop_source,
+        package_to_dict,
+        parse_appx_block_map,
+        read_authenticode,
+        read_file_version,
+        read_file_versions,
         sha256_file,
+        source_access_probes,
+        is_windowsapps_path,
     )
-    from windows.fuses import disable_asar_integrity_validation
+    from windows.fuses import FuseSnapshot, disable_asar_integrity_validation, read_fuses
     from windows.mirror import (
+        MirrorReport,
         PackagingBlockedError,
         copy_unpacked_tree,
         derive_unpack_directories,
         derive_unpack_files,
-        mirror_directory,
+        mirror_desktop_source,
         verify_desktop_mirror,
     )
 
@@ -82,6 +104,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source", type=Path, help="Windows package root/app directory override")
     parser.add_argument("--real-codex", type=Path, help="explicit native per-user codex.exe override")
     parser.add_argument("--destination", type=Path, default=DEFAULT_DESTINATION)
+    parser.add_argument(
+        "--diagnose-source",
+        action="store_true",
+        help="read-only source discovery diagnostics; never stages or patches files",
+    )
+    parser.add_argument(
+        "--audit-only",
+        action="store_true",
+        help="read-only real Desktop executable, ASAR, fuse, and renderer audit",
+    )
+    parser.add_argument(
+        "--mirror-dry-run",
+        action="store_true",
+        help="mirror the unmodified Desktop shell into a temporary writable directory",
+    )
+    parser.add_argument(
+        "--diagnostics-json",
+        type=Path,
+        help="write source diagnostics (and audit/mirror evidence when selected) to JSON",
+    )
     parser.add_argument("--force", action="store_true", help="move a previous local build to a recoverable backup")
     parser.add_argument(
         "--allow-untested-source",
@@ -99,16 +141,133 @@ def output(command: list[str], *, cwd: Path | None = None) -> str:
     return subprocess.check_output(command, cwd=cwd, text=True).strip()
 
 
-def require_tool(name: str) -> None:
-    if shutil.which(name) is None:
-        raise RuntimeError(f"required tool not found: {name}")
+def _powershell_executable() -> str | None:
+    return shutil.which("pwsh.exe") or shutil.which("powershell.exe") or shutil.which("pwsh")
 
 
-def build_go_binary(package: str, destination: Path) -> None:
+def _go_probe_command(command: list[str]) -> tuple[list[str], str | None]:
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return [], str(error)
+    lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    if result.returncode != 0 and not lines:
+        return [], (result.stderr or f"exit code {result.returncode}").strip().splitlines()[0]
+    return lines, None
+
+
+def probe_go_toolchain() -> dict[str, object]:
+    """Probe Go without installing it or changing the process/global PATH."""
+    attempts: list[dict[str, object]] = []
+    candidates: list[Path] = []
+
+    path_go = shutil.which("go")
+    attempts.append({"probe": "PATH/shutil.which(go)", "status": "PASS" if path_go else "FAIL"})
+    if path_go:
+        candidates.append(Path(path_go))
+
+    where_executable = shutil.which("where.exe") or shutil.which("where")
+    if where_executable:
+        paths, error = _go_probe_command([where_executable, "go"])
+        attempts.append({"probe": "where.exe go", "status": "PASS" if paths else "FAIL", "error": error})
+        candidates.extend(Path(path) for path in paths)
+    else:
+        attempts.append({"probe": "where.exe go", "status": "NOT AVAILABLE", "error": "where.exe unavailable"})
+
+    known_paths = (Path(r"C:\Program Files\Go\bin\go.exe"), Path(r"C:\Go\bin\go.exe"))
+    for known in known_paths:
+        exists = known.is_file()
+        attempts.append({"probe": f"Test-Path {known}", "status": "PASS" if exists else "FAIL", "candidate": str(known)})
+        if exists:
+            candidates.append(known)
+
+    powershell = _powershell_executable()
+    registry_candidates: list[str] = []
+    if powershell:
+        command_script = r"""
+$paths = @(Get-Command go -All -ErrorAction SilentlyContinue | ForEach-Object { $_.Source })
+ConvertTo-Json -InputObject $paths -Compress
+"""
+        command_output, command_error = _go_probe_command(
+            [powershell, "-NoProfile", "-NonInteractive", "-Command", command_script]
+        )
+        command_paths: list[str] = []
+        if command_output and command_error is None:
+            try:
+                parsed = json.loads(command_output[-1])
+            except json.JSONDecodeError:
+                parsed = []
+            parsed_values = parsed if isinstance(parsed, list) else [parsed]
+            command_paths = [
+                item for item in parsed_values
+                if isinstance(item, str) and item.strip()
+            ]
+        attempts.append(
+            {
+                "probe": "Get-Command go -All",
+                "status": "PASS" if command_paths else "FAIL",
+                "error": command_error,
+            }
+        )
+        candidates.extend(Path(path) for path in command_paths)
+        registry_script = r"""
+$keys = @('HKLM:\SOFTWARE\GoProgrammingLanguage','HKLM:\SOFTWARE\WOW6432Node\GoProgrammingLanguage')
+$values = foreach ($key in $keys) {
+  Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue |
+    Select-Object -ExpandProperty InstallLocation -ErrorAction SilentlyContinue
+}
+ConvertTo-Json -InputObject @($values) -Compress
+"""
+        raw, error = _go_probe_command([powershell, "-NoProfile", "-NonInteractive", "-Command", registry_script])
+        if raw and error is None:
+            try:
+                parsed = json.loads(raw[-1])
+            except json.JSONDecodeError:
+                parsed = []
+            registry_candidates = parsed if isinstance(parsed, list) else [parsed]
+            registry_candidates = [item for item in registry_candidates if isinstance(item, str) and item]
+        attempts.append({"probe": "Go installation registry", "status": "PASS" if registry_candidates else "FAIL", "error": error})
+        candidates.extend(Path(item) / "bin" / "go.exe" for item in registry_candidates)
+    else:
+        attempts.append({"probe": "Go installation registry", "status": "NOT AVAILABLE", "error": "PowerShell unavailable"})
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        resolved = candidate.expanduser().resolve(strict=False)
+        key = str(resolved).casefold()
+        if key in seen or not resolved.is_file():
+            continue
+        seen.add(key)
+        unique.append(resolved)
+    selected = unique[0] if unique else None
+    return {
+        "selected": str(selected) if selected else None,
+        "candidates": [str(path) for path in unique],
+        "probes": attempts,
+    }
+
+
+def go_executable_or_raise() -> Path:
+    result = probe_go_toolchain()
+    selected = result.get("selected")
+    if isinstance(selected, str) and selected:
+        return Path(selected)
+    raise RuntimeError(f"required Go toolchain not found; probes: {json.dumps(result['probes'], sort_keys=True)}")
+
+
+def build_go_binary(package: str, destination: Path, go_executable: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     run(
         [
-            "go",
+            str(go_executable),
             "build",
             "-trimpath",
             "-ldflags=-s -w",
@@ -127,6 +286,183 @@ def print_anchor_audit(audit: list[object]) -> None:
             f"  {item.name}: {item.status}; asset={item.asset}; "
             f"matched={item.matched or '-'}; count={item.count}"
         )
+
+
+def _fuse_summary(snapshot: FuseSnapshot | None, error: str | None = None) -> dict[str, object]:
+    if snapshot is None:
+        return {"status": "UNAVAILABLE", "error": error or "fuse state was not readable"}
+    required = (
+        "RunAsNode",
+        "EnableCookieEncryption",
+        "EnableNodeOptionsEnvironmentVariable",
+        "EnableNodeCliInspectArguments",
+        "EnableEmbeddedAsarIntegrityValidation",
+        "OnlyLoadAppFromAsar",
+    )
+    return {
+        "schema_version": snapshot.schema_version,
+        "count": snapshot.count,
+        "fuses": list(snapshot.fuses),
+        "named": {
+            name: snapshot.fuses[index]
+            for name, index in {
+                "RunAsNode": 0,
+                "EnableCookieEncryption": 1,
+                "EnableNodeOptionsEnvironmentVariable": 2,
+                "EnableNodeCliInspectArguments": 3,
+                "EnableEmbeddedAsarIntegrityValidation": 4,
+                "OnlyLoadAppFromAsar": 5,
+            }.items()
+            if index < snapshot.count and name in required
+        },
+    }
+
+
+def _audit_has_failure(audit: list[object]) -> bool:
+    return any(item.status in {"MISSING", "SEMANTICALLY_CHANGED", "AMBIGUOUS"} for item in audit)
+
+
+def audit_windows_source(source: DesktopSource) -> dict[str, object]:
+    """Audit the real source without changing its executable or ASAR."""
+    asar = ensure_asar_tool()
+    versions = read_file_versions(source.executable)
+    source_hash = sha256_file(source.app_asar)
+    signature = read_authenticode(source.executable)
+    try:
+        fuses = read_fuses(source.executable)
+        fuse_error = None
+    except RuntimeError as error:
+        fuses = None
+        fuse_error = str(error)
+    block_map_path = source.source_root / "AppxBlockMap.xml"
+    try:
+        block_map_files = [path.as_posix() for path in parse_appx_block_map(block_map_path)]
+        block_map_error = None
+    except RuntimeError as error:
+        block_map_files = []
+        block_map_error = str(error)
+    with tempfile.TemporaryDirectory(prefix="codex-router-phase2a-audit-") as temporary:
+        extracted = Path(temporary) / "asar"
+        run([str(asar), "extract", str(source.app_asar), str(extracted)])
+        renderer_audit = audit_renderer_anchors(extracted)
+    return {
+        "source": {
+            "package": package_to_dict(source.package),
+            "source_kind": source.source_kind,
+            "source_root": str(source.source_root),
+            "app_dir": str(source.app_dir),
+            "executable": str(source.executable),
+            "file_version": versions.get("FileVersion") or source.file_version,
+            "product_version": versions.get("ProductVersion") or "unknown",
+            "authenticode": {"status": signature.status, "signer": signature.signer},
+            "app_asar": str(source.app_asar),
+            "app_asar_sha256": source_hash,
+        },
+        "access": [probe.to_dict() for probe in source_access_probes(source)],
+        "appx_block_map": {
+            "path": str(block_map_path),
+            "file_count": len(block_map_files),
+            "error": block_map_error,
+        },
+        "renderer_anchor_audit": [
+            {
+                "name": item.name,
+                "asset": item.asset,
+                "status": item.status,
+                "matched": item.matched,
+                "count": item.count,
+            }
+            for item in renderer_audit
+        ],
+        "electron_fuses": _fuse_summary(fuses, fuse_error),
+        "renderer_audit_pass": not _audit_has_failure(renderer_audit),
+        "fuse_audit_pass": fuses is not None,
+        "audit_pass": not _audit_has_failure(renderer_audit) and fuses is not None,
+    }
+
+
+def _write_json(path: Path | None, payload: dict[str, object]) -> None:
+    if path is None:
+        return
+    path = path.expanduser().resolve(strict=False)
+    if is_windowsapps_path(path):
+        raise RuntimeError("refusing to write diagnostics inside protected WindowsApps")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _print_access_matrix(probes: list[dict[str, object]]) -> None:
+    print("Direct-read/access results:")
+    for probe in probes:
+        detail = f"; error={probe['error']}" if probe.get("error") else ""
+        print(f"  {probe['method']}: {probe['status']}{detail}")
+
+
+def _run_source_diagnostics(args: argparse.Namespace) -> int:
+    source, diagnostics = discover_desktop_source(args.source)
+    if source is not None:
+        diagnostics.selected_source = source
+    payload = diagnostics.to_dict()
+    _write_json(args.diagnostics_json, payload)
+    print(format_source_diagnostics(diagnostics))
+    return 0 if source is not None else 1
+
+
+def _run_source_audit(args: argparse.Namespace) -> int:
+    source, diagnostics = discover_desktop_source(args.source)
+    if source is None:
+        payload = diagnostics.to_dict()
+        _write_json(args.diagnostics_json, payload)
+        print(format_source_diagnostics(diagnostics), file=sys.stderr)
+        return 1
+    try:
+        audit = audit_windows_source(source)
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        payload = diagnostics.to_dict()
+        payload["audit_error"] = str(error)
+        _write_json(args.diagnostics_json, payload)
+        print(format_source_diagnostics(diagnostics), file=sys.stderr)
+        print(f"Phase 2A audit failed: {error}", file=sys.stderr)
+        return 1
+    payload = diagnostics.to_dict()
+    payload["audit"] = audit
+    _write_json(args.diagnostics_json, payload)
+    print(format_source_diagnostics(diagnostics))
+    print(f"Source app.asar SHA-256: {audit['source']['app_asar_sha256']}")
+    print(f"ChatGPT.exe FileVersion: {audit['source']['file_version']}")
+    print(f"ChatGPT.exe ProductVersion: {audit['source']['product_version']}")
+    print(f"Authenticode: {audit['source']['authenticode']}")
+    print(f"AppxBlockMap files: {audit['appx_block_map']['file_count']}")
+    print(f"Electron fuses: {json.dumps(audit['electron_fuses'], sort_keys=True)}")
+    print_anchor_audit([type("AuditItem", (), item) for item in audit["renderer_anchor_audit"]])
+    _print_access_matrix(audit["access"])
+    return 0 if audit["audit_pass"] else 1
+
+
+def _run_mirror_dry_run(args: argparse.Namespace) -> int:
+    source, diagnostics = discover_desktop_source(args.source)
+    if source is None:
+        _write_json(args.diagnostics_json, diagnostics.to_dict())
+        print(format_source_diagnostics(diagnostics), file=sys.stderr)
+        return 1
+    with tempfile.TemporaryDirectory(prefix="codex-router-phase2a-mirror-") as temporary:
+        destination = Path(temporary) / "app"
+        try:
+            mirror = mirror_desktop_source(source, destination)
+            verify_desktop_mirror(source.app_dir, destination)
+        except (PackagingBlockedError, OSError, RuntimeError) as error:
+            print(f"Phase 2A mirror dry run failed: {error}", file=sys.stderr)
+            return 1
+        payload = diagnostics.to_dict()
+        payload["mirror"] = mirror.to_dict()
+        payload["mirror"]["destination"] = str(destination)
+        _write_json(args.diagnostics_json, payload)
+        print(f"Mirror strategy: {mirror.strategy}")
+        print(f"Mirror copied files: {len(mirror.copied)}")
+        print(f"Optional protected files skipped: {len(mirror.excluded)}")
+        print(f"Required-file failures: {len(mirror.required_failures)}")
+        print(f"Temporary mirror verified: {destination}")
+    return 0
 
 
 def _asar_unpack_pattern(unpack_directories: tuple[str, ...]) -> str | None:
@@ -199,6 +535,8 @@ def _metadata(
         "package_name": source.package.name,
         "package_full_name": source.package.package_full_name,
         "package_version": source.package.version,
+        "package_publisher": source.package.publisher,
+        "package_architecture": source.package.architecture,
         "source_kind": source.source_kind,
         "source_root": str(source.source_root),
         "source_app_executable": str(source.executable),
@@ -247,8 +585,11 @@ def _metadata(
             "fuses": list(fuse_after.fuses),
         },
         "mirror": {
+            "strategy": mirror_report.strategy,
             "copied_count": len(mirror_report.copied),
             "excluded": mirror_report.excluded,
+            "copy_failures": mirror_report.copy_failures,
+            "required_failures": mirror_report.required_failures,
         },
         "computer_use": "out of scope; no Windows Computer Use patch was applied",
     }
@@ -306,8 +647,7 @@ def build_windows_desktop(
             "unknown Windows ChatGPT source: package/version/app.asar is not in "
             f"{COMPATIBILITY_DOCUMENT}; pass --allow-untested-source only after reviewing the anchor audit"
         )
-    for tool in ("go",):
-        require_tool(tool)
+    go_executable = go_executable_or_raise()
     asar = ensure_asar_tool()
     token = load_or_create_token()
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -319,7 +659,7 @@ def build_windows_desktop(
         staged_runtime = staged / "runtime"
         extracted = temporary_root / "asar"
         staged.mkdir(parents=True, exist_ok=True)
-        mirror_report = mirror_directory(source.app_dir, staged_app)
+        mirror_report = mirror_desktop_source(source, staged_app)
         verify_desktop_mirror(source.app_dir, staged_app)
         staged_source_hash = sha256_file(staged / source.executable.name)
         source_executable_hash = sha256_file(source.executable)
@@ -329,7 +669,11 @@ def build_windows_desktop(
         run([str(asar), "extract", str(staged_resources / "app.asar"), str(extracted)])
         audit = audit_renderer_anchors(extracted)
         print_anchor_audit(audit)
-        failed = [item for item in audit if item.status in {"NO LONGER PRESENT", "AMBIGUOUS"}]
+        failed = [
+            item
+            for item in audit
+            if item.status in {"MISSING", "SEMANTICALLY_CHANGED", "AMBIGUOUS"}
+        ]
         if failed:
             raise RuntimeError("Windows renderer anchor audit failed; no loose replacement was attempted")
         bootstrap_report = patch_bootstrap(extracted, PROJECT_ROOT)
@@ -349,8 +693,8 @@ def build_windows_desktop(
         mux = staged_runtime / "codex-mux.exe"
         staged_real = staged_runtime / "codex.real.exe"
         launcher = staged / "Codex Subscription Router.exe"
-        build_go_binary("./cmd/codex-mux", mux)
-        build_go_binary("./cmd/codex-router-launcher", launcher)
+        build_go_binary("./cmd/codex-mux", mux, go_executable)
+        build_go_binary("./cmd/codex-router-launcher", launcher, go_executable)
         copy_byte_identical(real.path, staged_real)
 
         fuse_backup = temporary_root / f"{source.executable.name}.before-fuse-change"
@@ -391,6 +735,15 @@ def build_windows_desktop(
 def main() -> int:
     args = parse_args()
     try:
+        selected_modes = sum(bool(value) for value in (args.diagnose_source, args.audit_only, args.mirror_dry_run))
+        if selected_modes > 1:
+            raise RuntimeError("choose only one of --diagnose-source, --audit-only, or --mirror-dry-run")
+        if args.diagnose_source:
+            return _run_source_diagnostics(args)
+        if args.audit_only:
+            return _run_source_audit(args)
+        if args.mirror_dry_run:
+            return _run_mirror_dry_run(args)
         source = locate_desktop_source(args.source)
         real, candidates = discover_real_codex(args.real_codex)
         print(f"Windows source: {source.source_root}")

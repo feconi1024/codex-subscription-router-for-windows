@@ -1,19 +1,60 @@
-"""Windows AppX desktop and per-user native Codex discovery."""
+"""Windows AppX desktop, running-process, and native Codex discovery."""
 
 from __future__ import annotations
 
+import ctypes
+import fnmatch
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable
 
 
 WINDOWS_NATIVE_MACHINES = {0x014C, 0x8664, 0xAA64}
+PROBE_PASS = "PASS"
+PROBE_FAIL = "FAIL"
+PROBE_NOT_AVAILABLE = "NOT AVAILABLE"
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+TH32CS_SNAPPROCESS = 0x00000002
+INVALID_HANDLE_VALUE = -1
+DESKTOP_EXECUTABLE_NAMES = ("ChatGPT.exe", "Codex.exe")
+OPENAI_AUMID_PATTERNS = ("OpenAI.Codex_*!App", "OpenAI.ChatGPT_*!App")
+
+
+def _is_known_aumid(value: str) -> bool:
+    lowered = value.casefold()
+    return any(fnmatch.fnmatchcase(lowered, pattern.casefold()) for pattern in OPENAI_AUMID_PATTERNS)
+
+
+@dataclass(frozen=True)
+class SourceProbeResult:
+    """A non-sensitive result from one source-discovery mechanism."""
+
+    method: str
+    status: str
+    candidates: tuple[str, ...] = ()
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.status not in {PROBE_PASS, PROBE_FAIL, PROBE_NOT_AVAILABLE}:
+            raise ValueError(f"unknown source probe status: {self.status}")
+
+    def to_dict(self) -> dict[str, object]:
+        result: dict[str, object] = {
+            "method": self.method,
+            "status": self.status,
+            "candidates": list(self.candidates),
+        }
+        if self.error:
+            result["error"] = self.error
+        return result
 
 
 @dataclass(frozen=True)
@@ -24,6 +65,7 @@ class PackageMetadata:
     install_location: Path | None = None
     architecture: str = "unknown"
     status: str = "unknown"
+    publisher: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -54,50 +96,159 @@ class RealCodexCandidate:
     valid_native: bool
 
 
+@dataclass(frozen=True)
+class RunningProcessCandidate:
+    """A process name and its best-effort query-limited executable path."""
+
+    pid: int
+    name: str
+    parent_pid: int | None = None
+    executable: Path | None = None
+    error: str | None = None
+
+    def label(self) -> str:
+        if self.executable is not None:
+            return str(self.executable)
+        return f"{self.name} (pid {self.pid}; path unavailable)"
+
+    def to_dict(self) -> dict[str, object]:
+        result: dict[str, object] = {
+            "pid": self.pid,
+            "name": self.name,
+            "parent_pid": self.parent_pid,
+            "executable": str(self.executable) if self.executable else None,
+        }
+        if self.error:
+            result["error"] = self.error
+        return result
+
+
+@dataclass
+class SourceDiagnostics:
+    """Structured, printable source acquisition evidence."""
+
+    probes: list[SourceProbeResult] = field(default_factory=list)
+    aumids: list[str] = field(default_factory=list)
+    manifest_aumids: list[str] = field(default_factory=list)
+    selected_aumid: str | None = None
+    selected_source: DesktopSource | None = None
+    access: list[SourceProbeResult] = field(default_factory=list)
+
+    def add(self, probe: SourceProbeResult) -> None:
+        self.probes.append(probe)
+
+    def to_dict(self) -> dict[str, object]:
+        source = self.selected_source
+        return {
+            "registered_aumids": list(self.aumids),
+            "manifest_aumids": list(self.manifest_aumids),
+            "selected_aumid": self.selected_aumid,
+            "probes": [probe.to_dict() for probe in self.probes],
+            "access": [probe.to_dict() for probe in self.access],
+            "selected_source": (
+                {
+                    "source_root": str(source.source_root),
+                    "app_dir": str(source.app_dir),
+                    "executable": str(source.executable),
+                    "resources_dir": str(source.resources_dir),
+                    "app_asar": str(source.app_asar),
+                    "source_kind": source.source_kind,
+                    "file_version": source.file_version,
+                    "package": package_to_dict(source.package),
+                }
+                if source is not None
+                else None
+            ),
+        }
+
+
+class SourceDiscoveryError(RuntimeError):
+    """Source discovery failed; the diagnostics remain available to callers."""
+
+    def __init__(self, message: str, diagnostics: SourceDiagnostics) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
+
+def package_to_dict(package: PackageMetadata) -> dict[str, object]:
+    return {
+        "name": package.name,
+        "package_full_name": package.package_full_name,
+        "version": package.version,
+        "install_location": str(package.install_location) if package.install_location else None,
+        "architecture": package.architecture,
+        "status": package.status,
+        "publisher": package.publisher,
+    }
+
+
+def _safe_error(error: BaseException | str, *, limit: int = 300) -> str:
+    if isinstance(error, str):
+        message = error
+    else:
+        message = str(error) or type(error).__name__
+    message = " ".join(message.replace("\r", " ").replace("\n", " ").split())
+    if message:
+        return message[:limit]
+    return type(error).__name__ if not isinstance(error, str) else "unknown error"
+
+
 def _powershell_executable() -> str | None:
-    return shutil.which("powershell.exe") or shutil.which("pwsh.exe")
+    # PowerShell 7 exposes the Windows signature cmdlets reliably in the
+    # managed desktop runtime; fall back to inbox Windows PowerShell when it
+    # is the only available host.
+    return shutil.which("pwsh.exe") or shutil.which("powershell.exe") or shutil.which("pwsh")
 
 
 def _powershell_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _run_powershell_json(script: str) -> Any:
+def _run_powershell_json_with_error(script: str) -> tuple[Any | None, str | None]:
     executable = _powershell_executable()
     if executable is None:
-        return None
-    result = subprocess.run(
-        [executable, "-NoProfile", "-NonInteractive", "-Command", script],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=15,
-    )
-    if result.returncode != 0 or not result.stdout.strip():
-        return None
+        return None, "PowerShell executable unavailable"
     try:
-        return json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return None
+        result = subprocess.run(
+            [executable, "-NoProfile", "-NonInteractive", "-Command", script],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return None, _safe_error(error)
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip().splitlines()
+        suffix = f": {_safe_error(detail[0])}" if detail else ""
+        return None, f"PowerShell exited with code {result.returncode}{suffix}"
+    if not result.stdout.strip():
+        return None, "PowerShell returned no JSON output"
+    try:
+        return json.loads(result.stdout), None
+    except json.JSONDecodeError as error:
+        return None, f"PowerShell returned invalid JSON: {_safe_error(error)}"
 
 
-def query_appx_packages() -> list[PackageMetadata]:
-    """Query the current user's AppX metadata without touching WindowsApps ACLs."""
-    script = """
+def _run_powershell_json(script: str) -> Any:
+    parsed, _ = _run_powershell_json_with_error(script)
+    return parsed
+
+
+def query_appx_packages_with_probe() -> tuple[list[PackageMetadata], SourceProbeResult]:
+    """Query AppX metadata without touching WindowsApps ACLs."""
+    script = r"""
 $packages = @(Get-AppxPackage -ErrorAction Stop | Where-Object {
   $_.Name -match 'OpenAI|ChatGPT|Codex' -or
   $_.PackageFullName -match 'OpenAI|ChatGPT|Codex' -or
   $_.InstallLocation -match 'OpenAI|ChatGPT|Codex'
-} | Select-Object Name,PackageFullName,Version,InstallLocation,Architecture,Status)
-if ($packages.Count -gt 0) { $packages | ConvertTo-Json -Compress }
+} | Select-Object Name,PackageFullName,Version,InstallLocation,Architecture,Status,Publisher)
+ConvertTo-Json -InputObject $packages -Compress
 """
-    try:
-        parsed = _run_powershell_json(script)
-    except (OSError, subprocess.SubprocessError):
-        return []
-    if parsed is None:
-        return []
+    parsed, error = _run_powershell_json_with_error(script)
+    if error:
+        return [], SourceProbeResult("Get-AppxPackage", PROBE_FAIL, (), error)
     rows = parsed if isinstance(parsed, list) else [parsed]
     packages: list[PackageMetadata] = []
     for row in rows:
@@ -112,9 +263,233 @@ if ($packages.Count -gt 0) { $packages | ConvertTo-Json -Compress }
                 install_location=Path(location) if isinstance(location, str) and location else None,
                 architecture=str(row.get("Architecture") or "unknown"),
                 status=str(row.get("Status") or "unknown"),
+                publisher=str(row.get("Publisher") or "unknown"),
             )
         )
-    return packages
+    return packages, SourceProbeResult(
+        "Get-AppxPackage",
+        PROBE_PASS,
+        tuple(str(package.install_location) for package in packages if package.install_location),
+    )
+
+
+def query_appx_packages() -> list[PackageMetadata]:
+    return query_appx_packages_with_probe()[0]
+
+
+def query_start_apps_with_probe() -> tuple[list[str], SourceProbeResult]:
+    """Read stable OpenAI AUMIDs as identity evidence, not display names."""
+    script = r"""
+$apps = @(Get-StartApps -ErrorAction Stop | Where-Object {
+  $_.AppID -like 'OpenAI.Codex_*!App' -or $_.AppID -like 'OpenAI.ChatGPT_*!App'
+} | Select-Object Name,AppID)
+ConvertTo-Json -InputObject $apps -Compress
+"""
+    parsed, error = _run_powershell_json_with_error(script)
+    if error:
+        return [], SourceProbeResult("Get-StartApps", PROBE_FAIL, (), error)
+    rows = parsed if isinstance(parsed, list) else [parsed]
+    aumids = sorted(
+        {
+            str(row.get("AppID"))
+            for row in rows
+            if isinstance(row, dict)
+            and isinstance(row.get("AppID"), str)
+            and _is_known_aumid(str(row["AppID"]))
+        },
+        key=str.casefold,
+    )
+    return aumids, SourceProbeResult("Get-StartApps", PROBE_PASS, tuple(aumids))
+
+
+def recognize_start_app_aumids(rows: Iterable[dict[str, object]]) -> tuple[str, ...]:
+    """Return only stable OpenAI AUMIDs from StartApps-like rows."""
+    return tuple(
+        sorted(
+            {
+                str(row["AppID"])
+                for row in rows
+                if isinstance(row.get("AppID"), str)
+                and _is_known_aumid(str(row["AppID"]))
+            },
+            key=str.casefold,
+        )
+    )
+
+
+def _win32_error(prefix: str) -> str:
+    code = ctypes.get_last_error()
+    return f"{prefix} (Win32 error {code})"
+
+
+def _query_process_image_path(kernel32: Any, pid: int) -> tuple[Path | None, str | None]:
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None, _win32_error(f"OpenProcess query-limited-information failed for pid {pid}")
+    try:
+        size = 1024
+        while size <= 32768:
+            buffer = ctypes.create_unicode_buffer(size)
+            length = ctypes.c_uint32(size)
+            if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(length)):
+                return Path(buffer.value[: length.value]), None
+            if ctypes.get_last_error() != 122:  # ERROR_INSUFFICIENT_BUFFER
+                return None, _win32_error(f"QueryFullProcessImageNameW failed for pid {pid}")
+            size *= 2
+        return None, "executable path exceeded the query buffer limit"
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def discover_running_processes_native() -> tuple[list[RunningProcessCandidate], SourceProbeResult]:
+    """Enumerate ChatGPT.exe/Codex.exe using query-limited Windows APIs."""
+    if os.name != "nt":
+        return [], SourceProbeResult(
+            "running-process-native",
+            PROBE_NOT_AVAILABLE,
+            (),
+            "native Toolhelp32 process APIs are Windows-only",
+        )
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except (AttributeError, OSError) as error:
+        return [], SourceProbeResult("running-process-native", PROBE_NOT_AVAILABLE, (), _safe_error(error))
+
+    class ProcessEntry32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", ctypes.c_uint32),
+            ("cntUsage", ctypes.c_uint32),
+            ("th32ProcessID", ctypes.c_uint32),
+            ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", ctypes.c_uint32),
+            ("cntThreads", ctypes.c_uint32),
+            ("th32ParentProcessID", ctypes.c_uint32),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", ctypes.c_uint32),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    kernel32.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    kernel32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ProcessEntry32W)]
+    kernel32.Process32FirstW.restype = ctypes.c_int
+    kernel32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ProcessEntry32W)]
+    kernel32.Process32NextW.restype = ctypes.c_int
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_wchar_p,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+
+    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snapshot or snapshot == ctypes.c_void_p(INVALID_HANDLE_VALUE).value:
+        return [], SourceProbeResult("running-process-native", PROBE_FAIL, (), _win32_error("CreateToolhelp32Snapshot failed"))
+    candidates: list[RunningProcessCandidate] = []
+    entry = ProcessEntry32W()
+    entry.dwSize = ctypes.sizeof(ProcessEntry32W)
+    target_names = {item.casefold() for item in DESKTOP_EXECUTABLE_NAMES}
+    try:
+        if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            return [], SourceProbeResult("running-process-native", PROBE_FAIL, (), _win32_error("Process32FirstW failed"))
+        while True:
+            name = str(entry.szExeFile)
+            if name.casefold() in target_names:
+                path, error = _query_process_image_path(kernel32, int(entry.th32ProcessID))
+                candidates.append(
+                    RunningProcessCandidate(
+                        pid=int(entry.th32ProcessID),
+                        name=name,
+                        parent_pid=int(entry.th32ParentProcessID),
+                        executable=path,
+                        error=error,
+                    )
+                )
+            if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                break
+    finally:
+        kernel32.CloseHandle(snapshot)
+
+    errors = [candidate.error for candidate in candidates if candidate.error]
+    return candidates, SourceProbeResult(
+        "running-process-native",
+        PROBE_PASS,
+        tuple(candidate.label() for candidate in candidates),
+        "; ".join(error for error in errors if error) or None,
+    )
+
+
+def _rows_to_process_candidates(parsed: Any) -> list[RunningProcessCandidate]:
+    rows = parsed if isinstance(parsed, list) else [parsed]
+    candidates: list[RunningProcessCandidate] = []
+    target_names = {item.casefold() for item in DESKTOP_EXECUTABLE_NAMES}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("Name")
+        pid = row.get("ProcessId")
+        if not isinstance(name, str) or name.casefold() not in target_names:
+            continue
+        try:
+            process_id = int(pid)
+        except (TypeError, ValueError):
+            continue
+        parent = row.get("ParentProcessId")
+        try:
+            parent_id = int(parent) if parent is not None else None
+        except (TypeError, ValueError):
+            parent_id = None
+        executable = row.get("ExecutablePath")
+        candidates.append(
+            RunningProcessCandidate(
+                pid=process_id,
+                name=name,
+                parent_pid=parent_id,
+                executable=Path(executable) if isinstance(executable, str) and executable else None,
+                error=None if isinstance(executable, str) and executable else "CIM did not return an executable path",
+            )
+        )
+    return candidates
+
+
+def query_running_processes_powershell() -> tuple[list[RunningProcessCandidate], SourceProbeResult]:
+    script = r"""
+$processes = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+  $_.Name -ieq 'ChatGPT.exe' -or $_.Name -ieq 'Codex.exe'
+} | Select-Object Name,ProcessId,ParentProcessId,ExecutablePath)
+ConvertTo-Json -InputObject $processes -Compress
+"""
+    parsed, error = _run_powershell_json_with_error(script)
+    if error:
+        return [], SourceProbeResult("running-process-powershell", PROBE_FAIL, (), error)
+    candidates = _rows_to_process_candidates(parsed)
+    errors = [candidate.error for candidate in candidates if candidate.error]
+    return candidates, SourceProbeResult(
+        "running-process-powershell",
+        PROBE_PASS,
+        tuple(candidate.label() for candidate in candidates),
+        "; ".join(errors) or None,
+    )
+
+
+def select_running_process(candidates: Iterable[RunningProcessCandidate]) -> RunningProcessCandidate | None:
+    """Prefer a package path, then ChatGPT.exe, while retaining all candidates."""
+    usable = [candidate for candidate in candidates if candidate.executable is not None]
+    if not usable:
+        return None
+    return max(
+        usable,
+        key=lambda candidate: (
+            int("\\windowsapps\\" in str(candidate.executable).casefold()),
+            int(candidate.name.casefold() == "chatgpt.exe"),
+            str(candidate.executable).casefold(),
+        ),
+    )
 
 
 def is_windowsapps_path(path: Path) -> bool:
@@ -146,8 +521,6 @@ def is_native_windows_executable(path: Path) -> bool:
 
 
 def sha256_file(path: Path) -> str:
-    import hashlib
-
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
@@ -156,7 +529,13 @@ def sha256_file(path: Path) -> str:
 
 
 def read_file_version(path: Path) -> str:
-    """Read PE version metadata through PowerShell when available."""
+    """Read the PE FileVersion, falling back to ProductVersion."""
+    versions = read_file_versions(path)
+    return versions.get("FileVersion") or versions.get("ProductVersion") or "unknown"
+
+
+def read_file_versions(path: Path) -> dict[str, str]:
+    """Read both PE version fields through PowerShell when available."""
     script = (
         f"$i=(Get-Item -LiteralPath {_powershell_quote(str(path))}).VersionInfo; "
         "[pscustomobject]@{FileVersion=$i.FileVersion;ProductVersion=$i.ProductVersion} "
@@ -165,12 +544,14 @@ def read_file_version(path: Path) -> str:
     try:
         parsed = _run_powershell_json(script)
     except (OSError, subprocess.SubprocessError):
-        return "unknown"
+        return {}
     if isinstance(parsed, dict):
-        value = parsed.get("FileVersion") or parsed.get("ProductVersion")
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return "unknown"
+        return {
+            key: value.strip()
+            for key in ("FileVersion", "ProductVersion")
+            if isinstance(value := parsed.get(key), str) and value.strip()
+        }
+    return {}
 
 
 def read_authenticode(path: Path) -> AuthenticodeMetadata:
@@ -275,76 +656,296 @@ def discover_real_codex(
     return candidates[0], candidates
 
 
-def _executable_candidates(app_dir: Path) -> list[Path]:
+def _metadata_from_package_name(package_root: Path) -> PackageMetadata:
+    name = package_root.name
+    match = re.match(
+        r"^(?P<name>.+)_(?P<version>\d+(?:\.\d+){1,3})_(?P<architecture>[^_]+)__(?P<publisher>[^_]+)$",
+        name,
+    )
+    if match is None:
+        return PackageMetadata(package_full_name=name, install_location=package_root)
+    return PackageMetadata(
+        name=match.group("name"),
+        package_full_name=name,
+        version=match.group("version"),
+        install_location=package_root,
+        architecture=match.group("architecture").upper(),
+        publisher=match.group("publisher"),
+    )
+
+
+def _local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def read_appx_manifest_metadata(package_root: Path) -> tuple[PackageMetadata | None, str | None]:
+    """Read AppxManifest.xml directly, without enumerating its parent directory."""
+    manifest = package_root / "AppxManifest.xml"
     try:
-        files = [item for item in app_dir.iterdir() if item.is_file() and item.suffix.casefold() == ".exe"]
-    except OSError:
-        return []
-    names = {item.name.casefold(): item for item in files}
-    preferred = [names[name] for name in ("chatgpt.exe", "codex.exe") if name in names]
-    return preferred
+        with manifest.open("rb") as handle:
+            root = ET.parse(handle).getroot()
+    except (OSError, ET.ParseError) as error:
+        return None, _safe_error(error)
+    identity = next((element for element in root.iter() if _local_name(element.tag) == "Identity"), None)
+    if identity is None:
+        return None, "AppxManifest.xml has no Identity element"
+    fallback = _metadata_from_package_name(package_root)
+    return (
+        PackageMetadata(
+            name=str(identity.attrib.get("Name") or fallback.name),
+            package_full_name=fallback.package_full_name,
+            version=str(identity.attrib.get("Version") or fallback.version),
+            install_location=package_root,
+            architecture=str(identity.attrib.get("ProcessorArchitecture") or fallback.architecture).upper(),
+            status=fallback.status,
+            publisher=str(identity.attrib.get("Publisher") or fallback.publisher),
+        ),
+        None,
+    )
+
+
+def read_appx_manifest_aumids(package_root: Path, package: PackageMetadata) -> tuple[str, ...]:
+    """Derive package AUMIDs from manifest Application ids when StartApps is empty."""
+    manifest = package_root / "AppxManifest.xml"
+    try:
+        with manifest.open("rb") as handle:
+            root = ET.parse(handle).getroot()
+    except (OSError, ET.ParseError):
+        return ()
+    package_name_fallback = _metadata_from_package_name(package_root)
+    package_full_name = package.package_full_name
+    if package_full_name in {"", "unknown"}:
+        package_full_name = package_name_fallback.package_full_name
+    publisher_id = package_full_name.rsplit("__", 1)[-1]
+    if not publisher_id or publisher_id == package_full_name:
+        return ()
+    package_name = package.name if package.name not in {"", "unknown"} else package_name_fallback.name
+    prefix = f"{package_name}_{publisher_id}"
+    return tuple(
+        sorted(
+            {
+                f"{prefix}!{element.attrib['Id']}"
+                for element in root.iter()
+                if _local_name(element.tag) == "Application" and element.attrib.get("Id")
+            },
+            key=str.casefold,
+        )
+    )
+
+
+def package_metadata_from_root(package_root: Path) -> PackageMetadata:
+    fallback = _metadata_from_package_name(package_root)
+    metadata, _ = read_appx_manifest_metadata(package_root)
+    return metadata or fallback
+
+
+def _normalize_manifest_path(value: str) -> Path:
+    normalized = value.replace("\\", "/")
+    if not normalized or normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
+        raise ValueError(f"absolute AppX block-map path is not allowed: {value!r}")
+    parts: list[str] = []
+    for part in normalized.split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            raise ValueError(f"parent traversal in AppX block-map path is not allowed: {value!r}")
+        parts.append(part)
+    if not parts:
+        raise ValueError(f"empty AppX block-map path is not allowed: {value!r}")
+    return Path(*parts)
+
+
+def parse_appx_block_map(path: Path) -> tuple[Path, ...]:
+    """Return validated package-relative file names from AppxBlockMap.xml."""
+    try:
+        with path.open("rb") as handle:
+            root = ET.parse(handle).getroot()
+    except (OSError, ET.ParseError) as error:
+        raise RuntimeError(f"could not read AppxBlockMap.xml: {_safe_error(error)}") from error
+    paths: set[Path] = set()
+    for element in root.iter():
+        if _local_name(element.tag) != "File":
+            continue
+        name = element.attrib.get("Name")
+        if not isinstance(name, str):
+            raise RuntimeError("AppxBlockMap.xml contains a file without a Name")
+        try:
+            paths.add(_normalize_manifest_path(name))
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
+    if not paths:
+        raise RuntimeError("AppxBlockMap.xml contains no file entries")
+    return tuple(sorted(paths, key=lambda item: item.as_posix().casefold()))
+
+
+def _direct_read_probe(method: str, path: Path) -> SourceProbeResult:
+    try:
+        with path.open("rb") as handle:
+            handle.read(1)
+    except OSError as error:
+        return SourceProbeResult(method, PROBE_FAIL, (str(path),), _safe_error(error))
+    return SourceProbeResult(method, PROBE_PASS, (str(path),))
+
+
+def source_access_probes(source: DesktopSource) -> list[SourceProbeResult]:
+    package_root = source.source_root
+    try:
+        list(package_root.iterdir())
+        enumeration = SourceProbeResult("directory-enumeration", PROBE_PASS, (str(package_root),))
+    except OSError as error:
+        enumeration = SourceProbeResult("directory-enumeration", PROBE_FAIL, (str(package_root),), _safe_error(error))
+    executable_label = f"direct-{source.executable.name}-read"
+    return [
+        enumeration,
+        _direct_read_probe(executable_label, source.executable),
+        _direct_read_probe("direct-app.asar-read", source.app_asar),
+        _direct_read_probe("direct-AppxManifest.xml-read", package_root / "AppxManifest.xml"),
+        _direct_read_probe("direct-AppxBlockMap.xml-read", package_root / "AppxBlockMap.xml"),
+    ]
+
+
+def _executable_paths_from_root(root: Path) -> tuple[Path, ...]:
+    """Generate known paths without enumerating the source directory."""
+    root = root.expanduser().resolve(strict=False)
+    if root.suffix.casefold() == ".exe":
+        return (root,)
+    if root.name.casefold() == "resources":
+        root = root.parent
+    app_dirs = (root,) if root.name.casefold() == "app" else (root / "app", root)
+    paths: list[Path] = []
+    for app_dir in app_dirs:
+        for name in DESKTOP_EXECUTABLE_NAMES:
+            candidate = app_dir / name
+            if candidate not in paths:
+                paths.append(candidate)
+    return tuple(paths)
+
+
+def _require_direct_file(path: Path, label: str) -> None:
+    try:
+        with path.open("rb") as handle:
+            handle.read(1)
+    except OSError as error:
+        raise RuntimeError(f"{label} is not directly readable at {path}: {_safe_error(error)}") from error
+
+
+def desktop_source_from_executable(
+    executable: Path,
+    *,
+    package: PackageMetadata | None = None,
+    source_kind: str = "running-process",
+) -> DesktopSource:
+    """Construct a source from a known executable path without parent enumeration."""
+    executable = executable.expanduser().resolve(strict=False)
+    if executable.name.casefold() not in {name.casefold() for name in DESKTOP_EXECUTABLE_NAMES}:
+        raise RuntimeError(f"unsupported Windows Desktop executable name: {executable.name}")
+    app_dir = executable.parent
+    package_root = app_dir.parent if app_dir.name.casefold() == "app" else app_dir
+    resources_dir = app_dir / "resources"
+    app_asar = resources_dir / "app.asar"
+    _require_direct_file(executable, "Desktop executable")
+    _require_direct_file(app_asar, "Desktop app.asar")
+    selected_package = package or package_metadata_from_root(package_root)
+    return DesktopSource(
+        source_root=package_root,
+        app_dir=app_dir,
+        executable=executable,
+        resources_dir=resources_dir,
+        app_asar=app_asar,
+        package=selected_package,
+        source_kind=source_kind,
+        file_version=read_file_version(executable),
+    )
 
 
 def _source_layout(root: Path, package: PackageMetadata, source_kind: str) -> DesktopSource | None:
-    root = root.expanduser().resolve(strict=False)
-    layout_roots = [root]
-    if root.name.casefold() == "resources":
-        layout_roots.insert(0, root.parent)
-    if (root / "app").is_dir():
-        layout_roots.insert(0, root / "app")
-    seen: set[Path] = set()
-    for app_dir in layout_roots:
-        if app_dir in seen:
+    for executable in _executable_paths_from_root(root):
+        try:
+            return desktop_source_from_executable(executable, package=package, source_kind=source_kind)
+        except RuntimeError:
             continue
-        seen.add(app_dir)
-        resources = app_dir / "resources"
-        app_asar = resources / "app.asar"
-        if not app_asar.is_file():
-            continue
-        executables = _executable_candidates(app_dir)
-        if not executables:
-            continue
-        executable = executables[0]
-        file_version = read_file_version(executable)
-        return DesktopSource(
-            source_root=root if root.name.casefold() != "resources" else root.parent,
-            app_dir=app_dir,
-            executable=executable,
-            resources_dir=resources,
-            app_asar=app_asar,
-            package=package,
-            source_kind=source_kind,
-            file_version=file_version,
-        )
     return None
 
 
-def locate_desktop_source(explicit: Path | None = None) -> DesktopSource:
-    if explicit is not None:
-        package = PackageMetadata(install_location=explicit.expanduser().resolve(strict=False))
-        found = _source_layout(explicit, package, "explicit")
-        if found is None:
-            raise RuntimeError(
-                "not a supported Windows ChatGPT source: expected "
-                "<source>\\app\\ChatGPT.exe (or Codex.exe) and "
-                "<source>\\app\\resources\\app.asar"
-            )
-        return found
+def _source_from_process_candidates(
+    candidates: Iterable[RunningProcessCandidate],
+) -> DesktopSource | None:
+    selected = select_running_process(candidates)
+    if selected is None or selected.executable is None:
+        return None
+    try:
+        return desktop_source_from_executable(selected.executable, source_kind="running-process")
+    except RuntimeError:
+        return None
 
-    packages = query_appx_packages()
-    package_candidates = sorted(
-        [package for package in packages if package.install_location is not None],
-        key=lambda package: (
-            int(package.name.casefold() == "openai.codex"),
-            int("chatgpt" in package.name.casefold()),
-            package.version,
-        ),
-        reverse=True,
-    )
-    for package in package_candidates:
-        found = _source_layout(package.install_location, package, "appx")
-        if found is not None:
-            return found
+
+def discover_desktop_source(
+    explicit: Path | None = None,
+    *,
+    activate_source: bool = False,
+) -> tuple[DesktopSource | None, SourceDiagnostics]:
+    """Discover a source and retain every non-sensitive mechanism result."""
+    del activate_source  # Activation is intentionally not the default in Phase 2A.
+    diagnostics = SourceDiagnostics()
+    if explicit is not None:
+        explicit = explicit.expanduser().resolve(strict=False)
+        try:
+            source = (
+                desktop_source_from_executable(explicit, source_kind="explicit")
+                if explicit.suffix.casefold() == ".exe"
+                else _source_layout(explicit, PackageMetadata(install_location=explicit), "explicit")
+            )
+        except RuntimeError as error:
+            source = None
+            diagnostics.add(SourceProbeResult("explicit-source", PROBE_FAIL, (str(explicit),), _safe_error(error)))
+        else:
+            diagnostics.add(SourceProbeResult("explicit-source", PROBE_PASS, (str(source.source_root),)))
+        if source is not None:
+            diagnostics.selected_source = source
+            diagnostics.access = source_access_probes(source)
+        return source, diagnostics
+
+    aumids, aumid_probe = query_start_apps_with_probe()
+    diagnostics.aumids = aumids
+    diagnostics.selected_aumid = aumids[0] if len(aumids) == 1 else None
+    diagnostics.add(aumid_probe)
+
+    native_processes, native_probe = discover_running_processes_native()
+    diagnostics.add(native_probe)
+    process_candidates = list(native_processes)
+    source = _source_from_process_candidates(process_candidates)
+
+    if source is None:
+        fallback_processes, fallback_probe = query_running_processes_powershell()
+        diagnostics.add(fallback_probe)
+        process_candidates.extend(fallback_processes)
+        source = _source_from_process_candidates(fallback_processes)
+    else:
+        diagnostics.add(
+            SourceProbeResult(
+                "running-process-powershell",
+                PROBE_NOT_AVAILABLE,
+                (),
+                "not attempted because native process discovery yielded a readable source",
+            )
+        )
+
+    packages, package_probe = query_appx_packages_with_probe()
+    diagnostics.add(package_probe)
+    if source is None:
+        package_candidates = sorted(
+            [package for package in packages if package.install_location is not None],
+            key=lambda package: (
+                int(package.name.casefold() == "openai.codex"),
+                int("chatgpt" in package.name.casefold()),
+                package.version,
+            ),
+            reverse=True,
+        )
+        for package in package_candidates:
+            source = _source_layout(package.install_location, package, "appx")
+            if source is not None:
+                break
 
     local = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
     conventional = (
@@ -353,20 +954,99 @@ def locate_desktop_source(explicit: Path | None = None) -> DesktopSource:
         local / "OpenAI" / "ChatGPT",
         local / "OpenAI" / "Codex",
     )
-    for root in conventional:
-        found = _source_layout(root, PackageMetadata(install_location=root), "conventional")
-        if found is not None:
-            return found
-
-    package_text = "; ".join(
-        f"{package.name} at {package.install_location or '(location hidden)'}"
-        for package in packages
-    ) or "Get-AppxPackage returned no accessible OpenAI/Codex package"
-    tried = ", ".join(str(path) for path in conventional)
-    raise RuntimeError(
-        "Windows ChatGPT source not found. The official installation was not "
-        "modified or ACL-bypassed. Packages: " + package_text + ". Tried: " + tried
+    if source is None:
+        for root in conventional:
+            source = _source_layout(root, PackageMetadata(install_location=root), "conventional")
+            if source is not None:
+                break
+    diagnostics.add(
+        SourceProbeResult(
+            "conventional-paths",
+            PROBE_PASS if source is not None and source.source_kind == "conventional" else PROBE_FAIL,
+            tuple(str(path) for path in conventional),
+            None if source is not None else "no directly readable ChatGPT.exe/app.asar pair found",
+        )
     )
+
+    if source is not None:
+        diagnostics.manifest_aumids = list(read_appx_manifest_aumids(source.source_root, source.package))
+        package_prefix = f"{source.package.name}_".casefold()
+        matching_registered = [
+            aumid
+            for aumid in diagnostics.aumids
+            if aumid.casefold().startswith(package_prefix)
+        ]
+        if matching_registered:
+            diagnostics.selected_aumid = matching_registered[0]
+        elif diagnostics.manifest_aumids and diagnostics.selected_aumid is None:
+            diagnostics.selected_aumid = diagnostics.manifest_aumids[0]
+            diagnostics.add(
+                SourceProbeResult(
+                    "AppxManifest-AUMID-fallback",
+                    PROBE_PASS,
+                    tuple(diagnostics.manifest_aumids),
+                    "Get-StartApps had no matching package identity; AUMID derived from package identity and manifest Application id",
+                )
+            )
+        diagnostics.selected_source = source
+        diagnostics.access = source_access_probes(source)
+        return source, diagnostics
+
+    if diagnostics.aumids and not process_candidates:
+        diagnostics.add(
+            SourceProbeResult(
+                "registered-app-follow-up",
+                PROBE_FAIL,
+                tuple(diagnostics.aumids),
+                "AUMID exists but no ChatGPT.exe/Codex.exe process is running; launch the official app manually and rerun discovery",
+            )
+        )
+    elif process_candidates:
+        diagnostics.add(
+            SourceProbeResult(
+                "running-process-source-layout",
+                PROBE_FAIL,
+                tuple(candidate.label() for candidate in process_candidates),
+                "running process was found, but its known executable path did not expose a directly readable app.asar",
+            )
+        )
+    return None, diagnostics
+
+
+def format_source_diagnostics(diagnostics: SourceDiagnostics) -> str:
+    lines = ["Phase 2A Windows Desktop source diagnostics"]
+    lines.append("registered AUMID: " + (", ".join(diagnostics.aumids) if diagnostics.aumids else "none"))
+    if diagnostics.manifest_aumids:
+        lines.append("manifest-derived AUMID: " + ", ".join(diagnostics.manifest_aumids))
+    for probe in diagnostics.probes:
+        lines.append(f"- {probe.method}: {probe.status}")
+        if probe.candidates:
+            lines.append("  candidates: " + "; ".join(probe.candidates))
+        if probe.error:
+            lines.append("  error: " + probe.error)
+    source = diagnostics.selected_source
+    if source is None:
+        lines.append("selected ChatGPT.exe: none")
+    else:
+        lines.extend(
+            [
+                f"selected {source.executable.name}: {source.executable}",
+                f"package root: {source.source_root}",
+                f"package metadata: {json.dumps(package_to_dict(source.package), sort_keys=True)}",
+            ]
+        )
+    lines.append("direct-read results:")
+    for probe in diagnostics.access:
+        detail = f" ({probe.error})" if probe.error else ""
+        lines.append(f"- {probe.method}: {probe.status}{detail}")
+    return "\n".join(lines)
+
+
+def locate_desktop_source(explicit: Path | None = None) -> DesktopSource:
+    source, diagnostics = discover_desktop_source(explicit)
+    if source is not None:
+        return source
+    raise SourceDiscoveryError(format_source_diagnostics(diagnostics), diagnostics)
 
 
 def copy_byte_identical(source: Path, destination: Path) -> str:
