@@ -150,7 +150,7 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             with patch("scripts.windows.discovery.read_file_version", return_value="1.2.3"):
                 source = locate_desktop_source(root)
             self.assertEqual(source.executable.name, "ChatGPT.exe")
-            self.assertEqual(source.app_asar, resources / "app.asar")
+            self.assertEqual(source.app_asar, (resources / "app.asar").resolve(strict=False))
 
     def test_running_process_selection_prefers_official_chatgpt_path(self) -> None:
         candidates = [
@@ -230,9 +230,9 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                     package=package,
                     source_kind="running-process",
                 )
-            self.assertEqual(source.source_root, package_root)
-            self.assertEqual(source.app_dir, app)
-            self.assertEqual(source.app_asar, app / "resources" / "app.asar")
+            self.assertEqual(source.source_root, package_root.resolve(strict=False))
+            self.assertEqual(source.app_dir, app.resolve(strict=False))
+            self.assertEqual(source.app_asar, (app / "resources" / "app.asar").resolve(strict=False))
 
     def test_start_apps_recognition_uses_aumid_not_display_name(self) -> None:
         rows = [
