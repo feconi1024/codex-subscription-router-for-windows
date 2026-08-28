@@ -56,11 +56,22 @@ try:
     from .windows.smoke import (
         BLOCKED_OTHER_PACKAGE_IDENTITY,
         BLOCKED_UPDATER_IDENTITY,
+        DEVELOPMENT_ONLY_SANDBOX_BYPASS,
         DIRECT_LAUNCH_IDENTITY_BLOCKED,
         DIRECT_LAUNCH_PASS,
         MINIMAL_BOOTSTRAP_IDENTITY_BLOCKED,
         MINIMAL_BOOTSTRAP_PASS,
+        PATCHED_SHELL_BLOCKED,
+        PATCHED_SHELL_PASS,
+        PHASE2A4_APP_CONTAINER_ACCESS_FIX_CONFIRMED,
+        PHASE2A4_FAIL,
+        PHASE2A4_FULL_PASS,
+        PHASE2A4_LOCAL_ACL_FIX_CONFIRMED,
+        PHASE2A4_PATCHED_SHELL_BLOCKED,
+        PHASE2A4_WINDOWS_GPU_SANDBOX_REGRESSION,
+        final_layout_smoke_root,
         run_launch_probes,
+        run_patched_shell_smoke,
         run_phase2a4_sandbox_validation,
         run_smoke_launch_matrix,
         run_unmodified_mirror_smoke,
@@ -117,11 +128,22 @@ except ImportError:
     from windows.smoke import (
         BLOCKED_OTHER_PACKAGE_IDENTITY,
         BLOCKED_UPDATER_IDENTITY,
+        DEVELOPMENT_ONLY_SANDBOX_BYPASS,
         DIRECT_LAUNCH_IDENTITY_BLOCKED,
         DIRECT_LAUNCH_PASS,
         MINIMAL_BOOTSTRAP_IDENTITY_BLOCKED,
         MINIMAL_BOOTSTRAP_PASS,
+        PATCHED_SHELL_BLOCKED,
+        PATCHED_SHELL_PASS,
+        PHASE2A4_APP_CONTAINER_ACCESS_FIX_CONFIRMED,
+        PHASE2A4_FAIL,
+        PHASE2A4_FULL_PASS,
+        PHASE2A4_LOCAL_ACL_FIX_CONFIRMED,
+        PHASE2A4_PATCHED_SHELL_BLOCKED,
+        PHASE2A4_WINDOWS_GPU_SANDBOX_REGRESSION,
+        final_layout_smoke_root,
         run_launch_probes,
+        run_patched_shell_smoke,
         run_phase2a4_sandbox_validation,
         run_smoke_launch_matrix,
         run_unmodified_mirror_smoke,
@@ -776,17 +798,153 @@ def _run_sandbox_acl_smoke(args: argparse.Namespace) -> int:
         _write_json(args.diagnostics_json, diagnostics.to_dict())
         print(format_source_diagnostics(diagnostics), file=sys.stderr)
         return 1
+    candidates: list[RealCodexCandidate] = []
     try:
         real, candidates = discover_real_codex(args.real_codex)
         desktop_candidates = inventory_desktop_executables(source)
         smoke = run_phase2a4_sandbox_validation(source, real, desktop_candidates)
-    except (PackagingBlockedError, OSError, RuntimeError, subprocess.SubprocessError) as error:
+    except PermissionError as error:
         smoke = {
-            "status": "PHASE 2A.4 FAIL",
-            "reason": str(error),
-            "manual_operation_required": False,
+            "status": PHASE2A4_FAIL,
+            "reason": f"permission denied while preparing the Router-owned smoke root: {error}",
+            "manual_operation_required": True,
         }
         candidates = []
+    except (PackagingBlockedError, OSError, RuntimeError, subprocess.SubprocessError) as error:
+        smoke = {
+            "status": PHASE2A4_FAIL,
+            "reason": str(error),
+            "manual_operation_required": True if isinstance(error, PermissionError) else False,
+        }
+        candidates = []
+
+    def run_disposable_patched_shell(
+        diagnostic_arguments: tuple[str, ...] = (),
+        *,
+        development_only: bool = False,
+    ) -> dict[str, object]:
+        patched_cleanup: dict[str, object] = {}
+        try:
+            with final_layout_smoke_root(patched_cleanup) as smoke_root:
+                if patched_cleanup.get("path_virtualized") is True:
+                    patched = {
+                        "status": PATCHED_SHELL_BLOCKED,
+                        "reason": "the disposable patched-shell root was filesystem-virtualized by the host",
+                        "installation_root": str(smoke_root),
+                        "manual_operation_required": True,
+                    }
+                else:
+                    patched_destination = smoke_root / "patched-install"
+                    metadata = build_windows_desktop(
+                        source,
+                        real,
+                        patched_destination,
+                        force=False,
+                        allow_untested_source=args.allow_untested_source,
+                        launch_executable=args.launch_executable,
+                        bootstrap_user_data_patch=args.bootstrap_user_data_patch,
+                        bootstrap_disable_updater=args.bootstrap_disable_updater,
+                    )
+                    patched = run_patched_shell_smoke(
+                        patched_destination,
+                        real,
+                        disposable_root=True,
+                        diagnostic_arguments=diagnostic_arguments,
+                        development_only=development_only,
+                    )
+                    patched["build_metadata_summary"] = {
+                        "destination": str(patched_destination),
+                        "desktop_launch_executable": metadata.get("desktop_launch_executable"),
+                        "payload_acl_strategy": metadata.get("payload_acl_strategy"),
+                    }
+                patched["smoke_root_cleanup"] = patched_cleanup
+                return patched
+        except PermissionError as error:
+            return {
+                "status": PATCHED_SHELL_BLOCKED,
+                "reason": f"permission denied during disposable patched-shell validation: {error}",
+                "smoke_root_cleanup": patched_cleanup,
+                "manual_operation_required": True,
+            }
+        except (PackagingBlockedError, OSError, RuntimeError, subprocess.SubprocessError) as error:
+            return {
+                "status": PATCHED_SHELL_BLOCKED,
+                "reason": str(error),
+                "smoke_root_cleanup": patched_cleanup,
+                "manual_operation_required": True,
+            }
+
+    # A full patched-shell check is meaningful only after a normal-sandbox
+    # ChatGPT probe passes in a real, non-virtualized final-layout root. Build
+    # into a disposable sibling that is removed with the smoke root; never
+    # replace the user's configured destination from this diagnostic mode.
+    probe_c = smoke.get("probe_c_acl_normal_sandbox")
+    probe_b = smoke.get("probe_b_disable_gpu_sandbox")
+    if smoke.get("native_evidence_usable") is True and isinstance(probe_c, dict) and probe_c.get("status") == "PASS":
+        if not candidates:
+            smoke["patched_shell"] = {
+                "status": PATCHED_SHELL_BLOCKED,
+                "reason": "the validated real Codex candidate is unavailable for the patched-shell probe",
+                "manual_operation_required": True,
+            }
+            smoke["status"] = PHASE2A4_PATCHED_SHELL_BLOCKED
+            smoke["manual_operation_required"] = True
+        else:
+            real = candidates[0]
+            smoke["patched_shell"] = run_disposable_patched_shell()
+            patched_shell = smoke.get("patched_shell")
+            patched_cleanup = patched_shell.get("smoke_root_cleanup") if isinstance(patched_shell, dict) else None
+            if (
+                not isinstance(patched_shell, dict)
+                or patched_shell.get("status") != PATCHED_SHELL_PASS
+                or not isinstance(patched_cleanup, dict)
+                or patched_cleanup.get("removed") is not True
+            ):
+                smoke["status"] = PHASE2A4_PATCHED_SHELL_BLOCKED
+                smoke["manual_operation_required"] = True
+            else:
+                smoke["status"] = PHASE2A4_FULL_PASS
+                smoke["reason"] = "normal-sandbox probes and the disposable patched Router shell passed"
+                smoke["manual_operation_required"] = False
+    elif (
+        smoke.get("native_evidence_usable") is True
+        and isinstance(probe_b, dict)
+        and probe_b.get("status") == "PASS"
+        and isinstance(probe_c, dict)
+        and probe_c.get("status") != "PASS"
+    ):
+        # This is the sole development-only escape hatch. It answers whether
+        # the rest of the patched shell is functional when Chromium's GPU
+        # sandbox switch is the remaining blocker; it can never become a
+        # production-pass verdict or alter generated launch metadata.
+        if not candidates:
+            development_probe = {
+                "status": PATCHED_SHELL_BLOCKED,
+                "reason": "the validated real Codex candidate is unavailable for the development-only probe",
+                "manual_operation_required": True,
+            }
+        else:
+            real = candidates[0]
+            development_probe = run_disposable_patched_shell(
+                ("--disable-gpu-sandbox",),
+                development_only=True,
+            )
+        smoke["development_only_patched_shell"] = development_probe
+        development_cleanup = development_probe.get("smoke_root_cleanup")
+        if (
+            development_probe.get("status") == DEVELOPMENT_ONLY_SANDBOX_BYPASS
+            and isinstance(development_cleanup, dict)
+            and development_cleanup.get("removed") is True
+        ):
+            smoke["status"] = PHASE2A4_WINDOWS_GPU_SANDBOX_REGRESSION
+            smoke["reason"] = (
+                "the one disposable development-only sandbox bypass smoke passed; "
+                "the normal-sandbox production path remains blocked"
+            )
+        else:
+            smoke["status"] = PHASE2A4_PATCHED_SHELL_BLOCKED
+            smoke["reason"] = "the development-only sandbox bypass smoke was blocked"
+        smoke["manual_operation_required"] = True
     payload = diagnostics.to_dict()
     payload["phase2a4_sandbox"] = smoke
     if candidates:
@@ -796,17 +954,24 @@ def _run_sandbox_acl_smoke(args: argparse.Namespace) -> int:
     print(f"Reason: {smoke.get('reason')}")
     if smoke.get("manual_operation_required"):
         print(
-            "Manual operation required: the local Router-owned app ACL could not be "
-            "applied or verified; no official WindowsApps path was modified."
+            "Manual operation required: native evidence or the Router-owned disposable "
+            "root could not be validated; no official WindowsApps path was modified."
         )
     for label in ("probe_a_normal", "probe_b_disable_gpu_sandbox", "probe_c_acl_normal_sandbox"):
         probe = smoke.get(label)
         if isinstance(probe, dict):
             print(f"{label}: {probe.get('status')}")
+    patched_shell = smoke.get("patched_shell")
+    if isinstance(patched_shell, dict):
+        print(f"patched_shell: {patched_shell.get('status')}")
+    development_patched_shell = smoke.get("development_only_patched_shell")
+    if isinstance(development_patched_shell, dict):
+        print(f"development_only_patched_shell: {development_patched_shell.get('status')}")
     print(json.dumps(smoke, indent=2))
     return 0 if smoke.get("status") in {
-        "LOCAL_APP_ACL_FIX_CONFIRMED",
-        "APP_CONTAINER_ACCESS_FIX_CONFIRMED",
+        PHASE2A4_FULL_PASS,
+        PHASE2A4_LOCAL_ACL_FIX_CONFIRMED,
+        PHASE2A4_APP_CONTAINER_ACCESS_FIX_CONFIRMED,
     } else 1
 
 
@@ -1157,6 +1322,18 @@ def build_windows_desktop(
             copy_unpacked_tree(generated_unpacked, staged_resources / "app.asar.unpacked")
 
         staged_runtime.mkdir(parents=True, exist_ok=True)
+        staged_mux_home = staged_runtime / ".codex-mux"
+        staged_mux_home.mkdir(parents=True, exist_ok=True)
+        # The launcher deliberately points the mux at the Router-owned state
+        # directory. Copy the already validated local control token into that
+        # disposable staging tree so the patched renderer and mux authenticate
+        # to the same local server without falling back to the official state.
+        staged_control_token = staged_mux_home / "control-token"
+        staged_control_token.write_text(token + "\n", encoding="utf-8")
+        try:
+            staged_control_token.chmod(0o600)
+        except OSError:
+            pass
         mux = staged_runtime / "codex-mux.exe"
         staged_real = staged_runtime / "codex.real.exe"
         launcher = staged / "Codex Subscription Router.exe"
@@ -1200,6 +1377,7 @@ def build_windows_desktop(
                 staged_source_executable,
                 staged_resources / "app.asar",
                 staged / "launch.json",
+                staged_control_token,
             )
         ):
             raise RuntimeError("staged Windows Desktop layout is incomplete")

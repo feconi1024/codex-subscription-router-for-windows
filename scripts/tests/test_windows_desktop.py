@@ -71,11 +71,15 @@ from scripts.windows.smoke import (
     BLOCKED_UPDATER_IDENTITY,
     CRASHED,
     LOCAL_APP_ACL_FIX_CONFIRMED,
+    PATCHED_SHELL_BLOCKED,
+    PHASE2A4_LOCAL_ACL_FIX_CONFIRMED,
     PASS,
     _probe_candidate,
     classify_probe_output,
     final_layout_smoke_root,
+    _phase2a4_display_verdict,
     _phase2a4_verdict,
+    run_patched_shell_smoke,
 )
 from scripts.windows.acl import (
     ALL_APPLICATION_PACKAGES_SID,
@@ -474,6 +478,16 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         resource = classify_probe_output("failed to open resources\\app.asar", still_running=False, return_code=1)
         self.assertEqual(resource["status"], BLOCKED_RESOURCE)
 
+    def test_launch_classification_recognizes_gpu_not_usable_fatal_line(self) -> None:
+        result = classify_probe_output(
+            "[gpu_process_host] launch GPU process\nGPU process isn't usable. Goodbye.",
+            still_running=False,
+            return_code=-2147483645,
+        )
+        self.assertEqual(result["status"], BLOCKED_CHROMIUM_SANDBOX)
+        self.assertEqual(result["chromium_sandbox"]["fatal_line"], "GPU process isn't usable. Goodbye.")
+        self.assertGreaterEqual(result["chromium_sandbox"]["gpu_child_launch_attempt_count"], 1)
+
     def test_launch_classification_separates_gpu_sandbox_failure_and_records_child_evidence(self) -> None:
         log = "\n".join(
             [
@@ -509,11 +523,12 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
 
     def test_phase2a4_final_layout_root_uses_localappdata_and_is_disposable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
+            cleanup: dict[str, object] = {}
             with patch("scripts.windows.smoke.os.name", "nt"), patch(
                 "scripts.windows.smoke.os.environ",
                 {"LOCALAPPDATA": temporary},
             ):
-                with final_layout_smoke_root() as root:
+                with final_layout_smoke_root(cleanup) as root:
                     self.assertTrue(root.is_dir())
                     self.assertTrue(root.parent.parent.name == "Codex Subscription Router")
                     self.assertTrue((root / "app").is_dir())
@@ -521,6 +536,9 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                     self.assertTrue((root / "codex-home").is_dir())
                     kept_root = root
             self.assertFalse(kept_root.exists())
+            self.assertEqual(cleanup["requested_path"], cleanup["resolved_path"])
+            self.assertFalse(cleanup["path_virtualized"])
+            self.assertTrue(cleanup["removed"])
 
     def test_phase2a4_verdict_ignores_codex_diagnostic_failure(self) -> None:
         probe_a = {"status": BLOCKED_CHROMIUM_SANDBOX}
@@ -530,6 +548,10 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         self.assertEqual(
             _phase2a4_verdict(probe_a, {"status": "CRASHED"}, probe_c, None),
             APP_CONTAINER_ACCESS_FIX_CONFIRMED,
+        )
+        self.assertEqual(
+            _phase2a4_display_verdict(LOCAL_APP_ACL_FIX_CONFIRMED),
+            PHASE2A4_LOCAL_ACL_FIX_CONFIRMED,
         )
 
     def test_sandbox_bypass_flags_are_not_in_production_launcher_or_builder(self) -> None:
@@ -541,6 +563,30 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         )
         self.assertNotIn('"--disable-gpu-sandbox"', launcher)
         self.assertNotIn('"--no-sandbox"', launcher)
+
+    def test_patched_shell_smoke_requires_an_explicit_disposable_root(self) -> None:
+        with patch("scripts.windows.smoke.os.name", "nt"):
+            result = run_patched_shell_smoke(Path(tempfile.gettempdir()) / "router", object())
+        self.assertEqual(result["status"], PATCHED_SHELL_BLOCKED)
+        self.assertTrue(result["manual_operation_required"])
+        self.assertIn("disposable", result["reason"])
+
+    def test_patched_shell_sandbox_flag_requires_development_only_mode(self) -> None:
+        with patch("scripts.windows.smoke.os.name", "nt"):
+            result = run_patched_shell_smoke(
+                Path(tempfile.gettempdir()) / "router",
+                object(),
+                disposable_root=True,
+                diagnostic_arguments=("--disable-gpu-sandbox",),
+            )
+        self.assertEqual(result["status"], PATCHED_SHELL_BLOCKED)
+        self.assertTrue(result["manual_operation_required"])
+
+    def test_builder_copies_mux_token_into_router_owned_runtime_state(self) -> None:
+        source = inspect.getsource(build_windows_desktop)
+        self.assertIn('staged_runtime / ".codex-mux"', source)
+        self.assertIn('staged_mux_home / "control-token"', source)
+        self.assertIn("staged_control_token.write_text(token", source)
 
     def test_minimal_bootstrap_patch_has_no_renderer_or_ui_bridge_change(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
