@@ -578,7 +578,13 @@ def terminate_process_tree(root_pid: int, snapshot: Iterable[RunningProcessCandi
     kernel32.WaitForSingleObject.restype = ctypes.c_uint32
     kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     kernel32.CloseHandle.restype = ctypes.c_int
-    targets = process_tree_pids(root_pid, snapshot)
+    snapshot_rows = list(snapshot)
+    targets = process_tree_pids(root_pid, snapshot_rows)
+    # Never open a PID that disappeared before the cleanup snapshot; it could
+    # have been reused by an unrelated process. Descendants are retained only
+    # when their parent relationship is present in that same snapshot.
+    if root_pid not in {row.pid for row in snapshot_rows}:
+        targets = tuple(pid for pid in targets if pid != root_pid)
     terminated: list[int] = []
     errors: list[str] = []
     for pid in reversed(targets):

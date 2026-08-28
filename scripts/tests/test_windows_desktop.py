@@ -38,6 +38,7 @@ from scripts.windows.discovery import (
     read_appx_manifest_metadata,
     recognize_start_app_aumids,
     select_running_process,
+    process_tree_pids,
 )
 from scripts.windows.fuses import FUSE_INDEX, FUSE_VALUES, SENTINEL, FuseSnapshot, read_fuses, write_fuse
 from scripts.windows.integrity import (
@@ -50,6 +51,7 @@ from scripts.windows.integrity import (
     asar_header_digest,
     read_pe_integrity_resources,
     resolve_windows_asar_integrity,
+    scan_fuse_carriers,
 )
 from scripts.windows.mirror import (
     DirectoryEnumerationBlockedError,
@@ -182,6 +184,28 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             ]
         )
         self.assertEqual(legacy.name, "codex.exe")
+
+    def test_process_tree_scope_never_includes_unrelated_processes(self) -> None:
+        snapshot = [
+            RunningProcessCandidate(pid=10, name="ChatGPT.exe", parent_pid=1),
+            RunningProcessCandidate(pid=11, name="helper.exe", parent_pid=10),
+            RunningProcessCandidate(pid=12, name="unrelated.exe", parent_pid=99),
+        ]
+        self.assertEqual(process_tree_pids(10, snapshot), (10, 11))
+
+    def test_fuse_scan_records_carrier_state_and_scans_dlls(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            carrier = root / "ChatGPT.exe"
+            carrier.write_bytes(
+                b"MZ" + SENTINEL + bytes([1, 9]) + bytes(FUSE_VALUES["on"] for _ in range(9))
+            )
+            (root / "helper.dll").write_bytes(b"dll")
+            report = scan_fuse_carriers(root)
+            self.assertEqual(report["carrier_count"], 1)
+            self.assertEqual(report["carriers"][0]["relative"], "ChatGPT.exe")
+            self.assertEqual(report["carriers"][0]["fuse"]["fuses"][8], "on")
+            self.assertEqual(len(report["scanned_files"]), 2)
 
     def test_known_executable_derives_package_layout_without_parent_enumeration(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -460,6 +484,7 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                 input=initial_payload,
                 text=True,
                 check=True,
+                stdout=subprocess.PIPE,
             )
             before = read_pe_integrity_resources(executable)
             self.assertEqual(before["resources"][0]["parsed"][0]["value"], "0" * 64)

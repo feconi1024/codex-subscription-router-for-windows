@@ -8,7 +8,6 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
 
 try:
     from .discovery import (
@@ -42,6 +41,9 @@ _IDENTITY_PATTERNS = (
     r"activation context",
     r"register(?:ed|ing)?",
     r"windowsapps",
+    r"failed to set up updater",
+    r"initializewindowsupdater",
+    r"bootstrap failed to start the main app",
 )
 _SINGLE_INSTANCE_PATTERNS = (
     r"single instance",
@@ -165,11 +167,10 @@ def run_unmodified_mirror_smoke(
             ]
             final_windows = enumerate_windows_for_processes(final_pids)
             still_running = return_code is None
-            cleanup = terminate_process_tree(process.pid, final_snapshot) if still_running else {
-                "requested": [],
-                "terminated": [],
-                "errors": [],
-            }
+            # The root may exit while a helper remains alive. Always derive the
+            # cleanup set from the root PID and the final parent snapshot so no
+            # created child is left behind and no unrelated process is touched.
+            cleanup = terminate_process_tree(process.pid, final_snapshot)
             log_text = _tail(log_path)
 
         identity_errors = _matching_lines(log_text, _IDENTITY_PATTERNS)
@@ -181,6 +182,10 @@ def run_unmodified_mirror_smoke(
             status = "PASS"
             reason = "mirrored ChatGPT.exe remained healthy for the bounded startup interval"
             manual_required = False
+        elif identity_errors:
+            status = "BLOCKED_PACKAGE_IDENTITY"
+            reason = "the mirrored shell reported a package-registration or Windows identity failure"
+            manual_required = False
         elif official_instance and (single_instance_errors or return_code in {0, 1}):
             status = "BLOCKED_SINGLE_INSTANCE_LOCK"
             reason = (
@@ -188,10 +193,6 @@ def run_unmodified_mirror_smoke(
                 "single-instance locking is the leading cause"
             )
             manual_required = True
-        elif identity_errors:
-            status = "BLOCKED_PACKAGE_IDENTITY"
-            reason = "the mirrored shell reported a package-registration or Windows identity failure"
-            manual_required = False
         else:
             status = "FAIL"
             reason = f"mirrored ChatGPT.exe exited before the startup interval (code={return_code})"

@@ -20,6 +20,7 @@ try:
         ensure_asar_tool,
         load_or_create_token,
         patch_renderer,
+        select_renderer_variant,
     )
     from .windows.bootstrap import BootstrapPatchReport, audit_bootstrap, patch_bootstrap
     from .windows.compatibility import find_matching_record, load_compatibility_records
@@ -65,6 +66,7 @@ except ImportError:
         ensure_asar_tool,
         load_or_create_token,
         patch_renderer,
+        select_renderer_variant,
     )
     from windows.bootstrap import BootstrapPatchReport, audit_bootstrap, patch_bootstrap
     from windows.compatibility import find_matching_record, load_compatibility_records
@@ -364,6 +366,18 @@ def audit_windows_source(source: DesktopSource) -> dict[str, object]:
         fuse_scan = scan_fuse_carriers(mirror_root)
         extracted = temporary_root / "asar"
         run([str(asar), "extract", str(source.app_asar), str(extracted)])
+        initial_bundles = list((extracted / "webview" / "assets").glob("app-initial-*.js"))
+        try:
+            if len(initial_bundles) != 1:
+                raise RuntimeError(f"expected one initial renderer bundle, found {len(initial_bundles)}")
+            renderer_variant_id = select_renderer_variant(
+                initial_bundles[0].read_text(encoding="utf-8"),
+                package_name=source.package.name,
+                package_version=source.package.version,
+                app_asar_sha256=source_hash,
+            ).variant_id
+        except RuntimeError:
+            renderer_variant_id = "UNRESOLVED"
         renderer_audit = audit_renderer_anchors(
             extracted,
             package_name=source.package.name,
@@ -406,11 +420,13 @@ def audit_windows_source(source: DesktopSource) -> dict[str, object]:
             }
             for item in renderer_audit
         ],
+        "renderer_variant": renderer_variant_id,
         "electron_fuses": fuse_summary,
         "renderer_audit_pass": not _audit_has_failure(renderer_audit),
         "fuse_audit_pass": True,
         "audit_pass": (
-            not _audit_has_failure(renderer_audit)
+            renderer_variant_id != "UNRESOLVED"
+            and not _audit_has_failure(renderer_audit)
             and bool(bootstrap_audit.get("audit_pass"))
             and integrity_plan.resolved
         ),
@@ -469,6 +485,7 @@ def _run_source_audit(args: argparse.Namespace) -> int:
     print(f"ChatGPT.exe ProductVersion: {audit['source']['product_version']}")
     print(f"Authenticode: {audit['source']['authenticode']}")
     print(f"ASAR header SHA-256: {audit['source']['app_asar_header_sha256']}")
+    print(f"Renderer variant: {audit['renderer_variant']}")
     print(f"AppxBlockMap files: {audit['appx_block_map']['file_count']}")
     print(f"Electron fuses: {json.dumps(audit['electron_fuses'], sort_keys=True)}")
     print(f"Windows ASAR integrity: {json.dumps(audit['windows_asar_integrity'], sort_keys=True)}")

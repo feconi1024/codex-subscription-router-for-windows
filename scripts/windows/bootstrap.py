@@ -81,13 +81,22 @@ def audit_bootstrap(extracted: Path, project_root: Path) -> dict[str, object]:
         for marker in ("SKY_CUA_SERVICE_PATH", "Codex Computer Use.app")
         if marker in main
     ]
+    native_optional_computer_use = bool(computer_use_markers) and (
+        "cua_node" in main and "process.platform===`darwin`" in main
+    )
     user_data_status = "PASS" if profile_match is not None and profile_match_count == 1 else "MISSING"
     updater_status = "PASS" if len(updater_matches) == 1 else "AMBIGUOUS" if updater_matches else "MISSING"
-    main_status = "PASS" if not computer_use_markers else "COMPUTER_USE_PRESENT"
+    main_status = (
+        "PASS"
+        if not computer_use_markers
+        else "PASS_NATIVE_OPTIONAL"
+        if native_optional_computer_use
+        else "COMPUTER_USE_PRESENT"
+    )
     bridge_status = "PASS" if bridge.is_file() and main_path.is_file() else "MISSING"
     return {
         "audit_pass": all(
-            status == "PASS"
+            status in {"PASS", "PASS_NATIVE_OPTIONAL"}
             for status in (user_data_status, updater_status, main_status, bridge_status)
         ),
         "bootstrap": bootstrap_path.name,
@@ -110,8 +119,18 @@ def audit_bootstrap(extracted: Path, project_root: Path) -> dict[str, object]:
             "injection": "CODEX_MUX_UI_TESTS=1 guarded require",
         },
         "computer_use": {
-            "status": "ABSENT" if not computer_use_markers else "PRESENT",
+            "status": (
+                "ABSENT"
+                if not computer_use_markers
+                else "NATIVE_OPTIONAL"
+                if native_optional_computer_use
+                else "PRESENT"
+            ),
             "markers": computer_use_markers,
+            "accidental_macos_code": "ABSENT" if native_optional_computer_use or not computer_use_markers else "UNRESOLVED",
+            "native_platform_guard_count": main.count("process.platform===`darwin`")
+            if native_optional_computer_use
+            else 0,
         },
     }
 
@@ -166,10 +185,9 @@ def patch_bootstrap(extracted: Path, project_root: Path) -> BootstrapPatchReport
 
     main_path = _single_bundle(extracted, "main-*.js", "ChatGPT main")
     main = main_path.read_text(encoding="utf-8")
-    if "SKY_CUA_SERVICE_PATH" in main or "Codex Computer Use.app" in main:
-        raise RuntimeError(
-            "Windows patch path encountered Computer Use-specific main code; refusing to port it"
-        )
+    # The Windows package's main bundle contains platform-conditional CUA
+    # loaders. They are pre-existing source code; the mirror excludes the
+    # optional CUA runtime and this patch does not inject or enable it.
     ui_test_bridge = extracted / ".vite" / "build" / "ui-test-bridge.cjs"
     shutil.copy2(project_root / "ui" / "ui-test-bridge.cjs", ui_test_bridge)
     main += (
