@@ -29,6 +29,8 @@ INVALID_HANDLE_VALUE = -1
 WAIT_OBJECT_0 = 0x00000000
 DESKTOP_EXECUTABLE_NAMES = ("ChatGPT.exe", "Codex.exe")
 OPENAI_AUMID_PATTERNS = ("OpenAI.Codex_*!App", "OpenAI.ChatGPT_*!App")
+EXACT_26_820_PACKAGE_NAME = "OpenAI.Codex"
+EXACT_26_820_PACKAGE_VERSION = "26.820.7780.0"
 
 
 def _is_known_aumid(value: str) -> bool:
@@ -1039,6 +1041,51 @@ def inventory_desktop_executables(source: DesktopSource) -> tuple[DesktopExecuta
             )
         )
     return tuple(inventory)
+
+
+def select_authoritative_desktop_candidate(
+    source: DesktopSource,
+    candidates: Iterable[DesktopExecutableCandidate],
+) -> DesktopExecutableCandidate:
+    """Select the shell for this source without letting a diagnostic sibling veto it."""
+    present = [candidate for candidate in candidates if candidate.present]
+    if not present:
+        raise RuntimeError("no root-level Windows Desktop shell is present")
+
+    by_relative = {
+        candidate.relative_path.replace("/", "\\").casefold(): candidate
+        for candidate in present
+    }
+    if (
+        source.package.name.casefold() == EXACT_26_820_PACKAGE_NAME.casefold()
+        and source.package.version == EXACT_26_820_PACKAGE_VERSION
+    ):
+        exact = by_relative.get(r"app\chatgpt.exe")
+        if exact is None:
+            raise RuntimeError(
+                "exact OpenAI.Codex 26.820.7780.0 source has no app\\ChatGPT.exe shell"
+            )
+        if not exact.appx_manifest_declared:
+            raise RuntimeError(
+                "exact OpenAI.Codex 26.820.7780.0 source does not declare app\\ChatGPT.exe in AppxManifest.xml"
+            )
+        return exact
+
+    manifest_candidates = [candidate for candidate in present if candidate.appx_manifest_declared]
+    if len(manifest_candidates) == 1:
+        return manifest_candidates[0]
+
+    source_relative = source.executable.resolve(strict=False).relative_to(
+        source.source_root.resolve(strict=False)
+    ).as_posix().replace("/", "\\").casefold()
+    selected = by_relative.get(source_relative)
+    if selected is not None:
+        return selected
+    if len(present) == 1:
+        return present[0]
+    raise RuntimeError(
+        "multiple Desktop shells are present but no compatibility-specific manifest executable was proven"
+    )
 
 
 def read_codex_version(path: Path) -> str:

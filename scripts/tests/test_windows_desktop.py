@@ -7,6 +7,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -43,6 +44,7 @@ from scripts.windows.discovery import (
     process_tree_pids,
     attributable_process_pids,
     inventory_desktop_executables,
+    select_authoritative_desktop_candidate,
     path_is_within,
 )
 from scripts.windows.fuses import FUSE_INDEX, FUSE_VALUES, SENTINEL, FuseSnapshot, read_fuses, write_fuse
@@ -68,6 +70,18 @@ from scripts.windows.smoke import (
     CRASHED,
     _probe_candidate,
     classify_probe_output,
+)
+from scripts.windows.acl import (
+    ALL_APPLICATION_PACKAGES_SID,
+    ALL_RESTRICTED_APPLICATION_PACKAGES_SID,
+    AclAudit,
+    AclMutationBlockedError,
+    APP_CONTAINER_RX_INHERITANCE,
+    _audit_from_payload,
+    audit_acl_scope,
+    prepare_windows_electron_payload_acl,
+    read_acl_audit,
+    validate_router_app_root,
 )
 from scripts.windows.mirror import (
     DirectoryEnumerationBlockedError,
@@ -263,6 +277,172 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             self.assertFalse(inventory[1].present)
             self.assertEqual(inventory[1].authenticode.status, "NOT PRESENT")
             self.assertNotIn(r"resources\codex.exe", [item.relative_path for item in inventory])
+
+    def test_exact_26_820_chatgpt_shell_is_authoritative(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / "app"
+            app.mkdir()
+            source = DesktopSource(
+                source_root=root,
+                app_dir=app,
+                executable=app / "ChatGPT.exe",
+                resources_dir=app / "resources",
+                app_asar=app / "resources" / "app.asar",
+                package=PackageMetadata(
+                    name="OpenAI.Codex",
+                    version="26.820.7780.0",
+                ),
+                source_kind="fixture",
+                file_version="151.0.7922.170",
+            )
+            def candidate(relative: str, declared: bool) -> DesktopExecutableCandidate:
+                return DesktopExecutableCandidate(
+                    path=root / relative.replace("\\", "/"),
+                    relative_path=relative,
+                    present=True,
+                    file_size=1,
+                    file_version="151.0.7922.170",
+                    product_version="151.0.7922.170",
+                    authenticode=AuthenticodeMetadata("Valid", "CN=OpenAI"),
+                    pe_machine=0x8664,
+                    appx_manifest_declared=declared,
+                    fuse_wire_present=False,
+                    fuse=None,
+                    fuse_error=None,
+                    integrity_resource_present=False,
+                    integrity_resources=(),
+                    integrity_error=None,
+                )
+
+            selected = select_authoritative_desktop_candidate(
+                source,
+                (candidate(r"app\ChatGPT.exe", True), candidate(r"app\Codex.exe", False)),
+            )
+            self.assertEqual(selected.relative_path, r"app\ChatGPT.exe")
+
+    def test_acl_audit_normalizes_appcontainer_sids_without_calling_them_malicious(self) -> None:
+        audit = _audit_from_payload(
+            Path(r"C:\router\app"),
+            {
+                "Owner": "S-1-5-21-owner",
+                "Sddl": "O:S-1-5-21-ownerD:(A;;0x1200a9;;;S-1-15-2-1)(A;;0x1200a9;;;S-1-15-2-2)(A;;0x1200a9;;;S-1-15-99-1)",
+                "ProtectedDacl": False,
+                "Access": [
+                    {
+                        "Sid": ALL_APPLICATION_PACKAGES_SID,
+                        "Rights": "ReadAndExecute, Synchronize",
+                        "AccessType": "Allow",
+                        "IsInherited": False,
+                        "InheritanceFlags": "ContainerInherit, ObjectInherit",
+                    },
+                    {
+                        "Sid": ALL_RESTRICTED_APPLICATION_PACKAGES_SID,
+                        "Rights": "ReadAndExecute, Synchronize",
+                        "AccessType": "Allow",
+                        "IsInherited": False,
+                        "InheritanceFlags": "ContainerInherit, ObjectInherit",
+                    },
+                ],
+            },
+        )
+        self.assertTrue(audit.all_application_packages_rx)
+        self.assertTrue(audit.all_restricted_application_packages_rx)
+        self.assertEqual(audit.unknown_appcontainer_sids, ("S-1-15-99-1",))
+        self.assertFalse(audit.inheritance["protected_dacl"])
+
+    def test_acl_scope_is_read_only_and_structured(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "app"
+            path.mkdir()
+            with patch(
+                "scripts.windows.acl._run_acl_query",
+                return_value=(
+                    {
+                        "Owner": "S-1-5-18",
+                        "Sddl": "O:S-1-5-18",
+                        "ProtectedDacl": True,
+                        "Access": [],
+                    },
+                    None,
+                ),
+            ):
+                result = audit_acl_scope({"local_app": path})
+            self.assertTrue(result["read_only"])
+            self.assertFalse(result["manual_operation_required"])
+            self.assertEqual(result["audits"]["local_app"]["path"], str(path.resolve()))
+
+    def test_acl_mutation_rejects_windowsapps_and_paths_outside_router_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / "WindowsApps" / "package" / "app"
+            app.mkdir(parents=True)
+            with self.assertRaises(AclMutationBlockedError):
+                validate_router_app_root(app, app.parent)
+
+            local_root = root / "router"
+            local_app = local_root / "app"
+            local_app.mkdir(parents=True)
+            with self.assertRaises(AclMutationBlockedError):
+                validate_router_app_root(local_app, root)
+
+    def test_acl_mutation_adds_only_two_rx_appcontainer_aces_and_verifies_readback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "router"
+            app = root / "app"
+            app.mkdir(parents=True)
+            before = AclAudit(
+                path=app,
+                exists=True,
+                accessible=True,
+                owner="S-1-5-21-owner",
+                sddl="O:S-1-5-21-owner",
+                protected_dacl=False,
+                inheritance={"protected_dacl": False},
+                all_application_packages_rx=False,
+                all_restricted_application_packages_rx=False,
+                unknown_appcontainer_sids=(),
+                access_entries=(
+                    {
+                        "Sid": "S-1-5-18",
+                        "Rights": "FullControl",
+                        "AccessType": "Allow",
+                        "IsInherited": False,
+                    },
+                ),
+            )
+            after = AclAudit(
+                path=app,
+                exists=True,
+                accessible=True,
+                owner=before.owner,
+                sddl=before.sddl,
+                protected_dacl=False,
+                inheritance={"protected_dacl": False},
+                all_application_packages_rx=True,
+                all_restricted_application_packages_rx=True,
+                unknown_appcontainer_sids=(),
+                access_entries=before.access_entries
+                + (
+                    {"Sid": ALL_APPLICATION_PACKAGES_SID, "Rights": "ReadAndExecute", "AccessType": "Allow", "IsInherited": False},
+                    {"Sid": ALL_RESTRICTED_APPLICATION_PACKAGES_SID, "Rights": "ReadAndExecute", "AccessType": "Allow", "IsInherited": False},
+                ),
+            )
+            with patch("scripts.windows.acl.os.name", "nt"), patch(
+                "scripts.windows.acl.shutil.which", return_value=r"C:\Windows\System32\icacls.exe"
+            ), patch("scripts.windows.acl.read_acl_audit", side_effect=[before, after]), patch(
+                "scripts.windows.acl.subprocess.run",
+                return_value=SimpleNamespace(returncode=0, stdout="processed", stderr=""),
+            ) as run_command:
+                result = prepare_windows_electron_payload_acl(app, router_root=root)
+            self.assertEqual(result["status"], "PASS")
+            self.assertTrue(result["verified"])
+            self.assertEqual(result["scope"], str(app.resolve()))
+            command = run_command.call_args.args[0]
+            self.assertIn(f"*{ALL_APPLICATION_PACKAGES_SID}:{APP_CONTAINER_RX_INHERITANCE}", command)
+            self.assertIn(f"*{ALL_RESTRICTED_APPLICATION_PACKAGES_SID}:{APP_CONTAINER_RX_INHERITANCE}", command)
+            self.assertIn("/T", command)
+            self.assertEqual(result["runtime_user_data_scope"], "excluded")
 
     def test_launch_classification_does_not_treat_plain_windowsapps_path_as_identity(self) -> None:
         result = classify_probe_output(
