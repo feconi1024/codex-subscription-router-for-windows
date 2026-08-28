@@ -94,4 +94,22 @@ jobs:
         run: python -m compileall -q scripts
 
       - name: Test Windows patcher helpers
-        run: python -m unittest discover -s scripts/tests -p "test_*.py"
+        shell: pwsh
+        run: |
+          $output = @(& python -m unittest discover -s scripts/tests -p "test_*.py" 2>&1)
+          $exitCode = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          if ($exitCode -ne 0) {
+            $details = ($output |
+              Where-Object { $_ -match 'FAIL|ERROR|Traceback|AssertionError|Ran |FAILED' } |
+              ForEach-Object { $_.ToString().Trim() }) -join ' | '
+            if ([string]::IsNullOrWhiteSpace($details)) {
+              $details = "Windows helper tests exited with code $exitCode"
+            }
+            $details = $details.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            if ($details.Length -gt 6000) {
+              $details = $details.Substring(0, 6000)
+            }
+            Write-Output "::error file=scripts/tests/test_windows_desktop.py::$details"
+            exit $exitCode
+          }
