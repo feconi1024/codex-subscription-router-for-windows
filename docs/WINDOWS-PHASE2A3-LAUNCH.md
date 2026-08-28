@@ -71,7 +71,9 @@ The implementation nevertheless includes the guarded Gate 2 path, actual-carrier
 - Python helper tests: 38 passed
 - Python compilation: passed
 - `git diff --check`: passed
-- Go build/test/vet: delegated to the pinned Windows CI job because Go is not installed on this workstation
+- Go build/test/vet: passed in the pinned Windows CI job
 - official source/package: unchanged by this validation
 
-Implementation files are `scripts/windows/smoke.py`, `scripts/windows/discovery.py`, `scripts/windows/integrity.py`, `scripts/windows/bootstrap.py`, `scripts/patch_app_windows.py`, `cmd/codex-router-launcher/main.go`, and their tests. The pushed implementation round is commit `f0f7f68`; the documentation/evidence follow-up is pending CI verification.
+Implementation files are `scripts/windows/smoke.py`, `scripts/windows/discovery.py`, `scripts/windows/integrity.py`, `scripts/windows/bootstrap.py`, `scripts/patch_app_windows.py`, `cmd/codex-router-launcher/main.go`, and their tests. The implementation round is commit `f0f7f68`; the evidence follow-up is commit `6f4ac94`.
+
+Required CI run for commit `6f4ac94`: [checks](https://github.com/feconi1024/codex-subscription-router-for-windows/actions/runs/33173214220/job/98855206241) and [windows-go-core](https://github.com/feconi1024/codex-subscription-router-for-windows/actions/runs/33173214220/job/98855206533) both passed.
