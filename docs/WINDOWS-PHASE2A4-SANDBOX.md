@@ -95,3 +95,21 @@ cleanup.
 Until that rerun and the disposable full patched-shell gates pass,
 `docs/WINDOWS-COMPATIBILITY.md` is intentionally not updated to claim Phase
 2A.4 support.
+
+## Patched shell and CI result
+
+The full patched-shell smoke was **not run**. It is correctly gated on
+`native_evidence_usable: true`; the native final-layout root was virtualized
+and cleanup was not usable on this host. The development-only bypass is also
+not claimed or persisted.
+
+For commit [`c668976`](https://github.com/feconi1024/codex-subscription-router-for-windows/commit/c66897655a85c3ce632618c74a29310b26db330c), both required CI jobs passed:
+
+- `checks`: success
+- `windows-go-core`: success
+
+CI run: [33182217090](https://github.com/feconi1024/codex-subscription-router-for-windows/actions/runs/33182217090)
+
+Therefore the final Phase 2A.4 verdict remains `PHASE 2A.4 FAIL`: code and CI
+are green, but the required native final-layout and patched-shell evidence is
+still blocked by this host’s AppContainer virtualization.
