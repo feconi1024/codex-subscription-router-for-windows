@@ -23,7 +23,14 @@ try:
         select_renderer_variant,
     )
     from .windows.bootstrap import BootstrapPatchReport, audit_bootstrap, patch_bootstrap
-    from .windows.compatibility import find_matching_record, load_compatibility_records
+    from .windows.compatibility import (
+        PAYLOAD_ACL_APPCONTAINER_RX,
+        PAYLOAD_ACL_NONE,
+        PAYLOAD_ACL_STRATEGIES,
+        PAYLOAD_ACL_UNRESOLVED,
+        find_matching_record,
+        load_compatibility_records,
+    )
     from .windows.discovery import (
         DesktopExecutableCandidate,
         DesktopSource,
@@ -46,7 +53,7 @@ try:
         select_authoritative_desktop_candidate,
     )
     from .windows.fuses import FuseSnapshot
-    from .windows.acl import prepare_windows_electron_payload_acl
+    from .windows.acl import prepare_windows_electron_payload_acl, validate_router_app_root
     from .windows.integrity import (
         apply_windows_asar_integrity,
         asar_header_digest,
@@ -95,7 +102,14 @@ except ImportError:
         select_renderer_variant,
     )
     from windows.bootstrap import BootstrapPatchReport, audit_bootstrap, patch_bootstrap
-    from windows.compatibility import find_matching_record, load_compatibility_records
+    from windows.compatibility import (
+        PAYLOAD_ACL_APPCONTAINER_RX,
+        PAYLOAD_ACL_NONE,
+        PAYLOAD_ACL_STRATEGIES,
+        PAYLOAD_ACL_UNRESOLVED,
+        find_matching_record,
+        load_compatibility_records,
+    )
     from windows.discovery import (
         DesktopExecutableCandidate,
         DesktopSource,
@@ -118,7 +132,7 @@ except ImportError:
         select_authoritative_desktop_candidate,
     )
     from windows.fuses import FuseSnapshot
-    from windows.acl import prepare_windows_electron_payload_acl
+    from windows.acl import prepare_windows_electron_payload_acl, validate_router_app_root
     from windows.integrity import (
         apply_windows_asar_integrity,
         asar_header_digest,
@@ -203,6 +217,15 @@ def parse_args() -> argparse.Namespace:
         dest="smoke_sandbox_acl",
         action="store_true",
         help="run Phase 2A.4 Chromium sandbox diagnostics, local app ACL remediation, and post-ACL probe",
+    )
+    parser.add_argument(
+        "--payload-acl-strategy",
+        choices=PAYLOAD_ACL_STRATEGIES,
+        default=None,
+        help=(
+            "select the Router app-tree ACL strategy explicitly; the default "
+            "UNRESOLVED strategy never mutates ACLs"
+        ),
     )
     parser.add_argument(
         "--launch-executable",
@@ -799,10 +822,11 @@ def _run_sandbox_acl_smoke(args: argparse.Namespace) -> int:
         print(format_source_diagnostics(diagnostics), file=sys.stderr)
         return 1
     candidates: list[RealCodexCandidate] = []
+    selected_real: RealCodexCandidate | None = None
     try:
-        real, candidates = discover_real_codex(args.real_codex)
+        selected_real, candidates = discover_real_codex(args.real_codex)
         desktop_candidates = inventory_desktop_executables(source)
-        smoke = run_phase2a4_sandbox_validation(source, real, desktop_candidates)
+        smoke = run_phase2a4_sandbox_validation(source, selected_real, desktop_candidates)
     except PermissionError as error:
         smoke = {
             "status": PHASE2A4_FAIL,
@@ -837,17 +861,18 @@ def _run_sandbox_acl_smoke(args: argparse.Namespace) -> int:
                     patched_destination = smoke_root / "patched-install"
                     metadata = build_windows_desktop(
                         source,
-                        real,
+                        selected_real,
                         patched_destination,
                         force=False,
                         allow_untested_source=args.allow_untested_source,
                         launch_executable=args.launch_executable,
                         bootstrap_user_data_patch=args.bootstrap_user_data_patch,
                         bootstrap_disable_updater=args.bootstrap_disable_updater,
+                        payload_acl_strategy=getattr(args, "payload_acl_strategy", None),
                     )
                     patched = run_patched_shell_smoke(
                         patched_destination,
-                        real,
+                        selected_real,
                         disposable_root=True,
                         diagnostic_arguments=diagnostic_arguments,
                         development_only=development_only,
@@ -857,8 +882,16 @@ def _run_sandbox_acl_smoke(args: argparse.Namespace) -> int:
                         "desktop_launch_executable": metadata.get("desktop_launch_executable"),
                         "payload_acl_strategy": metadata.get("payload_acl_strategy"),
                     }
-                patched["smoke_root_cleanup"] = patched_cleanup
-                return patched
+            # Cleanup-dependent result fields are attached only after the
+            # final-layout context has completed its __exit__/finally block.
+            patched["smoke_root_cleanup"] = dict(patched_cleanup)
+            if patched_cleanup.get("removed") is not True:
+                patched["status"] = PATCHED_SHELL_BLOCKED
+                patched["reason"] = (
+                    "the disposable patched-shell root was not cleaned up successfully"
+                )
+                patched["manual_operation_required"] = True
+            return patched
         except PermissionError as error:
             return {
                 "status": PATCHED_SHELL_BLOCKED,
@@ -890,7 +923,6 @@ def _run_sandbox_acl_smoke(args: argparse.Namespace) -> int:
             smoke["status"] = PHASE2A4_PATCHED_SHELL_BLOCKED
             smoke["manual_operation_required"] = True
         else:
-            real = candidates[0]
             smoke["patched_shell"] = run_disposable_patched_shell()
             patched_shell = smoke.get("patched_shell")
             patched_cleanup = patched_shell.get("smoke_root_cleanup") if isinstance(patched_shell, dict) else None
@@ -924,7 +956,6 @@ def _run_sandbox_acl_smoke(args: argparse.Namespace) -> int:
                 "manual_operation_required": True,
             }
         else:
-            real = candidates[0]
             development_probe = run_disposable_patched_shell(
                 ("--disable-gpu-sandbox",),
                 development_only=True,
@@ -1141,7 +1172,8 @@ def _metadata(
         ],
         "windows_asar_integrity": integrity_result,
         "payload_acl": payload_acl,
-        "payload_acl_strategy": "Router-owned app tree only; runtime, User Data, and control token excluded",
+        "payload_acl_strategy": payload_acl.get("strategy", PAYLOAD_ACL_UNRESOLVED),
+        "payload_acl_scope": "Router-owned app tree only; runtime, User Data, and control token excluded",
         "fuse_carriers": fuse_scan,
         "actual_fuse_carrier_relative_paths": fuse_scan.get("carrier_relative_paths", []),
         "mirror": {
@@ -1201,6 +1233,56 @@ def _resolve_launch_executable(
     raise RuntimeError(f"selected Desktop shell was not found in source inventory: {requested}")
 
 
+def _payload_acl_for_strategy(
+    staged_app: Path,
+    *,
+    router_root: Path,
+    strategy: str,
+) -> dict[str, object]:
+    """Apply only an explicitly requested diagnostic ACL strategy."""
+
+    normalized = strategy.strip().upper()
+    if normalized not in PAYLOAD_ACL_STRATEGIES:
+        raise RuntimeError(
+            f"unknown payload ACL strategy {strategy!r}; expected one of {', '.join(PAYLOAD_ACL_STRATEGIES)}"
+        )
+    root, target = validate_router_app_root(staged_app, router_root)
+    base: dict[str, object] = {
+        "strategy": normalized,
+        "router_root": str(root),
+        "target": str(target),
+        "scope": str(target),
+        "applied": False,
+        "official_paths_touched": False,
+        "runtime_user_data_scope": "excluded",
+    }
+    if normalized == PAYLOAD_ACL_APPCONTAINER_RX:
+        result = prepare_windows_electron_payload_acl(target, router_root=root)
+        result["strategy"] = normalized
+        result["applied"] = result.get("status") == "PASS"
+        return result
+    if normalized == PAYLOAD_ACL_NONE:
+        base.update(
+            {
+                "status": "PASS",
+                "verified": True,
+                "reason": "no payload ACL mutation was requested",
+            }
+        )
+    else:
+        base.update(
+            {
+                "status": PAYLOAD_ACL_UNRESOLVED,
+                "verified": False,
+                "reason": (
+                    "out-of-package native validation has not established a payload ACL requirement; "
+                    "no mutation was performed"
+                ),
+            }
+        )
+    return base
+
+
 def build_windows_desktop(
     source: DesktopSource,
     real: RealCodexCandidate,
@@ -1211,6 +1293,7 @@ def build_windows_desktop(
     launch_executable: str | None = None,
     bootstrap_user_data_patch: bool | None = None,
     bootstrap_disable_updater: bool | None = None,
+    payload_acl_strategy: str | None = None,
 ) -> dict[str, object]:
     destination = destination.expanduser().resolve(strict=False)
     if (
@@ -1225,6 +1308,16 @@ def build_windows_desktop(
     # shell minimal unless a caller explicitly requests a reviewed legacy patch.
     patch_user_data = False if bootstrap_user_data_patch is None else bootstrap_user_data_patch
     disable_updater = False if bootstrap_disable_updater is None else bootstrap_disable_updater
+    selected_payload_acl_strategy = (
+        payload_acl_strategy.strip().upper()
+        if payload_acl_strategy is not None
+        else PAYLOAD_ACL_UNRESOLVED
+    )
+    if selected_payload_acl_strategy not in PAYLOAD_ACL_STRATEGIES:
+        raise RuntimeError(
+            "--payload-acl-strategy must be one of "
+            + ", ".join(PAYLOAD_ACL_STRATEGIES)
+        )
     records = load_compatibility_records(COMPATIBILITY_DOCUMENT)
     source_hash = sha256_file(source.app_asar)
     matching = find_matching_record(
@@ -1253,10 +1346,18 @@ def build_windows_desktop(
         staged.mkdir(parents=True, exist_ok=True)
         mirror_report = mirror_desktop_source(source, staged_app)
         verify_desktop_mirror(source.app_dir, staged_app)
-        payload_acl = prepare_windows_electron_payload_acl(staged_app, router_root=staged)
-        if os.name == "nt" and payload_acl.get("status") != "PASS":
+        payload_acl = _payload_acl_for_strategy(
+            staged_app,
+            router_root=staged,
+            strategy=selected_payload_acl_strategy,
+        )
+        if (
+            os.name == "nt"
+            and selected_payload_acl_strategy == PAYLOAD_ACL_APPCONTAINER_RX
+            and payload_acl.get("status") != "PASS"
+        ):
             raise RuntimeError(
-                "PHASE 2A.4 ACL BLOCKED: "
+                "explicit payload ACL strategy APPCONTAINER_RX was not verified: "
                 f"{payload_acl.get('reason', 'staged app payload ACL was not verified')}"
             )
         fuse_scan = scan_fuse_carriers(staged_app)
@@ -1342,6 +1443,7 @@ def build_windows_desktop(
         copy_byte_identical(real.path, staged_real)
 
         (staged / "User Data").mkdir(parents=True, exist_ok=True)
+        (staged / "codex-home").mkdir(parents=True, exist_ok=True)
         launch_config = {
             "schema_version": 1,
             "desktop_launch_executable": selected_launch_executable,
@@ -1436,6 +1538,7 @@ def main() -> int:
             launch_executable=args.launch_executable,
             bootstrap_user_data_patch=args.bootstrap_user_data_patch,
             bootstrap_disable_updater=args.bootstrap_disable_updater,
+            payload_acl_strategy=args.payload_acl_strategy,
         )
     except (PackagingBlockedError, RuntimeError, OSError, subprocess.CalledProcessError) as error:
         print(f"Windows patch failed: {error}", file=sys.stderr)

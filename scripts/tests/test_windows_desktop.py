@@ -7,6 +7,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
@@ -19,8 +20,19 @@ from scripts.patch_common import (
     renderer_variant_template,
     select_renderer_variant,
 )
-from scripts.patch_app_windows import audit_windows_source, build_windows_desktop, pack_asar, verify_asar_listing
-from scripts.windows.compatibility import load_compatibility_records
+from scripts.patch_app_windows import (
+    _payload_acl_for_strategy,
+    audit_windows_source,
+    build_windows_desktop,
+    pack_asar,
+    verify_asar_listing,
+)
+from scripts.windows.compatibility import (
+    PAYLOAD_ACL_APPCONTAINER_RX,
+    PAYLOAD_ACL_NONE,
+    PAYLOAD_ACL_UNRESOLVED,
+    load_compatibility_records,
+)
 from scripts.windows.bootstrap import audit_bootstrap, patch_bootstrap
 from scripts.windows.discovery import (
     AuthenticodeMetadata,
@@ -79,7 +91,17 @@ from scripts.windows.smoke import (
     final_layout_smoke_root,
     _phase2a4_display_verdict,
     _phase2a4_verdict,
+    native_evidence_is_usable,
     run_patched_shell_smoke,
+)
+from scripts.windows.host_context import (
+    APPMODEL_ERROR_NO_PACKAGE,
+    detect_windows_host_context,
+    run_localappdata_canary,
+)
+from scripts.windows.phase2a5_host_validation import (
+    _run_external_patched_shell,
+    run_phase2a5_host_validation,
 )
 from scripts.windows.acl import (
     ALL_APPLICATION_PACKAGES_SID,
@@ -538,6 +560,195 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             self.assertFalse(kept_root.exists())
             self.assertFalse(cleanup["path_virtualized"])
             self.assertTrue(cleanup["removed"])
+
+    def test_native_evidence_requires_cleanup_after_context_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cleanup: dict[str, object] = {}
+            with patch("scripts.windows.smoke.os.name", "nt"), patch(
+                "scripts.windows.smoke.os.environ",
+                {"LOCALAPPDATA": temporary},
+            ):
+                with final_layout_smoke_root(cleanup) as root:
+                    self.assertFalse(native_evidence_is_usable(cleanup))
+                    self.assertTrue(root.is_dir())
+            self.assertTrue(native_evidence_is_usable(cleanup))
+        self.assertTrue(native_evidence_is_usable({"path_virtualized": False, "removed": True}))
+        self.assertFalse(native_evidence_is_usable({"path_virtualized": False, "removed": False}))
+        self.assertFalse(native_evidence_is_usable({"path_virtualized": True, "removed": True}))
+
+    def test_host_context_detects_no_package_from_native_api(self) -> None:
+        class FakePackageApi:
+            argtypes = None
+            restype = None
+
+            def __call__(self, length, buffer):
+                return APPMODEL_ERROR_NO_PACKAGE
+
+        fake_kernel32 = SimpleNamespace(GetCurrentPackageFullName=FakePackageApi())
+        with patch("scripts.windows.host_context.os.name", "nt"), patch(
+            "scripts.windows.host_context.ctypes.WinDLL",
+            return_value=fake_kernel32,
+            create=True,
+        ):
+            result = detect_windows_host_context()
+        self.assertFalse(result["has_package_identity"])
+        self.assertEqual(result["package_full_name"], None)
+        self.assertEqual(result["appmodel_result"], APPMODEL_ERROR_NO_PACKAGE)
+        self.assertEqual(result["appmodel_result_name"], "APPMODEL_ERROR_NO_PACKAGE")
+
+    def test_host_context_detects_successful_package_identity_from_native_api(self) -> None:
+        class FakePackageApi:
+            argtypes = None
+            restype = None
+
+            def __call__(self, length, buffer):
+                if buffer is None:
+                    length._obj.value = len("OpenAI.Codex_2p2nqsd0c76g0") + 1
+                    return 122
+                buffer.value = "OpenAI.Codex_2p2nqsd0c76g0"
+                return 0
+
+        fake_kernel32 = SimpleNamespace(GetCurrentPackageFullName=FakePackageApi())
+        with patch("scripts.windows.host_context.os.name", "nt"), patch(
+            "scripts.windows.host_context.ctypes.WinDLL",
+            return_value=fake_kernel32,
+            create=True,
+        ):
+            result = detect_windows_host_context()
+        self.assertTrue(result["has_package_identity"])
+        self.assertEqual(result["package_full_name"], "OpenAI.Codex_2p2nqsd0c76g0")
+        self.assertEqual(result["appmodel_result_name"], "ERROR_SUCCESS")
+
+    def test_localappdata_canary_records_physical_path_and_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            local_appdata = Path(temporary)
+
+            def final_path(path: Path) -> tuple[str, str | None]:
+                return str(path.resolve()), None
+
+            with patch("scripts.windows.host_context.os.name", "nt"), patch(
+                "scripts.windows.host_context._native_final_path",
+                side_effect=final_path,
+            ):
+                result = run_localappdata_canary(local_appdata)
+        self.assertEqual(result["status"], "PASS")
+        self.assertFalse(result["filesystem_virtualized"])
+        self.assertTrue(result["cleanup"]["removed"])
+
+    def test_localappdata_canary_detects_package_cache_redirection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            local_appdata = Path(temporary)
+
+            def redirected_path(_path: Path) -> tuple[str, str | None]:
+                return str(local_appdata / "Packages" / "OpenAI.Codex" / "LocalCache" / "canary.txt"), None
+
+            with patch("scripts.windows.host_context.os.name", "nt"), patch(
+                "scripts.windows.host_context._native_final_path",
+                side_effect=redirected_path,
+            ):
+                result = run_localappdata_canary(local_appdata)
+        self.assertEqual(result["status"], "HOST FILESYSTEM VIRTUALIZED")
+        self.assertTrue(result["filesystem_virtualized"])
+        self.assertTrue(result["cleanup"]["removed"])
+
+    def test_phase2a5_packaged_host_aborts_before_source_or_canary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact = root / "result.json"
+            context = {
+                "has_package_identity": True,
+                "package_full_name": "OpenAI.Codex_2p2nqsd0c76g0",
+                "appmodel_result": 0,
+                "current_executable": "C:\\Windows\\python.exe",
+                "pid": 1,
+                "LOCALAPPDATA": "C:\\Users\\test\\AppData\\Local",
+                "USERPROFILE": "C:\\Users\\test",
+            }
+            with patch(
+                "scripts.windows.phase2a5_host_validation.detect_windows_host_context",
+                return_value=context,
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.run_localappdata_canary"
+            ) as canary, patch(
+                "scripts.windows.phase2a5_host_validation.discover_desktop_source"
+            ) as discover:
+                result = run_phase2a5_host_validation(repo_root=root, artifact_path=artifact)
+            self.assertTrue(artifact.is_file())
+        self.assertEqual(result["status"], "PHASE 2A.5 HOST CONTEXT BLOCKED")
+        self.assertIn("independently from an unpackaged Windows process", result["reason"])
+        canary.assert_not_called()
+        discover.assert_not_called()
+
+    def test_payload_acl_strategy_is_explicit_and_default_is_non_mutating(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / "app"
+            app.mkdir()
+            with patch("scripts.patch_app_windows.prepare_windows_electron_payload_acl") as prepare:
+                none = _payload_acl_for_strategy(app, router_root=root, strategy=PAYLOAD_ACL_NONE)
+                unresolved = _payload_acl_for_strategy(
+                    app,
+                    router_root=root,
+                    strategy=PAYLOAD_ACL_UNRESOLVED,
+                )
+            prepare.assert_not_called()
+        self.assertEqual(none["strategy"], PAYLOAD_ACL_NONE)
+        self.assertFalse(none["applied"])
+        self.assertEqual(unresolved["strategy"], PAYLOAD_ACL_UNRESOLVED)
+        self.assertFalse(unresolved["applied"])
+
+    def test_phase2a5_selected_real_candidate_is_not_replaced_by_first_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = RealCodexCandidate(
+                path=root / "first.exe",
+                version="first",
+                sha256="a" * 64,
+                authenticode=AuthenticodeMetadata("Unknown", None),
+                modified_time=1.0,
+                valid_native=True,
+            )
+            selected = RealCodexCandidate(
+                path=root / "selected.exe",
+                version="selected",
+                sha256="b" * 64,
+                authenticode=AuthenticodeMetadata("Valid", "CN=OpenAI"),
+                modified_time=2.0,
+                valid_native=True,
+            )
+
+            @contextmanager
+            def fake_smoke_root(cleanup, **_kwargs):
+                cleanup.update({"path_virtualized": False, "requested_path": str(root), "resolved_path": str(root)})
+                yield root
+                cleanup.update({"removed": True, "error": None})
+
+            with patch(
+                "scripts.windows.phase2a5_host_validation.final_layout_smoke_root",
+                side_effect=fake_smoke_root,
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.build_windows_desktop",
+                return_value={
+                    "desktop_launch_executable": "app\\ChatGPT.exe",
+                    "payload_acl_strategy": PAYLOAD_ACL_NONE,
+                },
+            ) as build, patch(
+                "scripts.windows.phase2a5_host_validation.run_patched_shell_smoke",
+                return_value={
+                    "status": "PATCHED_SHELL_PASS",
+                    "manual_operation_required": False,
+                    "mux_process_observed": True,
+                    "real_codex_process_observed": True,
+                },
+            ):
+                _run_external_patched_shell(
+                    SimpleNamespace(),
+                    selected,
+                    acl_strategy=PAYLOAD_ACL_NONE,
+                    timeout_seconds=1.0,
+                )
+        self.assertIs(build.call_args.args[1], selected)
+        self.assertIsNot(build.call_args.args[1], first)
 
     def test_phase2a4_verdict_ignores_codex_diagnostic_failure(self) -> None:
         probe_a = {"status": BLOCKED_CHROMIUM_SANDBOX}

@@ -32,6 +32,7 @@ try:
         terminate_attributed_processes,
     )
     from .acl import audit_acl_scope, prepare_windows_electron_payload_acl
+    from .host_context import detect_windows_host_context, run_localappdata_canary
     from .mirror import mirror_desktop_source, verify_desktop_mirror
 except ImportError:
     from discovery import (
@@ -50,6 +51,7 @@ except ImportError:
         terminate_attributed_processes,
     )
     from acl import audit_acl_scope, prepare_windows_electron_payload_acl
+    from host_context import detect_windows_host_context, run_localappdata_canary
     from mirror import mirror_desktop_source, verify_desktop_mirror
 
 
@@ -79,6 +81,15 @@ PHASE2A4_WINDOWS_GPU_SANDBOX_REGRESSION = "PHASE 2A.4 WINDOWS GPU SANDBOX REGRES
 PHASE2A4_BROADER_CHROMIUM_SANDBOX_BLOCKED = "PHASE 2A.4 BROADER CHROMIUM SANDBOX BLOCKED"
 PHASE2A4_PATCHED_SHELL_BLOCKED = "PHASE 2A.4 PATCHED SHELL BLOCKED"
 PHASE2A4_FAIL = "PHASE 2A.4 FAIL"
+
+PHASE2A5_FULL_PASS = "FULL PHASE 2A.5 PASS"
+PHASE2A5_HOST_CONTEXT_BLOCKED = "PHASE 2A.5 HOST CONTEXT BLOCKED"
+PHASE2A5_FILESYSTEM_VIRTUALIZED = "PHASE 2A.5 FILESYSTEM VIRTUALIZED"
+PHASE2A5_DIRECT_HOST_PASS = "PHASE 2A.5 DIRECT HOST PASS"
+PHASE2A5_ACL_FIX_CONFIRMED = "PHASE 2A.5 ACL FIX CONFIRMED"
+PHASE2A5_GPU_SANDBOX_REGRESSION = "PHASE 2A.5 GPU SANDBOX REGRESSION"
+PHASE2A5_PATCHED_SHELL_BLOCKED = "PHASE 2A.5 PATCHED SHELL BLOCKED"
+PHASE2A5_FAIL = "PHASE 2A.5 FAIL"
 
 DIRECT_LAUNCH_PASS = "DIRECT_LAUNCH_PASS"
 DIRECT_LAUNCH_IDENTITY_BLOCKED = "DIRECT_LAUNCH_IDENTITY_BLOCKED"
@@ -703,6 +714,15 @@ def _path_comparison_key(path: Path) -> str:
     return str(path).casefold()
 
 
+def native_evidence_is_usable(cleanup_status: dict[str, object]) -> bool:
+    """Return true only after a non-virtual root has been successfully removed."""
+
+    return (
+        cleanup_status.get("path_virtualized") is False
+        and cleanup_status.get("removed") is True
+    )
+
+
 def run_patched_shell_smoke(
     installation_root: Path,
     real: RealCodexCandidate,
@@ -1186,10 +1206,13 @@ def run_unmodified_mirror_smoke(
 @contextmanager
 def final_layout_smoke_root(
     cleanup_status: dict[str, object] | None = None,
+    *,
+    parent_name: str = "_smoke",
+    prefix: str = "phase2a4-",
 ) -> Iterator[Path]:
     """Create and remove a Router-owned development root under LOCALAPPDATA."""
     if os.name != "nt":
-        root = Path(tempfile.mkdtemp(prefix="codex-router-phase2a4-"))
+        root = Path(tempfile.mkdtemp(prefix=prefix))
         if cleanup_status is not None:
             cleanup_status.update(
                 {
@@ -1222,9 +1245,9 @@ def final_layout_smoke_root(
     # ``Path.resolve`` return a package-cache target even though callers asked
     # for the user's real LOCALAPPDATA directory.
     local_appdata = Path(local_appdata_value).expanduser()
-    router_smoke_parent = local_appdata / "Codex Subscription Router" / "_smoke"
+    router_smoke_parent = local_appdata / "Codex Subscription Router" / parent_name
     router_smoke_parent.mkdir(parents=True, exist_ok=True)
-    requested_root = Path(tempfile.mkdtemp(prefix="phase2a4-", dir=router_smoke_parent))
+    requested_root = Path(tempfile.mkdtemp(prefix=prefix, dir=router_smoke_parent))
     root = requested_root.resolve(strict=True)
     if cleanup_status is not None:
         cleanup_status.update(
@@ -1394,12 +1417,6 @@ def run_phase2a4_sandbox_validation(
         ):
             no_sandbox = run_profile_probe("no-sandbox", authoritative, "--no-sandbox")
 
-        official_after = {
-            "chatgpt_sha256": str(sha256_file(source.app_dir / "ChatGPT.exe"))
-            if (source.app_dir / "ChatGPT.exe").is_file()
-            else None,
-            "app_asar_sha256": str(sha256_file(source.app_asar)) if source.app_asar.is_file() else None,
-        }
         verdict = _phase2a4_verdict(probe_a, probe_b, probe_c, no_sandbox)
         display_verdict = _phase2a4_display_verdict(verdict)
         result = {
@@ -1428,31 +1445,258 @@ def run_phase2a4_sandbox_validation(
             "probe_c_acl_normal_sandbox": probe_c,
             "probe_d_no_sandbox": no_sandbox,
             "official_source_fingerprint_before": official_fingerprint,
-            "official_source_fingerprint_after": official_after,
-            "official_package_unchanged": official_fingerprint == official_after,
-            "native_evidence_usable": (
-                cleanup_status.get("path_virtualized") is not True
-                and cleanup_status.get("removed") is True
-            ),
-            "production_acl_strategy": (
-                "prepare_windows_electron_payload_acl on <Router root>\\app only"
-                if cleanup_status.get("path_virtualized") is not True
-                and acl_remediation.get("status") == PASS
-                else "not proven"
-            ),
-            "smoke_root_cleanup": cleanup_status,
-            "manual_operation_required": bool(
-                acl_remediation.get("manual_operation_required")
-                or cleanup_status.get("path_virtualized") is True
-                or cleanup_status.get("removed") is False
-            ),
         }
-        if cleanup_status.get("path_virtualized") is True:
-            result["status"] = PHASE2A4_FAIL
-            result["reason"] = (
-                "the requested LOCALAPPDATA smoke root was filesystem-virtualized by the host; "
-                "final-layout native evidence is not usable"
-            )
-        if result["status"] == PHASE2A4_LOCAL_ACL_FIX_CONFIRMED:
-            result["gpu_sandbox_diagnosis"] = GPU_SANDBOX_CONFIRMED
-        return result
+
+    # Cleanup-dependent evidence is finalized only after the context manager's
+    # __exit__/finally has populated the status dictionary.
+    official_after = {
+        "chatgpt_sha256": str(sha256_file(source.app_dir / "ChatGPT.exe"))
+        if (source.app_dir / "ChatGPT.exe").is_file()
+        else None,
+        "app_asar_sha256": str(sha256_file(source.app_asar)) if source.app_asar.is_file() else None,
+    }
+    result["official_source_fingerprint_after"] = official_after
+    result["official_package_unchanged"] = official_fingerprint == official_after
+    result["native_evidence_usable"] = native_evidence_is_usable(cleanup_status)
+    result["production_acl_strategy"] = (
+        "prepare_windows_electron_payload_acl on <Router root>\\app only"
+        if cleanup_status.get("path_virtualized") is False
+        and acl_remediation.get("status") == PASS
+        else "not proven"
+    )
+    result["smoke_root_cleanup"] = dict(cleanup_status)
+    result["manual_operation_required"] = bool(
+        acl_remediation.get("manual_operation_required")
+        or cleanup_status.get("path_virtualized") is True
+        or cleanup_status.get("removed") is not True
+    )
+    if cleanup_status.get("path_virtualized") is True:
+        result["status"] = PHASE2A4_FAIL
+        result["reason"] = (
+            "the requested LOCALAPPDATA smoke root was filesystem-virtualized by the host; "
+            "final-layout native evidence is not usable"
+        )
+    if result["status"] == PHASE2A4_LOCAL_ACL_FIX_CONFIRMED:
+        result["gpu_sandbox_diagnosis"] = GPU_SANDBOX_CONFIRMED
+    return result
+
+
+def _phase2a5_official_fingerprint(source: DesktopSource) -> dict[str, object]:
+    return {
+        "chatgpt_sha256": str(sha256_file(source.app_dir / "ChatGPT.exe"))
+        if (source.app_dir / "ChatGPT.exe").is_file()
+        else None,
+        "app_asar_sha256": str(sha256_file(source.app_asar)) if source.app_asar.is_file() else None,
+    }
+
+
+def _phase2a5_not_run(reason: str) -> dict[str, object]:
+    return {
+        "status": "NOT RUN",
+        "reason": reason,
+        "manual_operation_required": False,
+    }
+
+
+def run_phase2a5_sandbox_validation(
+    source: DesktopSource,
+    real: RealCodexCandidate,
+    candidates: Iterable[DesktopExecutableCandidate],
+    *,
+    timeout_seconds: float = 20.0,
+) -> dict[str, object]:
+    """Run causally isolated Phase 2A.5 A/B/C probes in a valid host root.
+
+    The caller must perform the package-identity and physical-LOCALAPPDATA
+    preflight first.  Each probe gets a fresh mirror: A is never ACL-mutated,
+    B is diagnostic-only, and C is the sole fresh ACL experiment.
+    """
+
+    candidates = tuple(candidates)
+    if os.name != "nt":
+        return {
+            "status": PHASE2A5_FAIL,
+            "reason": "native Windows sandbox/ACL validation is Windows-only",
+            "manual_operation_required": False,
+        }
+    authoritative = select_authoritative_desktop_candidate(source, candidates)
+    authoritative_relative = authoritative.relative_path.replace("/", "\\")
+    official_before = _phase2a5_official_fingerprint(source)
+    cleanup_status: dict[str, object] = {}
+    probe_a: dict[str, object] = _phase2a5_not_run("probe root was not available")
+    probe_b: dict[str, object] = _phase2a5_not_run("Probe A did not show the exact Chromium sandbox failure")
+    probe_c: dict[str, object] = _phase2a5_not_run("Probe A did not show the exact Chromium sandbox failure")
+    acl_before: dict[str, object] = {}
+    acl_after: dict[str, object] = {}
+    acl_remediation: dict[str, object] = _phase2a5_not_run("Probe C was not required")
+    mirror_reports: dict[str, object] = {}
+    probe_root_paths: dict[str, object] = {}
+    production_acl_strategy = "UNRESOLVED"
+
+    with final_layout_smoke_root(
+        cleanup_status,
+        parent_name="_host-validation",
+        prefix="phase2a5-",
+    ) as root:
+        if cleanup_status.get("path_virtualized") is not True:
+            def create_mirror(label: str) -> tuple[Path, Path, object]:
+                workspace = root / label
+                workspace.mkdir(parents=True, exist_ok=True)
+                mirror_root = workspace / "app"
+                report = mirror_desktop_source(source, mirror_root)
+                verify_desktop_mirror(source.app_dir, mirror_root)
+                mirror_reports[label] = report.to_dict()
+                probe_root_paths[label] = {
+                    "workspace": str(workspace),
+                    "app": str(mirror_root),
+                    "user_data": str(workspace / "User Data"),
+                    "codex_home": str(workspace / "codex-home"),
+                }
+                return workspace, mirror_root, report
+
+            def run_probe(
+                label: str,
+                workspace: Path,
+                mirror_root: Path,
+                candidate: DesktopExecutableCandidate,
+                *extra_arguments: str,
+            ) -> dict[str, object]:
+                profile_parent = workspace / "_probe-profiles"
+                profile_parent.mkdir(parents=True, exist_ok=True)
+                profile = Path(tempfile.mkdtemp(prefix=f"{label}-", dir=profile_parent))
+                return _probe_candidate(
+                    mirror_root,
+                    workspace,
+                    real,
+                    candidate,
+                    timeout_seconds=timeout_seconds,
+                    extra_arguments=extra_arguments,
+                    profile_root=profile,
+                )
+
+            workspace_a, mirror_a, _report_a = create_mirror("A")
+            acl_before = audit_acl_scope(_acl_paths(source, mirror_a))
+            probe_a = run_probe("normal", workspace_a, mirror_a, authoritative)
+
+            if (
+                probe_a.get("status") == BLOCKED_CHROMIUM_SANDBOX
+                and _has_chromium_sandbox_evidence(probe_a)
+            ):
+                workspace_b, mirror_b, _report_b = create_mirror("B")
+                probe_b = run_probe(
+                    "disable-gpu-sandbox",
+                    workspace_b,
+                    mirror_b,
+                    authoritative,
+                    "--disable-gpu-sandbox",
+                )
+
+                workspace_c, mirror_c, _report_c = create_mirror("C")
+                acl_before["probe_c"] = audit_acl_scope(_acl_paths(source, mirror_c))
+                acl_remediation = prepare_windows_electron_payload_acl(
+                    mirror_c,
+                    router_root=workspace_c,
+                )
+                acl_after = audit_acl_scope(_acl_paths(source, mirror_c))
+                probe_c = run_probe("acl-normal", workspace_c, mirror_c, authoritative)
+                if (
+                    acl_remediation.get("status") == PASS
+                    and probe_b.get("status") == PASS
+                    and probe_c.get("status") == PASS
+                ):
+                    production_acl_strategy = "APPCONTAINER_RX"
+            elif probe_a.get("status") == PASS:
+                production_acl_strategy = "NONE"
+
+            # Keep non-authoritative sibling shells as diagnostics, but never
+            # let them change the selected shell or the A/B/C promotion rule.
+            diagnostic_shells: list[dict[str, object]] = []
+            for candidate in candidates:
+                if candidate.relative_path.replace("/", "\\").casefold() == authoritative_relative.casefold():
+                    continue
+                if not candidate.present:
+                    continue
+                diagnostic_workspace, diagnostic_mirror, _report = create_mirror(
+                    f"diagnostic-{len(diagnostic_shells) + 1}"
+                )
+                diagnostic_shells.append(
+                    run_probe(
+                        "diagnostic",
+                        diagnostic_workspace,
+                        diagnostic_mirror,
+                        candidate,
+                    )
+                )
+        else:
+            diagnostic_shells = []
+
+    official_after = _phase2a5_official_fingerprint(source)
+    native_evidence_usable = native_evidence_is_usable(cleanup_status)
+    if cleanup_status.get("path_virtualized") is True:
+        status = PHASE2A5_FILESYSTEM_VIRTUALIZED
+        reason = (
+            "the requested external-host validation root was filesystem-virtualized; "
+            "no Phase 2A.5 probe evidence is usable"
+        )
+    elif not native_evidence_usable:
+        status = PHASE2A5_FAIL
+        reason = "the external-host validation root did not provide usable cleanup evidence"
+    elif probe_a.get("status") == PASS:
+        status = PHASE2A5_DIRECT_HOST_PASS
+        reason = "the authoritative ChatGPT.exe passed with the normal Chromium sandbox"
+    elif (
+        probe_a.get("status") == BLOCKED_CHROMIUM_SANDBOX
+        and probe_b.get("status") == PASS
+        and probe_c.get("status") == PASS
+        and acl_remediation.get("status") == PASS
+    ):
+        status = PHASE2A5_ACL_FIX_CONFIRMED
+        reason = "the fresh ACL experiment causally restored the normal-sandbox probe"
+    elif (
+        probe_a.get("status") == BLOCKED_CHROMIUM_SANDBOX
+        and probe_b.get("status") == PASS
+    ):
+        status = PHASE2A5_GPU_SANDBOX_REGRESSION
+        reason = "the development-only GPU sandbox bypass passed while the normal path remained blocked"
+    else:
+        status = PHASE2A5_FAIL
+        reason = "the authoritative normal-sandbox probe did not pass"
+
+    manual_operation_required = bool(
+        cleanup_status.get("removed") is not True
+        or cleanup_status.get("path_virtualized") is True
+        or acl_remediation.get("manual_operation_required")
+        or any(
+            isinstance(probe, dict) and probe.get("manual_operation_required")
+            for probe in (probe_a, probe_b, probe_c)
+        )
+        or official_before != official_after
+    )
+    return {
+        "status": status,
+        "reason": reason,
+        "authoritative_shell": authoritative.to_dict(),
+        "diagnostic_shells": diagnostic_shells,
+        "final_layout": {
+            "parent": str(Path(cleanup_status.get("requested_path", "")).parent),
+            "root": cleanup_status.get("resolved_path"),
+            "requested_root": cleanup_status.get("requested_path"),
+            "resolved_root": cleanup_status.get("resolved_path"),
+            "path_virtualized": cleanup_status.get("path_virtualized"),
+            "probe_roots": probe_root_paths,
+        },
+        "mirror": mirror_reports,
+        "acl_before": acl_before,
+        "acl_remediation": acl_remediation,
+        "acl_after": acl_after,
+        "probe_a_normal": probe_a,
+        "probe_b_disable_gpu_sandbox": probe_b,
+        "probe_c_acl_normal_sandbox": probe_c,
+        "official_source_fingerprint_before": official_before,
+        "official_source_fingerprint_after": official_after,
+        "official_package_unchanged": official_before == official_after,
+        "native_evidence_usable": native_evidence_usable,
+        "production_acl_strategy": production_acl_strategy,
+        "smoke_root_cleanup": dict(cleanup_status),
+        "manual_operation_required": manual_operation_required,
+    }

@@ -21,6 +21,9 @@ state.json
 .codex-router-windows-*/
 Codex Subscription Router/
 
+# Phase 2A.5 host validation artifacts are local diagnostics, never release input.
+/docs/generated/
+
 AGENTS.md
 
 # Signing and local credentials must never enter source control.

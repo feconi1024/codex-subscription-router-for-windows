@@ -9,6 +9,16 @@ from pathlib import Path
 from typing import Any
 
 
+PAYLOAD_ACL_NONE = "NONE"
+PAYLOAD_ACL_APPCONTAINER_RX = "APPCONTAINER_RX"
+PAYLOAD_ACL_UNRESOLVED = "UNRESOLVED"
+PAYLOAD_ACL_STRATEGIES = (
+    PAYLOAD_ACL_NONE,
+    PAYLOAD_ACL_APPCONTAINER_RX,
+    PAYLOAD_ACL_UNRESOLVED,
+)
+
+
 @dataclass(frozen=True)
 class WindowsCompatibilityRecord:
     architecture: str
