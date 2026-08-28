@@ -234,10 +234,20 @@ def _audit_from_payload(path: Path, payload: dict[str, object]) -> AclAudit:
     protected = _as_bool(payload.get("ProtectedDacl"))
     entries = _entry_list(payload.get("Access"))
     def has_sid(sid: str) -> bool:
-        return any(
+        if any(
             (_entry_sid(entry) or "").casefold() == sid.casefold()
             and _entry_allows_read_execute(entry)
             for entry in entries
+        ):
+            return True
+        if not sddl:
+            return False
+        aliases = (
+            ("AC",) if sid.casefold() == ALL_APPLICATION_PACKAGES_SID.casefold() else ()
+        ) + (sid,)
+        return any(
+            re.search(rf";;;{re.escape(alias)}\)", sddl, re.IGNORECASE) is not None
+            for alias in aliases
         )
 
     return AclAudit(
