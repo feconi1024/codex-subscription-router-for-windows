@@ -561,18 +561,26 @@ def attributable_process_pids(
     mirrored_root: Path,
     *,
     seed_pids: Iterable[int] = (),
+    additional_executable_paths: Iterable[Path] = (),
 ) -> tuple[int, ...]:
     """Track new descendants or mirror-path processes for one launch probe."""
     baseline = {int(pid) for pid in baseline_pids}
     rows = list(snapshot)
     tracked = {int(root_pid), *(int(pid) for pid in seed_pids)}
+    additional = {
+        path.expanduser().resolve(strict=False)
+        for path in additional_executable_paths
+    }
     changed = True
     while changed:
         changed = False
         for row in rows:
             if row.pid in tracked or row.pid in baseline:
                 continue
-            path_match = row.executable is not None and path_is_within(row.executable, mirrored_root)
+            path_match = row.executable is not None and (
+                path_is_within(row.executable, mirrored_root)
+                or row.executable.expanduser().resolve(strict=False) in additional
+            )
             parent_match = row.parent_pid in tracked
             if path_match or parent_match:
                 tracked.add(row.pid)
@@ -684,6 +692,7 @@ def terminate_attributed_processes(
     mirrored_root: Path,
     *,
     root_pid: int | None = None,
+    allowed_executable_paths: Iterable[Path] = (),
 ) -> dict[str, object]:
     """Terminate only PIDs tracked for a probe, never protected package processes."""
     if os.name != "nt":
@@ -705,6 +714,10 @@ def terminate_attributed_processes(
     tracked = tuple(dict.fromkeys(int(pid) for pid in process_pids))
     requested: list[int] = []
     skipped: list[str] = []
+    allowed_paths = {
+        path.expanduser().resolve(strict=False)
+        for path in allowed_executable_paths
+    }
 
     def has_mirror_ancestor(pid: int) -> bool:
         current = rows.get(pid)
@@ -728,7 +741,7 @@ def terminate_attributed_processes(
         if is_windowsapps_path(row.executable):
             skipped.append(f"pid {pid}: refusing protected WindowsApps process {row.executable}")
             continue
-        if not path_is_within(row.executable, mirrored_root):
+        if not path_is_within(row.executable, mirrored_root) and row.executable.resolve(strict=False) not in allowed_paths:
             # A child helper may be system-installed, but it is safe to target
             # only when the final snapshot still proves a mirror-path ancestor.
             # This also protects against a root PID being reused after it exits.

@@ -497,6 +497,7 @@ def _probe_candidate(
                         snapshot,
                         mirror_root,
                         seed_pids=attributed,
+                        additional_executable_paths=(real.path,),
                     )
                     attributed.update(current)
                     windows = enumerate_windows_for_processes(current)
@@ -518,6 +519,7 @@ def _probe_candidate(
                     final_snapshot,
                     mirror_root,
                     seed_pids=attributed,
+                    additional_executable_paths=(real.path,),
                 )
                 attributed.update(final_attributed)
                 final_windows = enumerate_windows_for_processes(sorted(attributed))
@@ -528,6 +530,7 @@ def _probe_candidate(
                     final_snapshot,
                     mirror_root,
                     root_pid=process.pid,
+                    allowed_executable_paths=(real.path,),
                 )
                 # The root is known from Popen and is already part of the
                 # attributed set. If its snapshot disappeared after the last
@@ -842,13 +845,33 @@ def run_phase2a4_sandbox_validation(
         mirror_report = mirror_desktop_source(source, mirror_root)
         verify_desktop_mirror(source.app_dir, mirror_root)
         acl_before = audit_acl_scope(_acl_paths(source, mirror_root))
+
+        profile_parent = root / "_probe-profiles"
+        profile_parent.mkdir(parents=True, exist_ok=True)
+
+        def run_profile_probe(
+            label: str,
+            candidate: DesktopExecutableCandidate,
+            *extra_arguments: str,
+        ) -> dict[str, object]:
+            profile = Path(tempfile.mkdtemp(prefix=f"{label}-", dir=profile_parent))
+            return _probe_candidate(
+                mirror_root,
+                root,
+                real,
+                candidate,
+                timeout_seconds=timeout_seconds,
+                extra_arguments=extra_arguments,
+                profile_root=profile,
+            )
+
         probe_a = _probe_candidate(
             mirror_root,
             root,
             real,
             authoritative,
             timeout_seconds=timeout_seconds,
-            profile_root=root,
+            profile_root=Path(tempfile.mkdtemp(prefix="normal-", dir=profile_parent)),
         )
 
         diagnostic_shells: list[dict[str, object]] = []
@@ -857,54 +880,22 @@ def run_phase2a4_sandbox_validation(
                 continue
             if not candidate.present:
                 continue
-            diagnostic_shells.append(
-                _probe_candidate(
-                    mirror_root,
-                    root,
-                    real,
-                    candidate,
-                    timeout_seconds=timeout_seconds,
-                    profile_root=root,
-                )
-            )
+            diagnostic_shells.append(run_profile_probe("diagnostic", candidate))
 
-        probe_b = _probe_candidate(
-            mirror_root,
-            root,
-            real,
-            authoritative,
-            timeout_seconds=timeout_seconds,
-            extra_arguments=("--disable-gpu-sandbox",),
-            profile_root=root,
-        )
+        probe_b = run_profile_probe("disable-gpu-sandbox", authoritative, "--disable-gpu-sandbox")
         acl_remediation = prepare_windows_electron_payload_acl(
             mirror_root,
             router_root=root,
         )
         acl_after = audit_acl_scope(_acl_paths(source, mirror_root))
-        probe_c = _probe_candidate(
-            mirror_root,
-            root,
-            real,
-            authoritative,
-            timeout_seconds=timeout_seconds,
-            profile_root=root,
-        )
+        probe_c = run_profile_probe("acl-normal", authoritative)
         no_sandbox: dict[str, object] | None = None
         if (
             probe_b.get("status") != PASS
             and probe_c.get("status") != PASS
             and _has_chromium_sandbox_evidence(probe_b)
         ):
-            no_sandbox = _probe_candidate(
-                mirror_root,
-                root,
-                real,
-                authoritative,
-                timeout_seconds=timeout_seconds,
-                extra_arguments=("--no-sandbox",),
-                profile_root=root,
-            )
+            no_sandbox = run_profile_probe("no-sandbox", authoritative, "--no-sandbox")
 
         official_after = {
             "chatgpt_sha256": str(sha256_file(source.app_dir / "ChatGPT.exe"))
