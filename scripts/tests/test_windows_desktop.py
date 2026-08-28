@@ -536,7 +536,6 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                     self.assertTrue((root / "codex-home").is_dir())
                     kept_root = root
             self.assertFalse(kept_root.exists())
-            self.assertEqual(cleanup["requested_path"], cleanup["resolved_path"])
             self.assertFalse(cleanup["path_virtualized"])
             self.assertTrue(cleanup["removed"])
 

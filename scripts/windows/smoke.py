@@ -686,6 +686,23 @@ def _process_path_matches(row: RunningProcessCandidate, expected: Path) -> bool:
     )
 
 
+def _has_windows_short_path_component(path: Path) -> bool:
+    return any(re.search(r"~\d(?:$|\.)", part) for part in path.parts)
+
+
+def _path_comparison_key(path: Path) -> str:
+    # Windows runners may return an 8.3 alias from GetTempPathW while
+    # Path.resolve() returns the long spelling. Normalize that benign alias,
+    # but keep the raw spelling for ordinary paths so AppContainer
+    # virtualization remains visible as a real path change.
+    if os.name == "nt" and _has_windows_short_path_component(path):
+        try:
+            return str(path.resolve(strict=True)).casefold()
+        except OSError:
+            pass
+    return str(path).casefold()
+
+
 def run_patched_shell_smoke(
     installation_root: Path,
     real: RealCodexCandidate,
@@ -1214,7 +1231,7 @@ def final_layout_smoke_root(
             {
                 "requested_path": str(requested_root),
                 "resolved_path": str(root),
-                "path_virtualized": str(requested_root).casefold() != str(root).casefold(),
+                "path_virtualized": _path_comparison_key(requested_root) != _path_comparison_key(root),
             }
         )
     try:
