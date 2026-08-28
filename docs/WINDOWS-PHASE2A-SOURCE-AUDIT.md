@@ -1,7 +1,7 @@
 # Windows Desktop MVP — Phase 2A source acquisition and compatibility audit
 
-Date: 2026-08-28  
-Branch: `codex/windows-desktop-mvp`  
+Date: 2026-08-28
+Branch: `codex/windows-desktop-mvp`
 Scope: real Windows Desktop source acquisition, compatibility audit, and an unmodified mirror dry run. Full Phase 2 GUI E2E and Phase 2B were not started.
 
 ## Verdict
