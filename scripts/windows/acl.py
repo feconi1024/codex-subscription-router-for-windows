@@ -22,6 +22,13 @@ ALL_RESTRICTED_APPLICATION_PACKAGES_SID = "S-1-15-2-2"
 APPCONTAINER_SID_PREFIX = "S-1-15-"
 APP_CONTAINER_RX_INHERITANCE = "(OI)(CI)(RX)"
 _SID_PATTERN = re.compile(r"S-1-15-[0-9-]+", re.IGNORECASE)
+_SID_ALIASES = {
+    "ac": ALL_APPLICATION_PACKAGES_SID,
+    "all application packages": ALL_APPLICATION_PACKAGES_SID,
+    "application package authority\\all application packages": ALL_APPLICATION_PACKAGES_SID,
+    "all restricted application packages": ALL_RESTRICTED_APPLICATION_PACKAGES_SID,
+    "application package authority\\all restricted application packages": ALL_RESTRICTED_APPLICATION_PACKAGES_SID,
+}
 
 
 class AclMutationBlockedError(RuntimeError):
@@ -92,6 +99,7 @@ $entries = @($acl.Access | ForEach-Object {{
   }}
   [pscustomobject]@{{
     Sid = [string]$sid
+    IdentityReference = [string]$_.IdentityReference
     Rights = [string]$_.FileSystemRights
     AccessType = [string]$_.AccessControlType
     IsInherited = [bool]$_.IsInherited
@@ -113,6 +121,8 @@ $entries = @($acl.Access | ForEach-Object {{
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=20,
         )
     except (OSError, subprocess.SubprocessError) as error:
@@ -121,7 +131,7 @@ $entries = @($acl.Access | ForEach-Object {{
         detail = (result.stderr or result.stdout or f"exit code {result.returncode}").strip()
         return None, detail.splitlines()[-1] if detail else f"exit code {result.returncode}"
     try:
-        parsed = json.loads(result.stdout)
+        parsed = json.loads(result.stdout or "")
     except json.JSONDecodeError as error:
         return None, f"PowerShell ACL output was not JSON: {_safe_error(error)}"
     if not isinstance(parsed, dict):
@@ -150,10 +160,15 @@ def _entry_sid(entry: Mapping[str, object]) -> str | None:
     value = entry.get("Sid")
     if value is None:
         value = entry.get("sid")
-    if not isinstance(value, str):
+    if isinstance(value, str) and value.strip():
+        value = value.strip()
+    else:
+        value = str(
+            entry.get("IdentityReference", entry.get("identity_reference", ""))
+        ).strip()
+    if not value:
         return None
-    value = value.strip()
-    return value or None
+    return _SID_ALIASES.get(value.casefold(), value)
 
 
 def _entry_allows_read_execute(entry: Mapping[str, object]) -> bool:
@@ -404,6 +419,8 @@ def prepare_windows_electron_payload_acl(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=120,
         )
     except (OSError, subprocess.SubprocessError) as error:
