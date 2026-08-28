@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 import shutil
 import sys
 import time
@@ -180,10 +181,26 @@ def _native_final_path(path: Path) -> tuple[str | None, str | None]:
 
 
 def _path_is_within(path: Path, root: Path) -> bool:
+    def variants(value: Path) -> tuple[str, ...]:
+        raw = os.path.normcase(os.path.normpath(str(value)))
+        values = [raw]
+        if any(re.search(r"~\d(?:$|\.)", part) for part in value.parts):
+            try:
+                resolved = os.path.normcase(os.path.normpath(str(value.resolve(strict=True))))
+            except OSError:
+                resolved = raw
+            if resolved not in values:
+                values.append(resolved)
+        return tuple(values)
+
     try:
-        candidate = os.path.normcase(os.path.normpath(str(path)))
-        parent = os.path.normcase(os.path.normpath(str(root)))
-        return candidate == parent or candidate.startswith(parent + os.sep)
+        candidates = variants(path)
+        parents = variants(root)
+        return any(
+            candidate == parent or candidate.startswith(parent + os.sep)
+            for candidate in candidates
+            for parent in parents
+        )
     except (OSError, ValueError):
         return False
 
