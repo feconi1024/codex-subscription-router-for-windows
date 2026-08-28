@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import inspect
+import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,14 +12,15 @@ from unittest.mock import patch
 
 from scripts.patch_common import (
     _plugin_mapping_anchors,
-    _renderer_variant_values,
     audit_renderer_anchors,
     ensure_asar_tool,
     patch_renderer,
+    renderer_variant_template,
+    select_renderer_variant,
 )
-from scripts.patch_app_windows import audit_windows_source, pack_asar, verify_asar_listing
+from scripts.patch_app_windows import audit_windows_source, build_windows_desktop, pack_asar, verify_asar_listing
 from scripts.windows.compatibility import load_compatibility_records
-from scripts.windows.bootstrap import patch_bootstrap
+from scripts.windows.bootstrap import audit_bootstrap, patch_bootstrap
 from scripts.windows.discovery import (
     AuthenticodeMetadata,
     DesktopSource,
@@ -34,7 +39,18 @@ from scripts.windows.discovery import (
     recognize_start_app_aumids,
     select_running_process,
 )
-from scripts.windows.fuses import SENTINEL, disable_asar_integrity_validation, read_fuses
+from scripts.windows.fuses import FUSE_INDEX, FUSE_VALUES, SENTINEL, FuseSnapshot, read_fuses, write_fuse
+from scripts.windows.integrity import (
+    FUSE_PRESENT_RESOURCE_MISSING,
+    RESOURCE_ABSENT_NO_VALIDATION_METADATA,
+    RESOURCE_PRESENT_UPDATE_REQUIRED,
+    AsarHeaderDigest,
+    WindowsAsarIntegrityPlan,
+    apply_windows_asar_integrity,
+    asar_header_digest,
+    read_pe_integrity_resources,
+    resolve_windows_asar_integrity,
+)
 from scripts.windows.mirror import (
     DirectoryEnumerationBlockedError,
     PackagingBlockedError,
@@ -53,6 +69,49 @@ def write_pe(path: Path, machine: int = 0x8664) -> None:
     data[0x80:0x84] = b"PE\0\0"
     data[0x84:0x86] = machine.to_bytes(2, "little")
     path.write_bytes(data)
+
+
+def write_exact_26_820_renderer_fixture(root: Path) -> dict[str, object]:
+    values = renderer_variant_template("windows-26.820")
+    webview = root / "webview"
+    assets = webview / "assets"
+    assets.mkdir(parents=True)
+    tick = chr(96)
+    bundle_parts = [str(values["component_anchor"])]
+    bundle_parts.extend(
+        str(spec["current"])
+        for spec in values["plugin_mappings"]
+        if spec["name"] != "mcpServerStatus/list RPC call"
+    )
+    bundle_parts.extend(
+        [
+            str(values["app_server_anchor"]),
+            str(values["profile_query"]),
+            str(values["usage_modal"]),
+            str(values["reset_query"]),
+            str(values["reset_mutation"]),
+            "let y=v;if(g!=null){",
+            str(values["usage_header"]),
+            str(values["usage_slot"]),
+            str(values["open_change"][0]),
+            str(values["open_preserved"]),
+            f"defaultMessage:{tick}You’re out of Codex and Work usage{tick}",
+            f"defaultMessage:{tick}You’ve used all Codex and Work usage{tick}",
+            f"defaultMessage:{tick}You’ve reached your usage limit{tick}",
+        ]
+    )
+    (webview / "index.html").write_text("connect-src &#39;self&#39;", encoding="utf-8")
+    (assets / "app-initial-26-820.js").write_text("\n".join(bundle_parts), encoding="utf-8")
+    (assets / "profile-26-820.js").write_text(
+        " ".join(str(values[key]) for key in ("profile_avatar", "profile_name", "profile_identity")),
+        encoding="utf-8",
+    )
+    (assets / "plugins-page-26-820.js").write_text(str(values["plugin_anchor"]), encoding="utf-8")
+    (assets / "local-conversation-thread-26-820.js").write_text(
+        str(values["thread_anchor"]) + " " + str(values["thread_summary_anchor"]),
+        encoding="utf-8",
+    )
+    return values
 
 
 class WindowsDesktopHelpersTests(unittest.TestCase):
@@ -291,15 +350,178 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                 "scripts.patch_app_windows.read_authenticode",
                 return_value=AuthenticodeMetadata("Valid", "CN=OpenAI"),
             ), patch(
-                "scripts.patch_app_windows.read_fuses",
-                side_effect=RuntimeError("fixture has no fuse sentinel"),
+                "scripts.patch_app_windows.asar_header_digest",
+                return_value=AsarHeaderDigest("sha256", "a" * 64, 4, 3),
             ), patch("scripts.patch_app_windows.run"), patch(
                 "scripts.patch_app_windows.audit_renderer_anchors", return_value=[]
             ):
                 result = audit_windows_source(source)
-            self.assertEqual(result["electron_fuses"]["status"], "UNAVAILABLE")
+            self.assertEqual(result["electron_fuses"]["status"], "NOT PRESENT")
             self.assertEqual(executable.read_bytes(), executable_before)
             self.assertEqual(asar.read_bytes(), asar_before)
+
+    def test_windows_ci_setup_go_sha_is_pinned_to_correct_commit(self) -> None:
+        workflow = (Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("actions/setup-go@b7ad1dad31d06c5925ef5d2fc7ad053ef454303e", workflow)
+        self.assertGreaterEqual(
+            workflow.count("actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e"),
+            2,
+        )
+
+    def test_build_uses_executable_inside_staged_app(self) -> None:
+        source = inspect.getsource(build_windows_desktop)
+        self.assertIn("staged_source_executable = staged_app / source.executable.name", source)
+        self.assertNotIn("staged / source.executable.name", source)
+
+    def test_bootstrap_dry_run_audit_matches_fixture(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            extracted = Path(temporary)
+            build = extracted / ".vite" / "build"
+            build.mkdir(parents=True)
+            (build / "bootstrap-fixture.js").write_text(
+                "e.app.setPath(`userData`,x({appDataPath:e.app.getPath(`appData`),"
+                "buildFlavor:`stable`,env:process.env}))"
+                "await u.initialize();try{let{runMainAppStartup:startup}=x}",
+                encoding="utf-8",
+            )
+            (build / "main-fixture.js").write_text("main", encoding="utf-8")
+            report = audit_bootstrap(extracted, Path(__file__).resolve().parents[2])
+            self.assertTrue(report["audit_pass"], report)
+            self.assertEqual(report["updater_hook"]["initializer_count"], 1)
+
+    def test_exact_26_820_variant_requires_multiple_fingerprints(self) -> None:
+        values = renderer_variant_template("windows-26.820")
+        bundle = "\n".join(
+            [
+                str(values["component_anchor"]),
+                str(values["app_server_anchor"]),
+                str(values["profile_query"]),
+                str(values["usage_modal"]),
+                str(values["reset_query"]),
+                str(values["reset_mutation"]),
+                str(values["usage_slot"]),
+                str(values["open_change"][0]),
+            ]
+        )
+        selected = select_renderer_variant(
+            bundle,
+            package_name="OpenAI.Codex",
+            package_version="26.820.7780.0",
+            app_asar_sha256="5df8bf5a9d30742919390ab11fa419e83aab0891152569a42c6ea4abf15386c2",
+        )
+        self.assertEqual(selected.variant_id, "windows-26.820")
+        with self.assertRaises(RuntimeError):
+            select_renderer_variant(
+                bundle.replace(str(values["reset_mutation"]), "reset-mutation-drift"),
+                package_name="OpenAI.Codex",
+                package_version="26.820.7780.0",
+                app_asar_sha256="5df8bf5a9d30742919390ab11fa419e83aab0891152569a42c6ea4abf15386c2",
+            )
+
+    def test_exact_26_820_renderer_patches_host_scoped_plugin_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            extracted = Path(temporary)
+            values = write_exact_26_820_renderer_fixture(extracted)
+            audit = audit_renderer_anchors(extracted)
+            self.assertTrue(all(item.status == "UNCHANGED" for item in audit), audit)
+            patch_renderer(extracted, "c" * 64)
+            bundle = next((extracted / "webview" / "assets").glob("app-initial-*.js")).read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("function CodexMuxAccountMenu(", bundle)
+            self.assertIn("function qg(e,t){let n=e.get(Jg)", bundle)
+            self.assertIn('codexMuxScopePluginRequest("list-apps"', bundle)
+            self.assertIn('codexMuxScopePluginRequest("list-installed-apps"', bundle)
+            self.assertIn('codexMuxScopePluginRequest("read-apps"', bundle)
+            self.assertIn('codexMuxScopePluginRequest("login-mcp-server"', bundle)
+            self.assertIn('codexMuxScopePluginRequest("list-mcp-server-status"', bundle)
+            self.assertIn("open:s,onOpenChange:l,contentWidth:`panel`,triggerButton:Ot", bundle)
+            self.assertIn("CodexMuxProfileMenuOpenChange(l)", bundle)
+            self.assertIn("CodexMuxThreadSubscription,{conversationId:a}", (
+                extracted / "webview" / "assets" / "local-conversation-thread-26-820.js"
+            ).read_text(encoding="utf-8"))
+            self.assertIn("CodexMuxProfileAvatarStack", (
+                extracted / "webview" / "assets" / "profile-26-820.js"
+            ).read_text(encoding="utf-8"))
+
+    def test_pe_integrity_resource_read_update_and_readback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable = root / "ChatGPT.exe"
+            initial_payload = json.dumps(
+                [{"file": "resources\\app.asar", "alg": "sha256", "value": "0" * 64}],
+                separators=(",", ":"),
+            )
+            fixture_script = Path(__file__).resolve().parents[1] / "windows" / "pe_resources.mjs"
+            subprocess.run(
+                ["node", str(fixture_script), "fixture", str(executable)],
+                input=initial_payload,
+                text=True,
+                check=True,
+            )
+            before = read_pe_integrity_resources(executable)
+            self.assertEqual(before["resources"][0]["parsed"][0]["value"], "0" * 64)
+            extracted = root / "asar-source"
+            extracted.mkdir()
+            (extracted / "index.js").write_text("fixture", encoding="utf-8")
+            archive = root / "app.asar"
+            pack_asar(ensure_asar_tool(), extracted, archive, (), ())
+            plan = WindowsAsarIntegrityPlan(
+                RESOURCE_PRESENT_UPDATE_REQUIRED,
+                True,
+                "fixture",
+                None,
+                None,
+                True,
+                tuple(before["resources"]),
+                None,
+            )
+            result = apply_windows_asar_integrity(executable, archive, plan)
+            expected = asar_header_digest(archive).hash
+            self.assertTrue(result["resource_updated"])
+            self.assertEqual(result["asar_header"]["hash"], expected)
+            after = read_pe_integrity_resources(executable)
+            self.assertEqual(after["resources"][0]["parsed"][0]["value"], expected)
+
+    def test_asar_header_digest_is_not_whole_archive_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "index.js").write_text("header fixture", encoding="utf-8")
+            archive = root / "app.asar"
+            pack_asar(ensure_asar_tool(), source, archive, (), ())
+            header = asar_header_digest(archive)
+            whole = hashlib.sha256(archive.read_bytes()).hexdigest()
+            self.assertEqual(header.algorithm, "sha256")
+            self.assertEqual(len(header.hash), 64)
+            self.assertNotEqual(header.hash, whole)
+
+    def test_integrity_plan_accepts_absent_metadata_but_blocks_fuse_without_resource(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = Path(temporary) / "ChatGPT.exe"
+            executable.write_bytes(b"fixture")
+            with patch(
+                "scripts.windows.integrity.read_fuses",
+                side_effect=RuntimeError("Electron fuse sentinel not found"),
+            ), patch(
+                "scripts.windows.integrity.read_pe_integrity_resources",
+                return_value={"resources": []},
+            ):
+                absent = resolve_windows_asar_integrity(executable)
+            self.assertEqual(absent.state, RESOURCE_ABSENT_NO_VALIDATION_METADATA)
+            self.assertTrue(absent.resolved)
+
+            fuse = FuseSnapshot(1, 9, ("on",) * 9, 0)
+            with patch("scripts.windows.integrity.read_fuses", return_value=fuse), patch(
+                "scripts.windows.integrity.read_pe_integrity_resources",
+                return_value={"resources": []},
+            ):
+                missing_resource = resolve_windows_asar_integrity(executable)
+            self.assertEqual(missing_resource.state, FUSE_PRESENT_RESOURCE_MISSING)
+            self.assertFalse(missing_resource.resolved)
 
     def test_semantic_renderer_counterpart_is_not_patchable_by_old_anchor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -424,20 +646,25 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                 ("native.node",),
             )
 
-    def test_fuse_writer_changes_only_asar_integrity(self) -> None:
+    def test_fuse_schema_values_and_writer_change_only_selected_byte(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             binary = root / "ChatGPT.exe"
-            backup = root / "ChatGPT.exe.before"
-            before_bytes = b"MZ" + b"prefix" + SENTINEL + bytes([1, 9]) + b"011111111" + b"suffix"
+            before_bytes = b"MZ" + b"prefix" + SENTINEL + bytes([1, 9]) + bytes(FUSE_VALUES["on"] for _ in range(9)) + b"suffix"
             binary.write_bytes(before_bytes)
             before = read_fuses(binary)
-            before_snapshot, after_snapshot = disable_asar_integrity_validation(binary, backup)
-            self.assertEqual(before_snapshot, before)
-            self.assertEqual(after_snapshot.fuses[4], "off")
+            self.assertEqual(FUSE_VALUES, {"off": 0x30, "on": 0x31, "removed": 0x72, "inherit": 0x90})
+            self.assertEqual(FUSE_INDEX["WasmTrapHandlers"], 8)
+            self.assertNotIn("ResetAdHocDarwinSignature", FUSE_INDEX)
+            previous, updated = write_fuse(binary, "EnableEmbeddedAsarIntegrityValidation", "off")
+            after = read_fuses(binary)
+            self.assertEqual(before.fuses[4], previous)
+            self.assertEqual(updated, "off")
+            self.assertEqual(after.fuses[4], "off")
             for index in (0, 1, 2, 3, 5, 6, 7, 8):
-                self.assertEqual(before_snapshot.fuses[index], after_snapshot.fuses[index])
-            self.assertEqual(backup.read_bytes(), before_bytes)
+                self.assertEqual(before.fuses[index], after.fuses[index])
+            changed = [index for index, (left, right) in enumerate(zip(before_bytes, binary.read_bytes())) if left != right]
+            self.assertEqual(changed, [before.offset + 4])
 
     def test_compatibility_record_parser(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -464,7 +691,7 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             webview = extracted / "webview"
             assets = webview / "assets"
             assets.mkdir(parents=True)
-            values = _renderer_variant_values("fixture")
+            values = renderer_variant_template("electron-original")
             tick = chr(96)
             bundle_parts = [str(values["component_anchor"])]
             bundle_parts.extend(_plugin_mapping_anchors(str(values["rpc_wrapper"]), str(values["status_rpc_wrapper"])))
@@ -511,7 +738,7 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             assets = webview / "assets"
             assets.mkdir(parents=True)
             marker = "function Icl(e){let t=(0,Vcl.c)(248),"
-            values = _renderer_variant_values(marker)
+            values = renderer_variant_template("electron-6662")
             tick = chr(96)
             bundle_parts = [marker]
             bundle_parts.extend(

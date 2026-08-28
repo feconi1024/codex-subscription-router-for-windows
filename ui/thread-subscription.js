@@ -1,13 +1,16 @@
 const CODEX_MUX_THREAD_API = "http://127.0.0.1:__CODEX_MUX_CONTROL_PORT__/v1";
 const CODEX_MUX_THREAD_TOKEN = "__CODEX_MUX_CONTROL_TOKEN__";
 
-function CodexMuxThreadSubscription() {
-  const route = $n(sr);
+function CodexMuxThreadSubscription({ conversationId = null } = {}) {
+  const route = __CODEX_MUX_ROUTE__;
   const threadId =
-    route.value.routeKind === "local-thread" ? route.value.conversationId : null;
-  const [account, setAccount] = TE.useState(null);
+    conversationId ||
+    (route?.value?.routeKind === "local-thread"
+      ? route.value.conversationId
+      : null);
+  const [account, setAccount] = __CODEX_MUX_REACT__.useState(null);
 
-  TE.useEffect(() => {
+  __CODEX_MUX_REACT__.useEffect(() => {
     let active = true;
     if (!threadId) {
       setAccount(null);
@@ -61,23 +64,23 @@ function CodexMuxThreadSubscription() {
   const remaining = weekly == null ? null : Math.max(0, 100 - weekly.usedPercent);
   const depleted = remaining === 0;
   const AccountAvatar = globalThis.CodexMuxAccountAvatar;
-  return (0, zE.jsx)(K.Section, {
+  return (0, __CODEX_MUX_JSX__.jsx)(__CODEX_MUX_SECTION__.Section, {
     sectionKey: "codex-mux-subscription",
     title: "Subscription",
-    children: (0, zE.jsxs)("div", {
+    children: (0, __CODEX_MUX_JSX__.jsxs)("div", {
       className: "flex min-h-9 items-center justify-between gap-3 py-1 text-sm",
       children: [
-        (0, zE.jsxs)("div", {
+        (0, __CODEX_MUX_JSX__.jsxs)("div", {
           className: "flex min-w-0 items-center gap-2",
           children: [
             AccountAvatar
-              ? (0, zE.jsx)(AccountAvatar, {
+              ? (0, __CODEX_MUX_JSX__.jsx)(AccountAvatar, {
                   imageUrl: account.profileImageUrl,
                   label: account.label,
                   className: "size-5 shrink-0",
                 })
               : null,
-            (0, zE.jsx)("span", {
+            (0, __CODEX_MUX_JSX__.jsx)("span", {
               className: "truncate text-token-text-primary",
               children: account.planLabel
                 ? `${account.label} · ${account.planLabel}`
@@ -85,7 +88,7 @@ function CodexMuxThreadSubscription() {
             }),
           ],
         }),
-        (0, zE.jsx)("span", {
+        (0, __CODEX_MUX_JSX__.jsx)("span", {
           className: "shrink-0 tabular-nums text-token-description-foreground",
           children:
             remaining == null

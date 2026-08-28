@@ -21,7 +21,7 @@ try:
         load_or_create_token,
         patch_renderer,
     )
-    from .windows.bootstrap import BootstrapPatchReport, patch_bootstrap
+    from .windows.bootstrap import BootstrapPatchReport, audit_bootstrap, patch_bootstrap
     from .windows.compatibility import find_matching_record, load_compatibility_records
     from .windows.discovery import (
         DesktopSource,
@@ -41,7 +41,14 @@ try:
         source_access_probes,
         is_windowsapps_path,
     )
-    from .windows.fuses import FuseSnapshot, disable_asar_integrity_validation, read_fuses
+    from .windows.fuses import FuseSnapshot
+    from .windows.integrity import (
+        apply_windows_asar_integrity,
+        asar_header_digest,
+        resolve_windows_asar_integrity,
+        scan_fuse_carriers,
+    )
+    from .windows.smoke import run_unmodified_mirror_smoke
     from .windows.mirror import (
         MirrorReport,
         PackagingBlockedError,
@@ -59,7 +66,7 @@ except ImportError:
         load_or_create_token,
         patch_renderer,
     )
-    from windows.bootstrap import BootstrapPatchReport, patch_bootstrap
+    from windows.bootstrap import BootstrapPatchReport, audit_bootstrap, patch_bootstrap
     from windows.compatibility import find_matching_record, load_compatibility_records
     from windows.discovery import (
         DesktopSource,
@@ -79,7 +86,14 @@ except ImportError:
         source_access_probes,
         is_windowsapps_path,
     )
-    from windows.fuses import FuseSnapshot, disable_asar_integrity_validation, read_fuses
+    from windows.fuses import FuseSnapshot
+    from windows.integrity import (
+        apply_windows_asar_integrity,
+        asar_header_digest,
+        resolve_windows_asar_integrity,
+        scan_fuse_carriers,
+    )
+    from windows.smoke import run_unmodified_mirror_smoke
     from windows.mirror import (
         MirrorReport,
         PackagingBlockedError,
@@ -118,6 +132,11 @@ def parse_args() -> argparse.Namespace:
         "--mirror-dry-run",
         action="store_true",
         help="mirror the unmodified Desktop shell into a temporary writable directory",
+    )
+    parser.add_argument(
+        "--smoke-unmodified-mirror",
+        action="store_true",
+        help="launch an unmodified temporary Desktop mirror for bounded startup evidence",
     )
     parser.add_argument(
         "--diagnostics-json",
@@ -290,7 +309,7 @@ def print_anchor_audit(audit: list[object]) -> None:
 
 def _fuse_summary(snapshot: FuseSnapshot | None, error: str | None = None) -> dict[str, object]:
     if snapshot is None:
-        return {"status": "UNAVAILABLE", "error": error or "fuse state was not readable"}
+        return {"status": "NOT PRESENT" if error is None else "UNAVAILABLE", "error": error}
     required = (
         "RunAsNode",
         "EnableCookieEncryption",
@@ -327,13 +346,9 @@ def audit_windows_source(source: DesktopSource) -> dict[str, object]:
     asar = ensure_asar_tool()
     versions = read_file_versions(source.executable)
     source_hash = sha256_file(source.app_asar)
+    source_header = asar_header_digest(source.app_asar)
     signature = read_authenticode(source.executable)
-    try:
-        fuses = read_fuses(source.executable)
-        fuse_error = None
-    except RuntimeError as error:
-        fuses = None
-        fuse_error = str(error)
+    integrity_plan = resolve_windows_asar_integrity(source.executable)
     block_map_path = source.source_root / "AppxBlockMap.xml"
     try:
         block_map_files = [path.as_posix() for path in parse_appx_block_map(block_map_path)]
@@ -342,9 +357,21 @@ def audit_windows_source(source: DesktopSource) -> dict[str, object]:
         block_map_files = []
         block_map_error = str(error)
     with tempfile.TemporaryDirectory(prefix="codex-router-phase2a-audit-") as temporary:
-        extracted = Path(temporary) / "asar"
+        temporary_root = Path(temporary)
+        mirror_root = temporary_root / "mirror" / "app"
+        mirror_report = mirror_desktop_source(source, mirror_root)
+        verify_desktop_mirror(source.app_dir, mirror_root)
+        fuse_scan = scan_fuse_carriers(mirror_root)
+        extracted = temporary_root / "asar"
         run([str(asar), "extract", str(source.app_asar), str(extracted)])
-        renderer_audit = audit_renderer_anchors(extracted)
+        renderer_audit = audit_renderer_anchors(
+            extracted,
+            package_name=source.package.name,
+            package_version=source.package.version,
+            app_asar_sha256=source_hash,
+        )
+        bootstrap_audit = audit_bootstrap(extracted, PROJECT_ROOT)
+    fuse_summary = _fuse_summary(integrity_plan.fuse, integrity_plan.fuse_error)
     return {
         "source": {
             "package": package_to_dict(source.package),
@@ -357,6 +384,7 @@ def audit_windows_source(source: DesktopSource) -> dict[str, object]:
             "authenticode": {"status": signature.status, "signer": signature.signer},
             "app_asar": str(source.app_asar),
             "app_asar_sha256": source_hash,
+            "app_asar_header_sha256": source_header.hash,
         },
         "access": [probe.to_dict() for probe in source_access_probes(source)],
         "appx_block_map": {
@@ -364,6 +392,10 @@ def audit_windows_source(source: DesktopSource) -> dict[str, object]:
             "file_count": len(block_map_files),
             "error": block_map_error,
         },
+        "windows_asar_integrity": integrity_plan.to_dict(),
+        "fuse_carriers": fuse_scan,
+        "bootstrap_audit": bootstrap_audit,
+        "mirror": mirror_report.to_dict(),
         "renderer_anchor_audit": [
             {
                 "name": item.name,
@@ -374,10 +406,14 @@ def audit_windows_source(source: DesktopSource) -> dict[str, object]:
             }
             for item in renderer_audit
         ],
-        "electron_fuses": _fuse_summary(fuses, fuse_error),
+        "electron_fuses": fuse_summary,
         "renderer_audit_pass": not _audit_has_failure(renderer_audit),
-        "fuse_audit_pass": fuses is not None,
-        "audit_pass": not _audit_has_failure(renderer_audit) and fuses is not None,
+        "fuse_audit_pass": True,
+        "audit_pass": (
+            not _audit_has_failure(renderer_audit)
+            and bool(bootstrap_audit.get("audit_pass"))
+            and integrity_plan.resolved
+        ),
     }
 
 
@@ -432,11 +468,51 @@ def _run_source_audit(args: argparse.Namespace) -> int:
     print(f"ChatGPT.exe FileVersion: {audit['source']['file_version']}")
     print(f"ChatGPT.exe ProductVersion: {audit['source']['product_version']}")
     print(f"Authenticode: {audit['source']['authenticode']}")
+    print(f"ASAR header SHA-256: {audit['source']['app_asar_header_sha256']}")
     print(f"AppxBlockMap files: {audit['appx_block_map']['file_count']}")
     print(f"Electron fuses: {json.dumps(audit['electron_fuses'], sort_keys=True)}")
+    print(f"Windows ASAR integrity: {json.dumps(audit['windows_asar_integrity'], sort_keys=True)}")
+    print(
+        "Fuse carrier scan: "
+        f"{audit['fuse_carriers']['carrier_count']} carrier(s), "
+        f"{len(audit['fuse_carriers']['scanned_files'])} file(s) scanned"
+    )
+    print(f"Bootstrap audit: {json.dumps(audit['bootstrap_audit'], sort_keys=True)}")
     print_anchor_audit([type("AuditItem", (), item) for item in audit["renderer_anchor_audit"]])
     _print_access_matrix(audit["access"])
     return 0 if audit["audit_pass"] else 1
+
+
+def _run_unmodified_mirror_smoke(args: argparse.Namespace) -> int:
+    source, diagnostics = discover_desktop_source(args.source)
+    if source is None:
+        _write_json(args.diagnostics_json, diagnostics.to_dict())
+        print(format_source_diagnostics(diagnostics), file=sys.stderr)
+        return 1
+    try:
+        real, candidates = discover_real_codex(args.real_codex)
+        smoke = run_unmodified_mirror_smoke(source, real)
+    except (PackagingBlockedError, OSError, RuntimeError, subprocess.SubprocessError) as error:
+        smoke = {
+            "status": "BLOCKED_PACKAGE_IDENTITY" if "identity" in str(error).casefold() else "FAIL",
+            "reason": str(error),
+            "manual_operation_required": False,
+        }
+        candidates = []
+    payload = diagnostics.to_dict()
+    payload["smoke_unmodified_mirror"] = smoke
+    if candidates:
+        payload["real_codex_candidates"] = [str(candidate.path) for candidate in candidates]
+    _write_json(args.diagnostics_json, payload)
+    print(f"Unmodified mirror smoke: {smoke.get('status')}")
+    print(f"Reason: {smoke.get('reason')}")
+    if smoke.get("manual_operation_required"):
+        print(
+            "Manual operation required: close the official ChatGPT/Codex Desktop instance, "
+            "then rerun --smoke-unmodified-mirror. The test did not close it."
+        )
+    print(json.dumps(smoke, indent=2))
+    return 0 if smoke.get("status") == "PASS" else 1
 
 
 def _run_mirror_dry_run(args: argparse.Namespace) -> int:
@@ -525,8 +601,8 @@ def _metadata(
     destination: Path,
     bootstrap_report: BootstrapPatchReport,
     audit: list[object],
-    fuse_before: object,
-    fuse_after: object,
+    integrity_result: dict[str, object],
+    fuse_scan: dict[str, object],
     mirror_report: object,
 ) -> dict[str, object]:
     return {
@@ -542,6 +618,7 @@ def _metadata(
         "source_app_executable": str(source.executable),
         "source_app_file_version": source.file_version,
         "source_app_asar_sha256": sha256_file(source.app_asar),
+        "source_app_asar_header_sha256": asar_header_digest(source.app_asar).hash,
         "bootstrap_patch": {
             "bootstrap_bundle": bootstrap_report.bootstrap.name,
             "main_bundle": bootstrap_report.main.name,
@@ -574,16 +651,8 @@ def _metadata(
             }
             for item in audit
         ],
-        "electron_fuses_before": {
-            "schema_version": fuse_before.schema_version,
-            "count": fuse_before.count,
-            "fuses": list(fuse_before.fuses),
-        },
-        "electron_fuses_after": {
-            "schema_version": fuse_after.schema_version,
-            "count": fuse_after.count,
-            "fuses": list(fuse_after.fuses),
-        },
+        "windows_asar_integrity": integrity_result,
+        "fuse_carriers": fuse_scan,
         "mirror": {
             "strategy": mirror_report.strategy,
             "copied_count": len(mirror_report.copied),
@@ -635,6 +704,12 @@ def build_windows_desktop(
         raise RuntimeError("destination must be separate from the official source")
     records = load_compatibility_records(COMPATIBILITY_DOCUMENT)
     source_hash = sha256_file(source.app_asar)
+    integrity_plan = resolve_windows_asar_integrity(source.executable)
+    if not integrity_plan.resolved:
+        raise RuntimeError(
+            "PHASE 2A.2 INTEGRITY BLOCKED: "
+            f"{integrity_plan.state}: {integrity_plan.reason}"
+        )
     matching = find_matching_record(
         records,
         package_name=source.package.name,
@@ -661,13 +736,20 @@ def build_windows_desktop(
         staged.mkdir(parents=True, exist_ok=True)
         mirror_report = mirror_desktop_source(source, staged_app)
         verify_desktop_mirror(source.app_dir, staged_app)
-        staged_source_hash = sha256_file(staged / source.executable.name)
+        fuse_scan = scan_fuse_carriers(staged_app)
+        staged_source_executable = staged_app / source.executable.name
+        staged_source_hash = sha256_file(staged_source_executable)
         source_executable_hash = sha256_file(source.executable)
         if staged_source_hash != source_executable_hash:
             raise RuntimeError("staged desktop executable changed while mirroring")
 
         run([str(asar), "extract", str(staged_resources / "app.asar"), str(extracted)])
-        audit = audit_renderer_anchors(extracted)
+        audit = audit_renderer_anchors(
+            extracted,
+            package_name=source.package.name,
+            package_version=source.package.version,
+            app_asar_sha256=source_hash,
+        )
         print_anchor_audit(audit)
         failed = [
             item
@@ -677,7 +759,13 @@ def build_windows_desktop(
         if failed:
             raise RuntimeError("Windows renderer anchor audit failed; no loose replacement was attempted")
         bootstrap_report = patch_bootstrap(extracted, PROJECT_ROOT)
-        patch_renderer(extracted, token)
+        patch_renderer(
+            extracted,
+            token,
+            package_name=source.package.name,
+            package_version=source.package.version,
+            app_asar_sha256=source_hash,
+        )
         unpacked_source = staged_resources / "app.asar.unpacked"
         unpack_directories = derive_unpack_directories(unpacked_source)
         unpack_files = derive_unpack_files(unpacked_source)
@@ -685,6 +773,11 @@ def build_windows_desktop(
         listing = pack_asar(asar, extracted, repacked_asar, unpack_directories, unpack_files)
         verify_asar_listing(listing, unpacked_source, unpack_directories, unpack_files)
         shutil.copy2(repacked_asar, staged_resources / "app.asar")
+        integrity_result = apply_windows_asar_integrity(
+            staged_source_executable,
+            staged_resources / "app.asar",
+            integrity_plan,
+        )
         generated_unpacked = temporary_root / "app.asar.unpacked"
         if generated_unpacked.is_dir():
             copy_unpacked_tree(generated_unpacked, staged_resources / "app.asar.unpacked")
@@ -697,15 +790,6 @@ def build_windows_desktop(
         build_go_binary("./cmd/codex-router-launcher", launcher, go_executable)
         copy_byte_identical(real.path, staged_real)
 
-        fuse_backup = temporary_root / f"{source.executable.name}.before-fuse-change"
-        fuse_before, fuse_after = disable_asar_integrity_validation(
-            staged_app / source.executable.name,
-            fuse_backup,
-        )
-        try:
-            fuse_backup.unlink()
-        except FileNotFoundError:
-            pass
         (staged / "User Data").mkdir(parents=True, exist_ok=True)
         metadata = _metadata(
             source,
@@ -713,8 +797,8 @@ def build_windows_desktop(
             destination,
             bootstrap_report,
             audit,
-            fuse_before,
-            fuse_after,
+            integrity_result,
+            fuse_scan,
             mirror_report,
         )
         (staged / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
@@ -722,7 +806,7 @@ def build_windows_desktop(
         # generated layout honest without starting the official UI in Round 1.
         if not all(
             path.is_file()
-            for path in (launcher, mux, staged_real, staged_app / source.executable.name, staged_resources / "app.asar")
+            for path in (launcher, mux, staged_real, staged_source_executable, staged_resources / "app.asar")
         ):
             raise RuntimeError("staged Windows Desktop layout is incomplete")
         backup = _atomic_install(staged, destination, force)
@@ -735,15 +819,28 @@ def build_windows_desktop(
 def main() -> int:
     args = parse_args()
     try:
-        selected_modes = sum(bool(value) for value in (args.diagnose_source, args.audit_only, args.mirror_dry_run))
+        selected_modes = sum(
+            bool(value)
+            for value in (
+                args.diagnose_source,
+                args.audit_only,
+                args.mirror_dry_run,
+                args.smoke_unmodified_mirror,
+            )
+        )
         if selected_modes > 1:
-            raise RuntimeError("choose only one of --diagnose-source, --audit-only, or --mirror-dry-run")
+            raise RuntimeError(
+                "choose only one of --diagnose-source, --audit-only, --mirror-dry-run, "
+                "or --smoke-unmodified-mirror"
+            )
         if args.diagnose_source:
             return _run_source_diagnostics(args)
         if args.audit_only:
             return _run_source_audit(args)
         if args.mirror_dry_run:
             return _run_mirror_dry_run(args)
+        if args.smoke_unmodified_mirror:
+            return _run_unmodified_mirror_smoke(args)
         source = locate_desktop_source(args.source)
         real, candidates = discover_real_codex(args.real_codex)
         print(f"Windows source: {source.source_root}")

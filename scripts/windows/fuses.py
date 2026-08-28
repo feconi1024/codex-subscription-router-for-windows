@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,9 +16,9 @@ FUSE_INDEX = {
     "OnlyLoadAppFromAsar": 5,
     "LoadBrowserProcessSpecificV8Snapshot": 6,
     "GrantFileProtocolExtraPrivileges": 7,
-    "ResetAdHocDarwinSignature": 8,
+    "WasmTrapHandlers": 8,
 }
-FUSE_VALUES = {"off": 0x30, "on": 0x31, "removed": 0x32, "inherit": 0x33}
+FUSE_VALUES = {"off": 0x30, "on": 0x31, "removed": 0x72, "inherit": 0x90}
 BYTE_VALUES = {value: key for key, value in FUSE_VALUES.items()}
 
 
@@ -75,29 +74,3 @@ def write_fuse(binary: Path, name: str, value: str) -> tuple[str, str]:
     data[snapshot.offset + index] = FUSE_VALUES[value]
     binary.write_bytes(data)
     return previous, value
-
-
-def disable_asar_integrity_validation(binary: Path, backup: Path) -> tuple[FuseSnapshot, FuseSnapshot]:
-    """Back up the staged PE and change only the embedded ASAR-integrity fuse."""
-    backup.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(binary, backup)
-    try:
-        before = read_fuses(binary)
-        for required in ("EnableEmbeddedAsarIntegrityValidation", "OnlyLoadAppFromAsar"):
-            if FUSE_INDEX[required] >= before.count:
-                raise RuntimeError(f"staged Electron executable has no {required} fuse")
-        index = FUSE_INDEX["EnableEmbeddedAsarIntegrityValidation"]
-        if before.fuses[index] == "on":
-            write_fuse(binary, "EnableEmbeddedAsarIntegrityValidation", "off")
-        after = read_fuses(binary)
-        changed = [
-            position
-            for position, (left, right) in enumerate(zip(before.fuses, after.fuses))
-            if left != right
-        ]
-        if changed != ([index] if before.fuses[index] == "on" else []):
-            raise RuntimeError("Electron fuse operation changed an unrelated fuse")
-    except Exception:
-        shutil.copy2(backup, binary)
-        raise
-    return before, after

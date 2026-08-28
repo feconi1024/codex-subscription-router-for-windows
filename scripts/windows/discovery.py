@@ -22,8 +22,11 @@ PROBE_PASS = "PASS"
 PROBE_FAIL = "FAIL"
 PROBE_NOT_AVAILABLE = "NOT AVAILABLE"
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+PROCESS_TERMINATE = 0x0001
+SYNCHRONIZE = 0x00100000
 TH32CS_SNAPPROCESS = 0x00000002
 INVALID_HANDLE_VALUE = -1
+WAIT_OBJECT_0 = 0x00000000
 DESKTOP_EXECUTABLE_NAMES = ("ChatGPT.exe", "Codex.exe")
 OPENAI_AUMID_PATTERNS = ("OpenAI.Codex_*!App", "OpenAI.ChatGPT_*!App")
 
@@ -422,6 +425,179 @@ def discover_running_processes_native() -> tuple[list[RunningProcessCandidate], 
         tuple(candidate.label() for candidate in candidates),
         "; ".join(error for error in errors if error) or None,
     )
+
+
+def discover_process_snapshot_native() -> list[RunningProcessCandidate]:
+    """Return a best-effort native snapshot of all processes and parent IDs."""
+    if os.name != "nt":
+        return []
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except (AttributeError, OSError):
+        return []
+
+    class ProcessEntry32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", ctypes.c_uint32),
+            ("cntUsage", ctypes.c_uint32),
+            ("th32ProcessID", ctypes.c_uint32),
+            ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", ctypes.c_uint32),
+            ("cntThreads", ctypes.c_uint32),
+            ("th32ParentProcessID", ctypes.c_uint32),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", ctypes.c_uint32),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    kernel32.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    kernel32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ProcessEntry32W)]
+    kernel32.Process32FirstW.restype = ctypes.c_int
+    kernel32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ProcessEntry32W)]
+    kernel32.Process32NextW.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+
+    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snapshot or snapshot == ctypes.c_void_p(INVALID_HANDLE_VALUE).value:
+        return []
+    result: list[RunningProcessCandidate] = []
+    entry = ProcessEntry32W()
+    entry.dwSize = ctypes.sizeof(ProcessEntry32W)
+    try:
+        if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            return []
+        while True:
+            pid = int(entry.th32ProcessID)
+            path, error = _query_process_image_path(kernel32, pid)
+            result.append(
+                RunningProcessCandidate(
+                    pid=pid,
+                    name=str(entry.szExeFile),
+                    parent_pid=int(entry.th32ParentProcessID),
+                    executable=path,
+                    error=error,
+                )
+            )
+            if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                break
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return result
+
+
+def process_tree_pids(root_pid: int, snapshot: Iterable[RunningProcessCandidate]) -> tuple[int, ...]:
+    """Return only the root and descendants visible in one native snapshot."""
+    rows = list(snapshot)
+    children: dict[int, list[int]] = {}
+    for row in rows:
+        if row.parent_pid is not None:
+            children.setdefault(row.parent_pid, []).append(row.pid)
+    result: list[int] = [root_pid]
+    seen = {root_pid}
+    pending = [root_pid]
+    while pending:
+        parent = pending.pop(0)
+        for child in children.get(parent, []):
+            if child in seen:
+                continue
+            seen.add(child)
+            result.append(child)
+            pending.append(child)
+    return tuple(result)
+
+
+def enumerate_windows_for_processes(pids: Iterable[int]) -> list[dict[str, object]]:
+    """Collect visible top-level window evidence without sending input."""
+    wanted = {int(pid) for pid in pids}
+    if os.name != "nt" or not wanted:
+        return []
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+    except (AttributeError, OSError):
+        return []
+    enum_proc_type = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+    rows: list[dict[str, object]] = []
+
+    user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+    user32.IsWindowVisible.restype = ctypes.c_int
+    user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    user32.GetWindowThreadProcessId.restype = ctypes.c_uint32
+    user32.GetWindowTextLengthW.argtypes = [ctypes.c_void_p]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
+
+    @enum_proc_type
+    def callback(hwnd: int, _lparam: int) -> int:
+        if not user32.IsWindowVisible(hwnd):
+            return 1
+        process_id = ctypes.c_uint32()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+        pid = int(process_id.value)
+        if pid not in wanted:
+            return 1
+        title_length = max(1, user32.GetWindowTextLengthW(hwnd) + 1)
+        title = ctypes.create_unicode_buffer(title_length)
+        user32.GetWindowTextW(hwnd, title, title_length)
+        class_name = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, class_name, 256)
+        rows.append(
+            {
+                "hwnd": int(hwnd),
+                "pid": pid,
+                "title": title.value,
+                "class_name": class_name.value,
+                "visible": True,
+            }
+        )
+        return 1
+
+    user32.EnumWindows.argtypes = [enum_proc_type, ctypes.c_void_p]
+    user32.EnumWindows.restype = ctypes.c_int
+    user32.EnumWindows(callback, 0)
+    return rows
+
+
+def terminate_process_tree(root_pid: int, snapshot: Iterable[RunningProcessCandidate]) -> dict[str, object]:
+    """Terminate only a test process root and descendants from the supplied snapshot."""
+    if os.name != "nt":
+        return {"requested": [root_pid], "terminated": [], "errors": ["Windows-only process termination"]}
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except (AttributeError, OSError) as error:
+        return {"requested": [root_pid], "terminated": [], "errors": [str(error)]}
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.TerminateProcess.restype = ctypes.c_int
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    targets = process_tree_pids(root_pid, snapshot)
+    terminated: list[int] = []
+    errors: list[str] = []
+    for pid in reversed(targets):
+        handle = kernel32.OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, False, pid)
+        if not handle:
+            # A process that exited between snapshots is already safe to ignore.
+            continue
+        try:
+            if kernel32.TerminateProcess(handle, 0xC0DE):
+                result = kernel32.WaitForSingleObject(handle, 5_000)
+                if result == WAIT_OBJECT_0:
+                    terminated.append(pid)
+                else:
+                    errors.append(f"pid {pid} did not exit after termination (wait={result})")
+            else:
+                errors.append(_win32_error(f"TerminateProcess failed for pid {pid}"))
+        finally:
+            kernel32.CloseHandle(handle)
+    return {"requested": list(targets), "terminated": terminated, "errors": errors}
 
 
 def _rows_to_process_candidates(parsed: Any) -> list[RunningProcessCandidate]:
@@ -890,10 +1066,12 @@ def discover_desktop_source(
     if explicit is not None:
         explicit = explicit.expanduser().resolve(strict=False)
         try:
+            explicit_package_root = explicit.parent if explicit.name.casefold() == "app" else explicit
+            explicit_package = package_metadata_from_root(explicit_package_root)
             source = (
                 desktop_source_from_executable(explicit, source_kind="explicit")
                 if explicit.suffix.casefold() == ".exe"
-                else _source_layout(explicit, PackageMetadata(install_location=explicit), "explicit")
+                else _source_layout(explicit, explicit_package, "explicit")
             )
         except RuntimeError as error:
             source = None

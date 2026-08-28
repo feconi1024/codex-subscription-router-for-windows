@@ -20,6 +20,102 @@ class BootstrapPatchReport:
     ui_test_bridge: Path
 
 
+def _profile_matches(bootstrap: str) -> tuple[list[re.Match[str]], list[re.Match[str]]]:
+    exact_profile_pattern = re.compile(
+        r"(?P<electron>[A-Za-z_$][\w$]*)\.app\.setPath\("
+        r"`userData`,[A-Za-z_$][\w$]*\(\{"
+        r"appDataPath:(?P=electron)\.app\.getPath\(`appData`\),"
+        r"buildFlavor:[^,}]+,env:process\.env\}\)\)"
+    )
+    generic_matches = list(
+        re.finditer(
+            r"(?P<electron>[A-Za-z_$][\w$]*)\.app\.setPath\("
+            r"(?P<quote>[`\"'])userData(?P=quote),(?P<expression>[^;]{1,800})\)",
+            bootstrap,
+        )
+    )
+    return list(exact_profile_pattern.finditer(bootstrap)), generic_matches
+
+
+def _updater_matches(bootstrap: str) -> list[re.Match[str]]:
+    """Find the supported updater initializer immediately before main startup."""
+    pattern = re.compile(
+        r"await [A-Za-z_$][\w$]*\.initialize\(\);"
+        r"(?=try\{let\{runMainAppStartup:|let\{runMainAppStartup:)"
+    )
+    return list(pattern.finditer(bootstrap))
+
+
+def audit_bootstrap(extracted: Path, project_root: Path) -> dict[str, object]:
+    """Read-only dry-run audit of the Windows bootstrap transformation points."""
+    try:
+        bootstrap_path = _single_bundle(extracted, "bootstrap-*.js", "ChatGPT bootstrap")
+        main_path = _single_bundle(extracted, "main-*.js", "ChatGPT main")
+    except RuntimeError as error:
+        return {
+            "audit_pass": False,
+            "error": str(error),
+            "bootstrap": None,
+            "main": None,
+            "user_data_hook": {"status": "MISSING"},
+            "updater_hook": {"status": "MISSING"},
+            "main_bundle": {"status": "MISSING"},
+            "ui_test_bridge": {"status": "MISSING"},
+            "computer_use": {"status": "UNKNOWN"},
+        }
+    bootstrap = bootstrap_path.read_text(encoding="utf-8")
+    main = main_path.read_text(encoding="utf-8")
+    exact_matches, generic_matches = _profile_matches(bootstrap)
+    candidates = [
+        match
+        for match in generic_matches
+        if "appData" in match.group("expression")
+        and "getPath" in match.group("expression")
+    ]
+    profile_match_count = len(exact_matches) if exact_matches else len(candidates)
+    profile_match = exact_matches[0] if len(exact_matches) == 1 else candidates[0] if len(candidates) == 1 else None
+    updater_matches = _updater_matches(bootstrap)
+    bridge = project_root / "ui" / "ui-test-bridge.cjs"
+    computer_use_markers = [
+        marker
+        for marker in ("SKY_CUA_SERVICE_PATH", "Codex Computer Use.app")
+        if marker in main
+    ]
+    user_data_status = "PASS" if profile_match is not None and profile_match_count == 1 else "MISSING"
+    updater_status = "PASS" if len(updater_matches) == 1 else "AMBIGUOUS" if updater_matches else "MISSING"
+    main_status = "PASS" if not computer_use_markers else "COMPUTER_USE_PRESENT"
+    bridge_status = "PASS" if bridge.is_file() and main_path.is_file() else "MISSING"
+    return {
+        "audit_pass": all(
+            status == "PASS"
+            for status in (user_data_status, updater_status, main_status, bridge_status)
+        ),
+        "bootstrap": bootstrap_path.name,
+        "main": main_path.name,
+        "user_data_hook": {
+            "status": user_data_status,
+            "match_count": profile_match_count,
+            "environment_variable": "CODEX_MUX_DESKTOP_USER_DATA",
+            "dry_run_replacement": profile_match is not None,
+        },
+        "updater_hook": {
+            "status": updater_status,
+            "initializer_count": len(updater_matches),
+            "dry_run_removal": len(updater_matches) == 1,
+        },
+        "main_bundle": {"status": main_status, "computer_use_markers": computer_use_markers},
+        "ui_test_bridge": {
+            "status": bridge_status,
+            "source": str(bridge),
+            "injection": "CODEX_MUX_UI_TESTS=1 guarded require",
+        },
+        "computer_use": {
+            "status": "ABSENT" if not computer_use_markers else "PRESENT",
+            "markers": computer_use_markers,
+        },
+    }
+
+
 def _single_bundle(root: Path, pattern: str, label: str) -> Path:
     matches = list((root / ".vite" / "build").glob(pattern))
     if len(matches) != 1:
@@ -31,20 +127,7 @@ def patch_bootstrap(extracted: Path, project_root: Path) -> BootstrapPatchReport
     """Use the launcher-provided profile and remove the copied updater startup."""
     bootstrap_path = _single_bundle(extracted, "bootstrap-*.js", "ChatGPT bootstrap")
     bootstrap = bootstrap_path.read_text(encoding="utf-8")
-    exact_profile_pattern = re.compile(
-        r"(?P<electron>[A-Za-z_$][\w$]*)\.app\.setPath\("
-        r"`userData`,[A-Za-z_$][\w$]*\(\{"
-        r"appDataPath:(?P=electron)\.app\.getPath\(`appData`\),"
-        r"buildFlavor:[^,}]+,env:process\.env\}\)\)"
-    )
-    exact_matches = list(exact_profile_pattern.finditer(bootstrap))
-    generic_matches = list(
-        re.finditer(
-            r"(?P<electron>[A-Za-z_$][\w$]*)\.app\.setPath\("
-            r"(?P<quote>[`\"'])userData(?P=quote),(?P<expression>[^;]{1,800})\)",
-            bootstrap,
-        )
-    )
+    exact_matches, generic_matches = _profile_matches(bootstrap)
     if len(exact_matches) > 1:
         raise RuntimeError("ambiguous Electron userData profile hooks")
     if exact_matches:
@@ -74,7 +157,7 @@ def patch_bootstrap(extracted: Path, project_root: Path) -> BootstrapPatchReport
 
     updater_pattern = re.compile(
         r"await [A-Za-z_$][\w$]*\.initialize\(\);"
-        r"(?=try\{let\{runMainAppStartup:)"
+        r"(?=try\{let\{runMainAppStartup:|let\{runMainAppStartup:)"
     )
     bootstrap, updater_replacements = updater_pattern.subn("", bootstrap, count=1)
     if updater_replacements != 1:
