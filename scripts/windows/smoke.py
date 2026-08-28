@@ -765,15 +765,27 @@ def run_unmodified_mirror_smoke(
 
 
 @contextmanager
-def final_layout_smoke_root() -> Iterator[Path]:
+def final_layout_smoke_root(
+    cleanup_status: dict[str, object] | None = None,
+) -> Iterator[Path]:
     """Create and remove a Router-owned development root under LOCALAPPDATA."""
     if os.name != "nt":
-        with tempfile.TemporaryDirectory(prefix="codex-router-phase2a4-") as temporary:
-            root = Path(temporary)
+        root = Path(tempfile.mkdtemp(prefix="codex-router-phase2a4-"))
+        try:
             (root / "app").mkdir()
             (root / "User Data").mkdir()
             (root / "codex-home").mkdir()
             yield root
+        finally:
+            try:
+                shutil.rmtree(root)
+            except OSError as error:
+                if cleanup_status is not None:
+                    cleanup_status.update({"removed": False, "error": str(error)})
+                shutil.rmtree(root, ignore_errors=True)
+            else:
+                if cleanup_status is not None:
+                    cleanup_status.update({"removed": True, "error": None})
         return
 
     local_appdata_value = os.environ.get("LOCALAPPDATA")
@@ -782,12 +794,36 @@ def final_layout_smoke_root() -> Iterator[Path]:
     local_appdata = Path(local_appdata_value).expanduser().resolve(strict=False)
     router_smoke_parent = local_appdata / "Codex Subscription Router" / "_smoke"
     router_smoke_parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="phase2a4-", dir=router_smoke_parent) as temporary:
-        root = Path(temporary).resolve(strict=True)
+    root = Path(tempfile.mkdtemp(prefix="phase2a4-", dir=router_smoke_parent)).resolve(strict=True)
+    try:
         (root / "app").mkdir()
         (root / "User Data").mkdir()
         (root / "codex-home").mkdir()
         yield root
+    finally:
+        removed = False
+        last_error: OSError | None = None
+        for _attempt in range(5):
+            try:
+                shutil.rmtree(root)
+            except OSError as error:
+                last_error = error
+                time.sleep(0.5)
+            else:
+                removed = True
+                break
+        if cleanup_status is not None:
+            cleanup_status.update(
+                {
+                    "removed": removed,
+                    "error": str(last_error) if last_error is not None else None,
+                    "path": str(root),
+                }
+            )
+        if not removed:
+            # This is a best-effort final cleanup only after the exact generated
+            # path has failed several times. Never broaden it to a parent.
+            shutil.rmtree(root, ignore_errors=True)
 
 
 def _acl_paths(source: DesktopSource, mirror_root: Path) -> dict[str, Path]:
@@ -851,7 +887,8 @@ def run_phase2a4_sandbox_validation(
         "app_asar_sha256": str(sha256_file(source.app_asar)) if source.app_asar.is_file() else None,
     }
 
-    with final_layout_smoke_root() as root:
+    cleanup_status: dict[str, object] = {}
+    with final_layout_smoke_root(cleanup_status) as root:
         mirror_root = root / "app"
         mirror_report = mirror_desktop_source(source, mirror_root)
         verify_desktop_mirror(source.app_dir, mirror_root)
@@ -945,6 +982,7 @@ def run_phase2a4_sandbox_validation(
                 if acl_remediation.get("status") == PASS
                 else "not proven"
             ),
+            "smoke_root_cleanup": cleanup_status,
             "manual_operation_required": bool(acl_remediation.get("manual_operation_required")),
         }
         if verdict == LOCAL_APP_ACL_FIX_CONFIRMED:
