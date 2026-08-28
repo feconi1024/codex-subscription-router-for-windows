@@ -43,8 +43,10 @@ try:
         source_access_probes,
         is_windowsapps_path,
         inventory_desktop_executables,
+        select_authoritative_desktop_candidate,
     )
     from .windows.fuses import FuseSnapshot
+    from .windows.acl import prepare_windows_electron_payload_acl
     from .windows.integrity import (
         apply_windows_asar_integrity,
         asar_header_digest,
@@ -59,6 +61,7 @@ try:
         MINIMAL_BOOTSTRAP_IDENTITY_BLOCKED,
         MINIMAL_BOOTSTRAP_PASS,
         run_launch_probes,
+        run_phase2a4_sandbox_validation,
         run_smoke_launch_matrix,
         run_unmodified_mirror_smoke,
     )
@@ -101,8 +104,10 @@ except ImportError:
         source_access_probes,
         is_windowsapps_path,
         inventory_desktop_executables,
+        select_authoritative_desktop_candidate,
     )
     from windows.fuses import FuseSnapshot
+    from windows.acl import prepare_windows_electron_payload_acl
     from windows.integrity import (
         apply_windows_asar_integrity,
         asar_header_digest,
@@ -117,6 +122,7 @@ except ImportError:
         MINIMAL_BOOTSTRAP_IDENTITY_BLOCKED,
         MINIMAL_BOOTSTRAP_PASS,
         run_launch_probes,
+        run_phase2a4_sandbox_validation,
         run_smoke_launch_matrix,
         run_unmodified_mirror_smoke,
     )
@@ -168,6 +174,13 @@ def parse_args() -> argparse.Namespace:
         "--smoke-launch-matrix",
         action="store_true",
         help="run the sequential ChatGPT.exe/Codex.exe direct-launch matrix and identity-gated minimal fallback",
+    )
+    parser.add_argument(
+        "--smoke-sandbox-acl",
+        "--smoke-phase2a4",
+        dest="smoke_sandbox_acl",
+        action="store_true",
+        help="run Phase 2A.4 Chromium sandbox diagnostics, local app ACL remediation, and post-ACL probe",
     )
     parser.add_argument(
         "--launch-executable",
@@ -757,6 +770,46 @@ def _run_smoke_launch_matrix(args: argparse.Namespace) -> int:
     return 0 if smoke.get("status") in {DIRECT_LAUNCH_PASS, MINIMAL_BOOTSTRAP_PASS} else 1
 
 
+def _run_sandbox_acl_smoke(args: argparse.Namespace) -> int:
+    source, diagnostics = discover_desktop_source(args.source)
+    if source is None:
+        _write_json(args.diagnostics_json, diagnostics.to_dict())
+        print(format_source_diagnostics(diagnostics), file=sys.stderr)
+        return 1
+    try:
+        real, candidates = discover_real_codex(args.real_codex)
+        desktop_candidates = inventory_desktop_executables(source)
+        smoke = run_phase2a4_sandbox_validation(source, real, desktop_candidates)
+    except (PackagingBlockedError, OSError, RuntimeError, subprocess.SubprocessError) as error:
+        smoke = {
+            "status": "PHASE 2A.4 FAIL",
+            "reason": str(error),
+            "manual_operation_required": False,
+        }
+        candidates = []
+    payload = diagnostics.to_dict()
+    payload["phase2a4_sandbox"] = smoke
+    if candidates:
+        payload["real_codex_candidates"] = [str(candidate.path) for candidate in candidates]
+    _write_json(args.diagnostics_json, payload)
+    print(f"Phase 2A.4 sandbox/ACL validation: {smoke.get('status')}")
+    print(f"Reason: {smoke.get('reason')}")
+    if smoke.get("manual_operation_required"):
+        print(
+            "Manual operation required: the local Router-owned app ACL could not be "
+            "applied or verified; no official WindowsApps path was modified."
+        )
+    for label in ("probe_a_normal", "probe_b_disable_gpu_sandbox", "probe_c_acl_normal_sandbox"):
+        probe = smoke.get(label)
+        if isinstance(probe, dict):
+            print(f"{label}: {probe.get('status')}")
+    print(json.dumps(smoke, indent=2))
+    return 0 if smoke.get("status") in {
+        "LOCAL_APP_ACL_FIX_CONFIRMED",
+        "APP_CONTAINER_ACCESS_FIX_CONFIRMED",
+    } else 1
+
+
 def _run_unmodified_mirror_smoke(args: argparse.Namespace) -> int:
     return _run_smoke_launch_matrix(args)
 
@@ -853,6 +906,7 @@ def _metadata(
     integrity_result: dict[str, object],
     fuse_scan: dict[str, object],
     mirror_report: object,
+    payload_acl: dict[str, object],
 ) -> dict[str, object]:
     return {
         "platform": "windows",
@@ -868,6 +922,12 @@ def _metadata(
         "source_app_file_version": source.file_version,
         "desktop_launch_executable": launch_executable,
         "launch_metadata": "launch.json",
+        "launch_selection_basis": (
+            "exact OpenAI.Codex 26.820.7780.0 AppxManifest executable"
+            if source.package.name.casefold() == "openai.codex"
+            and source.package.version == "26.820.7780.0"
+            else "compatibility-specific AppxManifest executable or validated legacy shell"
+        ),
         "profile_isolation_strategy": "CODEX_ELECTRON_USER_DATA_PATH plus --user-data-dir",
         "updater_strategy": (
             "bootstrap-removal plus CODEX_SPARKLE_ENABLED=false"
@@ -915,6 +975,8 @@ def _metadata(
             for item in audit
         ],
         "windows_asar_integrity": integrity_result,
+        "payload_acl": payload_acl,
+        "payload_acl_strategy": "Router-owned app tree only; runtime, User Data, and control token excluded",
         "fuse_carriers": fuse_scan,
         "actual_fuse_carrier_relative_paths": fuse_scan.get("carrier_relative_paths", []),
         "mirror": {
@@ -955,11 +1017,10 @@ def _resolve_launch_executable(
     source: DesktopSource,
     requested: str | None,
 ) -> tuple[str, DesktopExecutableCandidate]:
+    inventory = inventory_desktop_executables(source)
     if not requested or not requested.strip():
-        raise RuntimeError(
-            "a validated Desktop shell is required; pass --launch-executable app\\ChatGPT.exe "
-            "or app\\Codex.exe from the Phase 2A.3 launch matrix"
-        )
+        selected = select_authoritative_desktop_candidate(source, inventory)
+        return selected.relative_path.replace("/", "\\"), selected
     normalized = requested.replace("/", "\\").strip("\\").casefold()
     if normalized in {"chatgpt.exe", "codex.exe"}:
         normalized = f"app\\{normalized}"
@@ -967,7 +1028,6 @@ def _resolve_launch_executable(
         raise RuntimeError(
             "--launch-executable must identify a root-level app\\ChatGPT.exe or app\\Codex.exe"
         )
-    inventory = inventory_desktop_executables(source)
     for candidate in inventory:
         if candidate.relative_path.replace("/", "\\").casefold() == normalized:
             if not candidate.present:
@@ -995,8 +1055,11 @@ def build_windows_desktop(
     ):
         raise RuntimeError("destination must be separate from the official source")
     selected_launch_executable, _selected_candidate = _resolve_launch_executable(source, launch_executable)
-    patch_user_data = True if bootstrap_user_data_patch is None else bootstrap_user_data_patch
-    disable_updater = True if bootstrap_disable_updater is None else bootstrap_disable_updater
+    # Phase 2A.3 proved the environment and argument isolation contract and
+    # CODEX_SPARKLE_ENABLED=false without a bootstrap mutation. Keep the full
+    # shell minimal unless a caller explicitly requests a reviewed legacy patch.
+    patch_user_data = False if bootstrap_user_data_patch is None else bootstrap_user_data_patch
+    disable_updater = False if bootstrap_disable_updater is None else bootstrap_disable_updater
     records = load_compatibility_records(COMPATIBILITY_DOCUMENT)
     source_hash = sha256_file(source.app_asar)
     matching = find_matching_record(
@@ -1025,6 +1088,12 @@ def build_windows_desktop(
         staged.mkdir(parents=True, exist_ok=True)
         mirror_report = mirror_desktop_source(source, staged_app)
         verify_desktop_mirror(source.app_dir, staged_app)
+        payload_acl = prepare_windows_electron_payload_acl(staged_app, router_root=staged)
+        if os.name == "nt" and payload_acl.get("status") != "PASS":
+            raise RuntimeError(
+                "PHASE 2A.4 ACL BLOCKED: "
+                f"{payload_acl.get('reason', 'staged app payload ACL was not verified')}"
+            )
         fuse_scan = scan_fuse_carriers(staged_app)
         staged_source_executable = staged_app / source.executable.name
         carrier_paths = _carrier_paths_from_scan(staged_app, fuse_scan)
@@ -1099,7 +1168,7 @@ def build_windows_desktop(
         launch_config = {
             "schema_version": 1,
             "desktop_launch_executable": selected_launch_executable,
-            "selection_basis": "Phase 2A.3 validated direct-launch matrix/build metadata",
+            "selection_basis": "Phase 2A.4 compatibility-specific authoritative shell selection",
             "source_relative_candidates": [
                 "app\\ChatGPT.exe",
                 "app\\Codex.exe",
@@ -1116,6 +1185,7 @@ def build_windows_desktop(
             integrity_result,
             fuse_scan,
             mirror_report,
+            payload_acl,
         )
         (staged / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
         # The launcher owns the environment contract; this static check keeps the
@@ -1151,12 +1221,13 @@ def main() -> int:
                 args.mirror_dry_run,
                 args.smoke_unmodified_mirror,
                 args.smoke_launch_matrix,
+                args.smoke_sandbox_acl,
             )
         )
         if selected_modes > 1:
             raise RuntimeError(
                 "choose only one of --diagnose-source, --audit-only, --mirror-dry-run, "
-                "or --smoke-unmodified-mirror/--smoke-launch-matrix"
+                "or --smoke-unmodified-mirror/--smoke-launch-matrix/--smoke-sandbox-acl"
             )
         if args.diagnose_source:
             return _run_source_diagnostics(args)
@@ -1168,6 +1239,8 @@ def main() -> int:
             return _run_unmodified_mirror_smoke(args)
         if args.smoke_launch_matrix:
             return _run_smoke_launch_matrix(args)
+        if args.smoke_sandbox_acl:
+            return _run_sandbox_acl_smoke(args)
         source = locate_desktop_source(args.source)
         real, candidates = discover_real_codex(args.real_codex)
         print(f"Windows source: {source.source_root}")

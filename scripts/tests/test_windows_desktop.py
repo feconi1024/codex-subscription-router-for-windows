@@ -62,14 +62,20 @@ from scripts.windows.integrity import (
     scan_fuse_carriers,
 )
 from scripts.windows.smoke import (
+    APP_CONTAINER_ACCESS_FIX_CONFIRMED,
+    BLOCKED_CHROMIUM_SANDBOX,
     BLOCKED_NATIVE_MODULE,
     BLOCKED_OTHER_PACKAGE_IDENTITY,
     BLOCKED_RESOURCE,
     BLOCKED_SINGLE_INSTANCE_LOCK,
     BLOCKED_UPDATER_IDENTITY,
     CRASHED,
+    LOCAL_APP_ACL_FIX_CONFIRMED,
+    PASS,
     _probe_candidate,
     classify_probe_output,
+    final_layout_smoke_root,
+    _phase2a4_verdict,
 )
 from scripts.windows.acl import (
     ALL_APPLICATION_PACKAGES_SID,
@@ -467,6 +473,65 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         self.assertEqual(native["status"], BLOCKED_NATIVE_MODULE)
         resource = classify_probe_output("failed to open resources\\app.asar", still_running=False, return_code=1)
         self.assertEqual(resource["status"], BLOCKED_RESOURCE)
+
+    def test_launch_classification_separates_gpu_sandbox_failure_and_records_child_evidence(self) -> None:
+        log = "\n".join(
+            [
+                "GPU process launch attempt 1",
+                "gpu_process_host: GPU process exited unexpectedly: exit_code=-2147483645",
+                "GPU process launch attempt 2",
+                "GPU process exited unexpectedly: exit_code=0x80000003",
+                "renderer process exited unexpectedly",
+                "GPU process isn't usable. Goodbye.",
+            ]
+        )
+        result = classify_probe_output(log, still_running=False, return_code=2147483651)
+        self.assertEqual(result["status"], BLOCKED_CHROMIUM_SANDBOX)
+        evidence = result["chromium_sandbox"]
+        self.assertEqual(evidence["gpu_child_launch_attempt_count"], 4)
+        self.assertEqual(evidence["gpu_child_exit_codes"], ["-2147483645", "0x80000003"])
+        self.assertTrue(evidence["renderer_child_process_failure_observed"])
+        self.assertEqual(evidence["fatal_line"], "GPU process isn't usable. Goodbye.")
+        self.assertIn("GPU process isn't usable. Goodbye.", result["relevant_log_lines"]["chromium_sandbox"]["gpu"])
+
+    def test_normal_crash_remains_crashed_without_gpu_evidence(self) -> None:
+        result = classify_probe_output("fatal: unrelated startup failure", still_running=False, return_code=1)
+        self.assertEqual(result["status"], CRASHED)
+
+    def test_phase2a4_final_layout_root_uses_localappdata_and_is_disposable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("scripts.windows.smoke.os.name", "nt"), patch(
+                "scripts.windows.smoke.os.environ",
+                {"LOCALAPPDATA": temporary},
+            ):
+                with final_layout_smoke_root() as root:
+                    self.assertTrue(root.is_dir())
+                    self.assertTrue(root.parent.parent.name == "Codex Subscription Router")
+                    self.assertTrue((root / "app").is_dir())
+                    self.assertTrue((root / "User Data").is_dir())
+                    self.assertTrue((root / "codex-home").is_dir())
+                    kept_root = root
+            self.assertFalse(kept_root.exists())
+
+    def test_phase2a4_verdict_ignores_codex_diagnostic_failure(self) -> None:
+        probe_a = {"status": BLOCKED_CHROMIUM_SANDBOX}
+        probe_b = {"status": PASS}
+        probe_c = {"status": PASS}
+        self.assertEqual(_phase2a4_verdict(probe_a, probe_b, probe_c, None), LOCAL_APP_ACL_FIX_CONFIRMED)
+        self.assertEqual(
+            _phase2a4_verdict(probe_a, {"status": "CRASHED"}, probe_c, None),
+            APP_CONTAINER_ACCESS_FIX_CONFIRMED,
+        )
+
+    def test_sandbox_bypass_flags_are_not_in_production_launcher_or_builder(self) -> None:
+        builder = inspect.getsource(build_windows_desktop)
+        self.assertNotIn("--disable-gpu-sandbox", builder)
+        self.assertNotIn("--no-sandbox", builder)
+        launcher = (Path(__file__).resolve().parents[2] / "cmd" / "codex-router-launcher" / "main.go").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn('"--disable-gpu-sandbox"', launcher)
+        self.assertNotIn('"--no-sandbox"', launcher)
 
     def test_minimal_bootstrap_patch_has_no_renderer_or_ui_bridge_change(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

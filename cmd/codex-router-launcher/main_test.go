@@ -151,6 +151,18 @@ func TestBuildEnvironmentIncludesWindowsIsolationContract(t *testing.T) {
 	}
 }
 
+func TestBuildEnvironmentIncludesRouterOwnedMuxHome(t *testing.T) {
+	environment := buildEnvironment(
+		[]string{"CODEX_MUX_HOME=official"},
+		map[string]string{"CODEX_MUX_HOME": `C:\\router\\runtime\\.codex-mux`},
+	)
+	joined := strings.Join(environment, "\n")
+	if strings.Contains(joined, "CODEX_MUX_HOME=official") ||
+		!strings.Contains(joined, `CODEX_MUX_HOME=C:\\router\\runtime\\.codex-mux`) {
+		t.Fatalf("mux state root was not isolated: %q", environment)
+	}
+}
+
 func TestIsolatedArgumentsAlwaysUseRouterProfile(t *testing.T) {
 	arguments := isolatedArguments([]string{"--foo", "bar", "--user-data-dir=official", "--user-data-dir", "other"}, `C:\router\User Data`)
 	if len(arguments) != 3 || arguments[0] != "--foo" || arguments[1] != "bar" || arguments[2] != `--user-data-dir=C:\router\User Data` {

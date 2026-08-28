@@ -16,6 +16,7 @@ const (
 	muxExecutableName     = "codex-mux.exe"
 	realCodexName         = "codex.real.exe"
 	userDataDirectoryName = "User Data"
+	muxStateDirectoryName = ".codex-mux"
 	launchMetadataName    = "launch.json"
 )
 
@@ -55,6 +56,7 @@ func run() int {
 	environment := buildEnvironment(os.Environ(), map[string]string{
 		"CODEX_CLI_PATH":              paths.mux,
 		"CODEX_MUX_REAL_CODEX":        paths.real,
+		"CODEX_MUX_HOME":              filepath.Join(paths.root, "runtime", muxStateDirectoryName),
 		"CODEX_MUX_DESKTOP_USER_DATA": paths.userData,
 		"CODEX_ELECTRON_USER_DATA_PATH": paths.userData,
 		"CODEX_SPARKLE_ENABLED":       "false",

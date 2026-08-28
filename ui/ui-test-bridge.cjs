@@ -367,8 +367,9 @@ function start() {
       recordDiagnostic("render-process-gone", details);
     });
   });
+  const muxHome = process.env.CODEX_MUX_HOME ?? path.join(os.homedir(), ".codex-mux");
   const token = fs
-    .readFileSync(path.join(os.homedir(), ".codex-mux", "control-token"), "utf8")
+    .readFileSync(path.join(muxHome, "control-token"), "utf8")
     .trim();
   const server = http.createServer(async (request, response) => {
     if (request.headers["x-codex-mux-token"] !== token) {

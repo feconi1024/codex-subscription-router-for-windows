@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 try:
     from .discovery import (
@@ -22,8 +24,11 @@ try:
         is_native_windows_executable,
         is_windowsapps_path,
         path_is_within,
+        select_authoritative_desktop_candidate,
+        sha256_file,
         terminate_attributed_processes,
     )
+    from .acl import audit_acl_scope, prepare_windows_electron_payload_acl
     from .mirror import mirror_desktop_source, verify_desktop_mirror
 except ImportError:
     from discovery import (
@@ -37,8 +42,11 @@ except ImportError:
         is_native_windows_executable,
         is_windowsapps_path,
         path_is_within,
+        select_authoritative_desktop_candidate,
+        sha256_file,
         terminate_attributed_processes,
     )
+    from acl import audit_acl_scope, prepare_windows_electron_payload_acl
     from mirror import mirror_desktop_source, verify_desktop_mirror
 
 
@@ -47,9 +55,16 @@ BLOCKED_OTHER_PACKAGE_IDENTITY = "BLOCKED_OTHER_PACKAGE_IDENTITY"
 BLOCKED_SINGLE_INSTANCE_LOCK = "BLOCKED_SINGLE_INSTANCE_LOCK"
 BLOCKED_RESOURCE = "BLOCKED_RESOURCE"
 BLOCKED_NATIVE_MODULE = "BLOCKED_NATIVE_MODULE"
+BLOCKED_CHROMIUM_SANDBOX = "BLOCKED_CHROMIUM_SANDBOX"
 CRASHED = "CRASHED"
 PASS = "PASS"
 NOT_PRESENT = "NOT PRESENT"
+
+GPU_SANDBOX_CONFIRMED = "GPU_SANDBOX_CONFIRMED"
+LOCAL_APP_ACL_FIX_CONFIRMED = "LOCAL_APP_ACL_FIX_CONFIRMED"
+WINDOWS_26200_GPU_SANDBOX_REGRESSION = "WINDOWS_26200_GPU_SANDBOX_REGRESSION"
+APP_CONTAINER_ACCESS_FIX_CONFIRMED = "APP_CONTAINER_ACCESS_FIX_CONFIRMED"
+BROADER_CHROMIUM_SANDBOX_BLOCKED = "BROADER_CHROMIUM_SANDBOX_BLOCKED"
 
 DIRECT_LAUNCH_PASS = "DIRECT_LAUNCH_PASS"
 DIRECT_LAUNCH_IDENTITY_BLOCKED = "DIRECT_LAUNCH_IDENTITY_BLOCKED"
@@ -109,6 +124,26 @@ _CRASH_PATTERNS = (
     r"breakpoint",
     r"0x80000003",
 )
+_GPU_SANDBOX_PATTERNS = (
+    r"gpu process exited unexpectedly",
+    r"gpu process isn't usable",
+    r"gpu_process_host",
+    r"gpu process.{0,100}(?:0x80000003|-2147483645)",
+    r"(?:0x80000003|-2147483645).{0,100}gpu",
+)
+_GPU_ATTEMPT_PATTERNS = (
+    r"launch(?:ing|ed)? .{0,60}gpu process",
+    r"gpu process.{0,60}(?:launch|start|create|exit)",
+    r"gpu_process_host",
+)
+_GPU_EXIT_CODE_PATTERN = re.compile(
+    r"(?:exit(?:_code| code)?|status|code)\s*[:=]\s*(0x[0-9a-f]+|-?\d+)",
+    re.IGNORECASE,
+)
+_RENDERER_FAILURE_PATTERNS = (
+    r"renderer.{0,100}(?:exited|crash|failed|failure|sandbox|not usable|unexpected)",
+    r"(?:exited|crash|failed|failure|sandbox|not usable|unexpected).{0,100}renderer",
+)
 _PACKAGED_PATTERNS = (
     r"packaged",
     r"ispackaged",
@@ -142,6 +177,62 @@ def _matching_lines(text: str, patterns: tuple[str, ...]) -> list[str]:
     return rows[-50:]
 
 
+def _all_matching_lines(text: str, patterns: tuple[str, ...]) -> list[str]:
+    return [
+        line[:1_000]
+        for line in text.splitlines()
+        if any(re.search(pattern, line, re.IGNORECASE) for pattern in patterns)
+    ]
+
+
+def _chromium_sandbox_evidence(log_text: str) -> dict[str, object]:
+    """Extract GPU/renderer child evidence without relying on localized text."""
+    gpu_lines = _all_matching_lines(log_text, _GPU_SANDBOX_PATTERNS)
+    attempt_lines = _all_matching_lines(log_text, _GPU_ATTEMPT_PATTERNS)
+    renderer_failure_lines = _all_matching_lines(log_text, _RENDERER_FAILURE_PATTERNS)
+    exit_codes: list[str] = []
+    for line in log_text.splitlines():
+        lowered = line.casefold()
+        if "gpu" not in lowered and "gpu_process_host" not in lowered:
+            continue
+        for match in _GPU_EXIT_CODE_PATTERN.finditer(line):
+            value = match.group(1)
+            if value not in exit_codes:
+                exit_codes.append(value)
+        if ("0x80000003" in lowered or "-2147483645" in lowered) and not exit_codes:
+            value = "0x80000003" if "0x80000003" in lowered else "-2147483645"
+            exit_codes.append(value)
+    if gpu_lines and not exit_codes:
+        for value in ("0x80000003", "-2147483645"):
+            if value.casefold() in log_text.casefold():
+                exit_codes.append(value)
+    attempt_count = len(attempt_lines)
+    if gpu_lines and attempt_count == 0:
+        # The fatal line itself proves that Chromium attempted at least one
+        # GPU child, even if this Electron build omitted launch diagnostics.
+        attempt_count = 1
+    fatal_line = next(
+        (
+            line
+            for line in reversed(gpu_lines)
+            if re.search(r"(?:fatal|isn't usable|exited unexpectedly|0x80000003|-2147483645)", line, re.IGNORECASE)
+        ),
+        gpu_lines[-1] if gpu_lines else None,
+    )
+    return {
+        "evidence": bool(gpu_lines),
+        "gpu_child_launch_attempt_count": attempt_count,
+        "gpu_child_exit_codes": exit_codes,
+        "renderer_child_process_failure_observed": bool(renderer_failure_lines),
+        "fatal_line": fatal_line,
+        "raw_relevant_lines": {
+            "gpu": gpu_lines[-50:],
+            "gpu_attempts": attempt_lines[-50:],
+            "renderer_failure": renderer_failure_lines[-50:],
+        },
+    }
+
+
 def classify_probe_output(
     log_text: str,
     *,
@@ -156,11 +247,15 @@ def classify_probe_output(
     native_module_lines = _matching_lines(log_text, _MISSING_DLL_PATTERNS)
     resource_lines = _matching_lines(log_text, _RESOURCE_PATTERNS)
     crash_lines = _matching_lines(log_text, _CRASH_PATTERNS)
+    chromium_sandbox = _chromium_sandbox_evidence(log_text)
 
     # A stable process or a visible window without fatal evidence is the only
     # positive result. Identity errors are considered before generic crashes so
     # the report remains actionable.
-    if still_running or (
+    if chromium_sandbox["evidence"]:
+        status = BLOCKED_CHROMIUM_SANDBOX
+        reason = "Chromium GPU/renderer child evidence indicates a Windows sandbox startup failure"
+    elif still_running or (
         visible_window_count > 0
         and not crash_lines
         and not updater_lines
@@ -197,7 +292,9 @@ def classify_probe_output(
             "native_module": native_module_lines,
             "resource": resource_lines,
             "crash": crash_lines,
+            "chromium_sandbox": chromium_sandbox["raw_relevant_lines"],
         },
+        "chromium_sandbox": chromium_sandbox,
     }
 
 
@@ -273,6 +370,37 @@ def _mirror_candidate_path(mirror_root: Path, candidate: DesktopExecutableCandid
     return mirror_root.joinpath(*parts)
 
 
+@contextmanager
+def _probe_profile_root(
+    workspace_root: Path,
+    profile_root: Path | None,
+) -> Iterator[Path]:
+    """Use disposable profiles, optionally in a final-layout-equivalent root."""
+    if profile_root is None:
+        with tempfile.TemporaryDirectory(prefix="codex-router-probe-") as temporary:
+            yield Path(temporary)
+        return
+
+    root = profile_root.expanduser().resolve(strict=False)
+    workspace = workspace_root.expanduser().resolve(strict=False)
+    if not path_is_within(root, workspace):
+        raise RuntimeError("probe profile root must remain inside the Router smoke root")
+    root.mkdir(parents=True, exist_ok=True)
+    for name in ("User Data", "codex-home"):
+        path = root / name
+        if path.is_symlink():
+            raise RuntimeError(f"refusing to use a symlinked isolated profile path: {path}")
+        if path.exists():
+            if not path_is_within(path, root):
+                raise RuntimeError(f"isolated profile path escaped the Router smoke root: {path}")
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        path.mkdir(parents=True, exist_ok=True)
+    yield root
+
+
 def _probe_candidate(
     mirror_root: Path,
     workspace_root: Path,
@@ -281,6 +409,8 @@ def _probe_candidate(
     *,
     timeout_seconds: float,
     baseline: tuple[RunningProcessCandidate, ...] | None = None,
+    extra_arguments: Iterable[str] = (),
+    profile_root: Path | None = None,
 ) -> dict[str, object]:
     """Launch one candidate with an isolated profile and attributed cleanup."""
     if os.name != "nt":
@@ -313,8 +443,8 @@ def _probe_candidate(
             "manual_operation_required": False,
         }
 
-    with tempfile.TemporaryDirectory(prefix="codex-router-probe-") as temporary:
-        probe_root = Path(temporary)
+    extra_arguments = tuple(str(argument) for argument in extra_arguments)
+    with _probe_profile_root(workspace_root, profile_root) as probe_root:
         user_data = probe_root / "User Data"
         codex_home = probe_root / "codex-home"
         log_path = probe_root / "startup.log"
@@ -332,7 +462,7 @@ def _probe_candidate(
                 "ELECTRON_ENABLE_STACK_DUMPING": "1",
             }
         )
-        command = [str(executable), f"--user-data-dir={user_data}"]
+        command = [str(executable), *extra_arguments, f"--user-data-dir={user_data}"]
         baseline_rows = tuple(baseline) if baseline is not None else tuple(discover_process_snapshot_native())
         baseline_pids = {row.pid for row in baseline_rows}
         attributed: set[int] = set()
@@ -467,6 +597,7 @@ def _probe_candidate(
             "status": classification["status"],
             "reason": classification["reason"],
             "command": command,
+            "diagnostic_arguments": list(extra_arguments),
             "working_directory": str(mirror_root),
             "timeout_seconds": timeout_seconds,
             "elapsed_seconds": round(time.monotonic() - started, 3),
@@ -488,8 +619,10 @@ def _probe_candidate(
                     list(relevant.get("updater_identity", []))
                     + list(relevant.get("other_package_identity", []))
                 ),
+                "chromium_sandbox": relevant.get("chromium_sandbox", []),
             },
             "relevant_log_lines": relevant,
+            "chromium_sandbox": classification.get("chromium_sandbox", {}),
             "log_tail": log_text,
             "profile_isolation": isolation,
             "manual_operation_required": False,
@@ -615,3 +748,203 @@ def run_unmodified_mirror_smoke(
             from discovery import inventory_desktop_executables
         candidates = inventory_desktop_executables(source)
     return run_smoke_launch_matrix(source, real, candidates, timeout_seconds=timeout_seconds)
+
+
+@contextmanager
+def final_layout_smoke_root() -> Iterator[Path]:
+    """Create and remove a Router-owned development root under LOCALAPPDATA."""
+    if os.name != "nt":
+        with tempfile.TemporaryDirectory(prefix="codex-router-phase2a4-") as temporary:
+            root = Path(temporary)
+            (root / "app").mkdir()
+            (root / "User Data").mkdir()
+            (root / "codex-home").mkdir()
+            yield root
+        return
+
+    local_appdata_value = os.environ.get("LOCALAPPDATA")
+    if local_appdata_value is None:
+        local_appdata_value = str(Path.home() / "AppData" / "Local")
+    local_appdata = Path(local_appdata_value).expanduser().resolve(strict=False)
+    router_smoke_parent = local_appdata / "Codex Subscription Router" / "_smoke"
+    router_smoke_parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="phase2a4-", dir=router_smoke_parent) as temporary:
+        root = Path(temporary).resolve(strict=True)
+        (root / "app").mkdir()
+        (root / "User Data").mkdir()
+        (root / "codex-home").mkdir()
+        yield root
+
+
+def _acl_paths(source: DesktopSource, mirror_root: Path) -> dict[str, Path]:
+    return {
+        "official_app_directory": source.app_dir,
+        "official_chatgpt_executable": source.app_dir / "ChatGPT.exe",
+        "local_smoke_app_directory": mirror_root,
+        "local_smoke_chatgpt_executable": mirror_root / "ChatGPT.exe",
+        "local_smoke_chrome_dll": mirror_root / "chrome.dll",
+    }
+
+
+def _has_chromium_sandbox_evidence(result: dict[str, object] | None) -> bool:
+    if not isinstance(result, dict):
+        return False
+    evidence = result.get("chromium_sandbox")
+    return isinstance(evidence, dict) and evidence.get("evidence") is True
+
+
+def _phase2a4_verdict(
+    probe_a: dict[str, object],
+    probe_b: dict[str, object],
+    probe_c: dict[str, object],
+    no_sandbox: dict[str, object] | None,
+) -> str:
+    a_status = probe_a.get("status")
+    b_status = probe_b.get("status")
+    c_status = probe_c.get("status")
+    if a_status == BLOCKED_CHROMIUM_SANDBOX and b_status == PASS and c_status == PASS:
+        return LOCAL_APP_ACL_FIX_CONFIRMED
+    if a_status == BLOCKED_CHROMIUM_SANDBOX and b_status == PASS and c_status != PASS:
+        return WINDOWS_26200_GPU_SANDBOX_REGRESSION
+    if a_status == BLOCKED_CHROMIUM_SANDBOX and b_status != PASS and c_status == PASS:
+        return APP_CONTAINER_ACCESS_FIX_CONFIRMED
+    if no_sandbox is not None and no_sandbox.get("status") == PASS:
+        return BROADER_CHROMIUM_SANDBOX_BLOCKED
+    return "PHASE 2A.4 FAIL"
+
+
+def run_phase2a4_sandbox_validation(
+    source: DesktopSource,
+    real: RealCodexCandidate,
+    candidates: Iterable[DesktopExecutableCandidate],
+    *,
+    timeout_seconds: float = 20.0,
+) -> dict[str, object]:
+    """Run ChatGPT A/B/C sandbox probes in a final-layout-equivalent root."""
+    candidates = tuple(candidates)
+    if os.name != "nt":
+        return {
+            "status": "PHASE 2A.4 FAIL",
+            "reason": "native Windows sandbox/ACL validation is Windows-only",
+            "manual_operation_required": False,
+        }
+    authoritative = select_authoritative_desktop_candidate(source, candidates)
+    authoritative_relative = authoritative.relative_path.replace("/", "\\")
+    official_fingerprint = {
+        "chatgpt_sha256": str(sha256_file(source.app_dir / "ChatGPT.exe"))
+        if (source.app_dir / "ChatGPT.exe").is_file()
+        else None,
+        "app_asar_sha256": str(sha256_file(source.app_asar)) if source.app_asar.is_file() else None,
+    }
+
+    with final_layout_smoke_root() as root:
+        mirror_root = root / "app"
+        mirror_report = mirror_desktop_source(source, mirror_root)
+        verify_desktop_mirror(source.app_dir, mirror_root)
+        acl_before = audit_acl_scope(_acl_paths(source, mirror_root))
+        probe_a = _probe_candidate(
+            mirror_root,
+            root,
+            real,
+            authoritative,
+            timeout_seconds=timeout_seconds,
+            profile_root=root,
+        )
+
+        diagnostic_shells: list[dict[str, object]] = []
+        for candidate in candidates:
+            if candidate.relative_path.replace("/", "\\").casefold() == authoritative_relative.casefold():
+                continue
+            if not candidate.present:
+                continue
+            diagnostic_shells.append(
+                _probe_candidate(
+                    mirror_root,
+                    root,
+                    real,
+                    candidate,
+                    timeout_seconds=timeout_seconds,
+                    profile_root=root,
+                )
+            )
+
+        probe_b = _probe_candidate(
+            mirror_root,
+            root,
+            real,
+            authoritative,
+            timeout_seconds=timeout_seconds,
+            extra_arguments=("--disable-gpu-sandbox",),
+            profile_root=root,
+        )
+        acl_remediation = prepare_windows_electron_payload_acl(
+            mirror_root,
+            router_root=root,
+        )
+        acl_after = audit_acl_scope(_acl_paths(source, mirror_root))
+        probe_c = _probe_candidate(
+            mirror_root,
+            root,
+            real,
+            authoritative,
+            timeout_seconds=timeout_seconds,
+            profile_root=root,
+        )
+        no_sandbox: dict[str, object] | None = None
+        if (
+            probe_b.get("status") != PASS
+            and probe_c.get("status") != PASS
+            and _has_chromium_sandbox_evidence(probe_b)
+        ):
+            no_sandbox = _probe_candidate(
+                mirror_root,
+                root,
+                real,
+                authoritative,
+                timeout_seconds=timeout_seconds,
+                extra_arguments=("--no-sandbox",),
+                profile_root=root,
+            )
+
+        official_after = {
+            "chatgpt_sha256": str(sha256_file(source.app_dir / "ChatGPT.exe"))
+            if (source.app_dir / "ChatGPT.exe").is_file()
+            else None,
+            "app_asar_sha256": str(sha256_file(source.app_asar)) if source.app_asar.is_file() else None,
+        }
+        verdict = _phase2a4_verdict(probe_a, probe_b, probe_c, no_sandbox)
+        result = {
+            "status": verdict,
+            "reason": "Phase 2A.4 ChatGPT normal/diagnostic/ACL probe sequence completed",
+            "authoritative_shell": authoritative.to_dict(),
+            "diagnostic_shells": diagnostic_shells,
+            "final_layout": {
+                "root": str(root),
+                "app": str(mirror_root),
+                "user_data": str(root / "User Data"),
+                "codex_home": str(root / "codex-home"),
+                "root_under_localappdata": str(root).casefold().startswith(
+                    str(Path(os.environ.get("LOCALAPPDATA", ""))).casefold()
+                ),
+            },
+            "mirror": mirror_report.to_dict(),
+            "acl_before": acl_before,
+            "probe_a_normal": probe_a,
+            "probe_b_disable_gpu_sandbox": probe_b,
+            "acl_remediation": acl_remediation,
+            "acl_after": acl_after,
+            "probe_c_acl_normal_sandbox": probe_c,
+            "probe_d_no_sandbox": no_sandbox,
+            "official_source_fingerprint_before": official_fingerprint,
+            "official_source_fingerprint_after": official_after,
+            "official_package_unchanged": official_fingerprint == official_after,
+            "production_acl_strategy": (
+                "prepare_windows_electron_payload_acl on <Router root>\\app only"
+                if acl_remediation.get("status") == PASS
+                else "not proven"
+            ),
+            "manual_operation_required": bool(acl_remediation.get("manual_operation_required")),
+        }
+        if verdict == LOCAL_APP_ACL_FIX_CONFIRMED:
+            result["gpu_sandbox_diagnosis"] = GPU_SANDBOX_CONFIRMED
+        return result
