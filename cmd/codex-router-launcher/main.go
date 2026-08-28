@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -15,7 +16,12 @@ const (
 	muxExecutableName     = "codex-mux.exe"
 	realCodexName         = "codex.real.exe"
 	userDataDirectoryName = "User Data"
+	launchMetadataName    = "launch.json"
 )
+
+type launchMetadata struct {
+	DesktopLaunchExecutable string `json:"desktop_launch_executable"`
+}
 
 type launchPaths struct {
 	root     string
@@ -47,9 +53,11 @@ func run() int {
 	}
 
 	environment := buildEnvironment(os.Environ(), map[string]string{
-		"CODEX_CLI_PATH":             paths.mux,
-		"CODEX_MUX_REAL_CODEX":       paths.real,
+		"CODEX_CLI_PATH":              paths.mux,
+		"CODEX_MUX_REAL_CODEX":        paths.real,
 		"CODEX_MUX_DESKTOP_USER_DATA": paths.userData,
+		"CODEX_ELECTRON_USER_DATA_PATH": paths.userData,
+		"CODEX_SPARKLE_ENABLED":       "false",
 	})
 	arguments := isolatedArguments(os.Args[1:], paths.userData)
 	command := exec.Command(paths.chatGPT, arguments...)
@@ -63,7 +71,7 @@ func run() int {
 		if errors.As(err, &exitError) {
 			return exitError.ExitCode()
 		}
-		fmt.Fprintf(os.Stderr, "Codex Subscription Router: launch ChatGPT.exe: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Codex Subscription Router: launch selected Desktop shell: %v\n", err)
 		return 1
 	}
 	return 0
@@ -76,9 +84,9 @@ func resolveLaunchPaths(launcher string) (launchPaths, error) {
 	}
 	root := filepath.Dir(absoluteLauncher)
 	appDir := filepath.Join(root, "app")
-	chatGPT := filepath.Join(appDir, chatGPTExecutableName)
-	if !regularFile(chatGPT) {
-		chatGPT = filepath.Join(appDir, legacyExecutableName)
+	chatGPT, err := resolveDesktopExecutable(root, appDir)
+	if err != nil {
+		return launchPaths{}, err
 	}
 	paths := launchPaths{
 		root:     root,
@@ -102,6 +110,38 @@ func resolveLaunchPaths(launcher string) (launchPaths, error) {
 		return launchPaths{}, fmt.Errorf("installation is incomplete; missing %s", strings.Join(missing, ", "))
 	}
 	return paths, nil
+}
+
+func resolveDesktopExecutable(root, appDir string) (string, error) {
+	metadataPath := filepath.Join(root, launchMetadataName)
+	data, err := os.ReadFile(metadataPath)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", launchMetadataName, err)
+	}
+	var metadata launchMetadata
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return "", fmt.Errorf("parse %s: %w", launchMetadataName, err)
+	}
+	normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(metadata.DesktopLaunchExecutable), "/", "\\"))
+	var name string
+	switch normalized {
+	case "app\\chatgpt.exe":
+		name = chatGPTExecutableName
+	case "app\\codex.exe":
+		name = legacyExecutableName
+	default:
+		return "", fmt.Errorf(
+			"%s desktop_launch_executable must be app\\%s or app\\%s",
+			launchMetadataName,
+			chatGPTExecutableName,
+			legacyExecutableName,
+		)
+	}
+	selected := filepath.Join(appDir, name)
+	if !regularFile(selected) {
+		return "", fmt.Errorf("%s selects missing app\\%s", launchMetadataName, name)
+	}
+	return selected, nil
 }
 
 func regularFile(path string) bool {

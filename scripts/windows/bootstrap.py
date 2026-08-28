@@ -17,7 +17,10 @@ class BootstrapPatchReport:
     main: Path
     profile_anchor: str
     updater_disabled: bool
-    ui_test_bridge: Path
+    ui_test_bridge: Path | None
+    user_data_patched: bool = True
+    ui_test_bridge_injected: bool = True
+    strategy: str = "profile-and-updater"
 
 
 def _profile_matches(bootstrap: str) -> tuple[list[re.Match[str]], list[re.Match[str]]]:
@@ -104,7 +107,10 @@ def audit_bootstrap(extracted: Path, project_root: Path) -> dict[str, object]:
         "user_data_hook": {
             "status": user_data_status,
             "match_count": profile_match_count,
-            "environment_variable": "CODEX_MUX_DESKTOP_USER_DATA",
+            "environment_variables": [
+                "CODEX_ELECTRON_USER_DATA_PATH",
+                "CODEX_MUX_DESKTOP_USER_DATA",
+            ],
             "dry_run_replacement": profile_match is not None,
         },
         "updater_hook": {
@@ -142,63 +148,98 @@ def _single_bundle(root: Path, pattern: str, label: str) -> Path:
     return matches[0]
 
 
-def patch_bootstrap(extracted: Path, project_root: Path) -> BootstrapPatchReport:
-    """Use the launcher-provided profile and remove the copied updater startup."""
+def patch_bootstrap(
+    extracted: Path,
+    project_root: Path,
+    *,
+    patch_user_data: bool = True,
+    disable_updater: bool = True,
+    inject_ui_test_bridge: bool = True,
+) -> BootstrapPatchReport:
+    """Apply only the requested bootstrap changes to an extracted app.
+
+    The default preserves the Phase 2A.2 patch. Minimal-bootstrap validation
+    can request updater removal without touching renderer/UI hooks and can
+    leave the source userData hook intact when the environment/argument
+    contract already proved sufficient.
+    """
     bootstrap_path = _single_bundle(extracted, "bootstrap-*.js", "ChatGPT bootstrap")
     bootstrap = bootstrap_path.read_text(encoding="utf-8")
     exact_matches, generic_matches = _profile_matches(bootstrap)
     if len(exact_matches) > 1:
         raise RuntimeError("ambiguous Electron userData profile hooks")
-    if exact_matches:
-        profile_match = exact_matches[0]
-        profile_anchor = "current"
-    else:
-        candidates = [
-            match
-            for match in generic_matches
-            if "appData" in match.group("expression")
-            and "getPath" in match.group("expression")
-        ]
-        if len(candidates) != 1:
-            raise RuntimeError(
-                "could not prove the semantic Windows Electron userData hook"
-            )
-        profile_match = candidates[0]
-        profile_anchor = "generic-semantic"
+    profile_anchor = "unchanged"
+    user_data_patched = False
+    if patch_user_data:
+        if exact_matches:
+            profile_match = exact_matches[0]
+            profile_anchor = "current"
+        else:
+            candidates = [
+                match
+                for match in generic_matches
+                if "appData" in match.group("expression")
+                and "getPath" in match.group("expression")
+            ]
+            if len(candidates) != 1:
+                raise RuntimeError(
+                    "could not prove the semantic Windows Electron userData hook"
+                )
+            profile_match = candidates[0]
+            profile_anchor = "generic-semantic"
 
-    electron = profile_match.group("electron")
-    fallback = f'{electron}.app.getPath(`appData`)+`/{DESKTOP_PROFILE_NAME}`'
-    replacement = (
-        f"{electron}.app.setPath(`userData`,"
-        f"process.env.CODEX_MUX_DESKTOP_USER_DATA||{fallback})"
-    )
-    bootstrap = bootstrap[: profile_match.start()] + replacement + bootstrap[profile_match.end() :]
+        electron = profile_match.group("electron")
+        fallback = f'{electron}.app.getPath(`appData`)+`/{DESKTOP_PROFILE_NAME}`'
+        replacement = (
+            f"{electron}.app.setPath(`userData`,"
+            f"process.env.CODEX_ELECTRON_USER_DATA_PATH||"
+            f"process.env.CODEX_MUX_DESKTOP_USER_DATA||{fallback})"
+        )
+        bootstrap = bootstrap[: profile_match.start()] + replacement + bootstrap[profile_match.end() :]
+        user_data_patched = True
 
-    updater_pattern = re.compile(
-        r"await [A-Za-z_$][\w$]*\.initialize\(\);"
-        r"(?=try\{let\{runMainAppStartup:|let\{runMainAppStartup:)"
-    )
-    bootstrap, updater_replacements = updater_pattern.subn("", bootstrap, count=1)
-    if updater_replacements != 1:
-        raise RuntimeError("could not disable updates in the copied ChatGPT app")
-    bootstrap_path.write_text(bootstrap, encoding="utf-8")
+    updater_replacements = 0
+    if disable_updater:
+        updater_pattern = re.compile(
+            r"await [A-Za-z_$][\w$]*\.initialize\(\);"
+            r"(?=try\{let\{runMainAppStartup:|let\{runMainAppStartup:)"
+        )
+        bootstrap, updater_replacements = updater_pattern.subn("", bootstrap, count=1)
+        if updater_replacements != 1:
+            raise RuntimeError("could not disable updates in the copied ChatGPT app")
+    if user_data_patched or disable_updater:
+        bootstrap_path.write_text(bootstrap, encoding="utf-8")
 
     main_path = _single_bundle(extracted, "main-*.js", "ChatGPT main")
     main = main_path.read_text(encoding="utf-8")
-    # The Windows package's main bundle contains platform-conditional CUA
-    # loaders. They are pre-existing source code; the mirror excludes the
-    # optional CUA runtime and this patch does not inject or enable it.
     ui_test_bridge = extracted / ".vite" / "build" / "ui-test-bridge.cjs"
-    shutil.copy2(project_root / "ui" / "ui-test-bridge.cjs", ui_test_bridge)
-    main += (
-        "\n;if(process.env.CODEX_MUX_UI_TESTS===`1`)"
-        "require(require(`node:path`).join(__dirname,`ui-test-bridge.cjs`)).start();"
-    )
-    main_path.write_text(main, encoding="utf-8")
+    bridge_injected = False
+    if inject_ui_test_bridge:
+        # The Windows package's main bundle contains platform-conditional CUA
+        # loaders. They are pre-existing source code; the mirror excludes the
+        # optional CUA runtime and this patch does not inject or enable it.
+        shutil.copy2(project_root / "ui" / "ui-test-bridge.cjs", ui_test_bridge)
+        main += (
+            "\n;if(process.env.CODEX_MUX_UI_TESTS===`1`)"
+            "require(require(`node:path`).join(__dirname,`ui-test-bridge.cjs`)).start();"
+        )
+        main_path.write_text(main, encoding="utf-8")
+        bridge_injected = True
     return BootstrapPatchReport(
         bootstrap=bootstrap_path,
         main=main_path,
         profile_anchor=profile_anchor,
-        updater_disabled=True,
-        ui_test_bridge=ui_test_bridge,
+        updater_disabled=bool(disable_updater),
+        ui_test_bridge=ui_test_bridge if bridge_injected else None,
+        user_data_patched=user_data_patched,
+        ui_test_bridge_injected=bridge_injected,
+        strategy=(
+            "profile-and-updater"
+            if user_data_patched and disable_updater
+            else "profile-only"
+            if user_data_patched
+            else "updater-only"
+            if disable_updater
+            else "environment-only"
+        ),
     )

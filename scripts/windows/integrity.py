@@ -9,7 +9,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 try:
     from .fuses import SENTINEL, FuseSnapshot, read_fuses
@@ -28,6 +28,7 @@ RESOURCE_PRESENT_UPDATE_REQUIRED = "RESOURCE_PRESENT_UPDATE_REQUIRED"
 RESOURCE_ABSENT_NO_VALIDATION_METADATA = "RESOURCE_ABSENT_NO_VALIDATION_METADATA"
 FUSE_PRESENT_RESOURCE_PRESENT = "FUSE_PRESENT_RESOURCE_PRESENT"
 FUSE_PRESENT_RESOURCE_MISSING = "FUSE_PRESENT_RESOURCE_MISSING"
+FUSE_PRESENT_ASAR_VALIDATION_DISABLED = "FUSE_PRESENT_ASAR_VALIDATION_DISABLED"
 UNRESOLVED = "UNRESOLVED"
 
 _OPTIONAL_RUNTIME_NAMES = {
@@ -68,6 +69,9 @@ class WindowsAsarIntegrityPlan:
     resource_present: bool
     resource_entries: tuple[dict[str, object], ...]
     resource_error: str | None
+    carrier_paths: tuple[Path, ...] = ()
+    carrier_records: tuple[dict[str, object], ...] = ()
+    carrier_paths_known: bool = False
 
     def to_dict(self) -> dict[str, object]:
         fuse: dict[str, object] | None
@@ -89,6 +93,10 @@ class WindowsAsarIntegrityPlan:
             "resource_present": self.resource_present,
             "resource_entries": list(self.resource_entries),
             "resource_error": self.resource_error,
+            "carrier_paths_known": self.carrier_paths_known,
+            "carrier_paths": [str(path) for path in self.carrier_paths],
+            "carrier_relative_paths": [path.name for path in self.carrier_paths],
+            "carrier_records": list(self.carrier_records),
         }
 
 
@@ -191,80 +199,158 @@ def _resource_asar_digest(resources: dict[str, object]) -> str | None:
 def _read_fuse_state(executable: Path) -> tuple[FuseSnapshot | None, str | None, bool]:
     try:
         return read_fuses(executable), None, True
-    except RuntimeError as error:
+    except (OSError, RuntimeError) as error:
         message = str(error)
         if "fuse sentinel not found" in message:
             return None, None, False
         return None, message, True
 
 
-def resolve_windows_asar_integrity(executable: Path) -> WindowsAsarIntegrityPlan:
-    fuse, fuse_error, fuse_wire_present = _read_fuse_state(executable)
-    resource_entries: tuple[dict[str, object], ...] = ()
-    resource_error: str | None = None
-    resource_present = False
-    try:
-        resource_result = read_pe_integrity_resources(executable)
-        resource_entries = tuple(_matching_resource_entries(resource_result))
-        resource_present = bool(resource_entries)
-        if resource_present:
-            _resource_asar_digest(resource_result)
-    except (OSError, RuntimeError) as error:
-        resource_error = _safe_error(error)
+def _carrier_paths_from_argument(
+    executable: Path,
+    carrier_paths: Iterable[Path] | None,
+) -> tuple[tuple[Path, ...], bool]:
+    if carrier_paths is None:
+        return (executable,), False
+    return tuple(Path(path) for path in carrier_paths), True
 
-    if fuse_error or resource_error:
+
+def _carrier_record(
+    path: Path,
+    fuse: FuseSnapshot | None,
+    fuse_error: str | None,
+    fuse_wire_present: bool,
+    resource_entries: tuple[dict[str, object], ...],
+    resource_error: str | None,
+) -> dict[str, object]:
+    return {
+        "path": str(path),
+        "relative": path.name,
+        "sentinel_found": fuse_wire_present,
+        "fuse": (
+            {
+                "schema_version": fuse.schema_version,
+                "count": fuse.count,
+                "fuses": list(fuse.fuses),
+                "offset": fuse.offset,
+                "asar_integrity_validation": (
+                    fuse.fuses[4] if fuse.count > 4 else "NOT PRESENT"
+                ),
+            }
+            if fuse is not None
+            else None
+        ),
+        "fuse_error": fuse_error,
+        "integrity_resource_present": bool(resource_entries),
+        "integrity_resources": list(resource_entries),
+        "integrity_error": resource_error,
+    }
+
+
+def resolve_windows_asar_integrity(
+    executable: Path,
+    *,
+    carrier_paths: Iterable[Path] | None = None,
+) -> WindowsAsarIntegrityPlan:
+    """Resolve validation against the observed Electron fuse carrier set.
+
+    ``carrier_paths=None`` retains the historical single-file API for callers
+    that only have one executable. Passing an explicit iterable, including an
+    empty iterable, makes the carrier inventory authoritative and prevents a
+    manifest executable from silently becoming the integrity carrier.
+    """
+    paths, paths_known = _carrier_paths_from_argument(executable, carrier_paths)
+    carrier_records: list[dict[str, object]] = []
+    fuses: list[FuseSnapshot] = []
+    fuse_errors: list[str] = []
+    resource_entries: list[dict[str, object]] = []
+    resource_errors: list[str] = []
+    resource_present = False
+    for path in paths:
+        fuse, fuse_error, fuse_wire_present = _read_fuse_state(path)
+        if fuse is not None:
+            fuses.append(fuse)
+        if fuse_error:
+            fuse_errors.append(f"{path}: {fuse_error}")
+        entries: tuple[dict[str, object], ...] = ()
+        resource_error: str | None = None
+        try:
+            resource_result = read_pe_integrity_resources(path)
+            entries = tuple(_matching_resource_entries(resource_result))
+            if entries:
+                _resource_asar_digest(resource_result)
+                resource_present = True
+                resource_entries.extend(entries)
+        except (OSError, RuntimeError) as error:
+            resource_error = _safe_error(error)
+            resource_errors.append(f"{path}: {resource_error}")
+        carrier_records.append(
+            _carrier_record(
+                path,
+                fuse,
+                fuse_error,
+                fuse_wire_present,
+                entries,
+                resource_error,
+            )
+        )
+
+    fuse = fuses[0] if fuses else None
+    fuse_wire_present = any(record["sentinel_found"] for record in carrier_records)
+    asar_validation_enabled = any(fuse.count > 4 and fuse.fuses[4] == "on" for fuse in fuses)
+    fuse_error = "; ".join(fuse_errors) or None
+    resource_error = "; ".join(resource_errors) or None
+    all_errors = fuse_error or resource_error
+    common = {
+        "fuse": fuse,
+        "fuse_error": fuse_error,
+        "resource_present": resource_present,
+        "resource_entries": tuple(resource_entries),
+        "resource_error": resource_error,
+        "carrier_paths": paths,
+        "carrier_records": tuple(carrier_records),
+        "carrier_paths_known": paths_known,
+    }
+    if all_errors:
         return WindowsAsarIntegrityPlan(
             UNRESOLVED,
             False,
             "fuse or PE resource metadata could not be parsed",
-            fuse,
-            fuse_error,
-            resource_present,
-            resource_entries,
-            resource_error,
+            **common,
         )
-    if fuse_wire_present and resource_present:
+    if asar_validation_enabled and resource_present:
         return WindowsAsarIntegrityPlan(
             FUSE_PRESENT_RESOURCE_PRESENT,
             True,
-            "Electron fuse metadata and PE ASAR-integrity resource are both present",
-            fuse,
-            None,
-            True,
-            resource_entries,
-            None,
+            "the actual Electron fuse carrier enables ASAR validation and carries PE integrity metadata",
+            **common,
         )
-    if fuse_wire_present and not resource_present:
+    if asar_validation_enabled and not resource_present:
         return WindowsAsarIntegrityPlan(
             FUSE_PRESENT_RESOURCE_MISSING,
             False,
-            "Electron ASAR-integrity fuse is present but INTEGRITY/ELECTRONASAR metadata is missing",
-            fuse,
-            None,
-            False,
-            resource_entries,
-            None,
+            "the actual Electron fuse carrier enables ASAR validation but its PE integrity metadata is missing",
+            **common,
+        )
+    if fuse_wire_present and not asar_validation_enabled:
+        return WindowsAsarIntegrityPlan(
+            FUSE_PRESENT_ASAR_VALIDATION_DISABLED,
+            True,
+            "the actual Electron fuse carrier is present but EnableEmbeddedAsarIntegrityValidation is off",
+            **common,
         )
     if resource_present:
         return WindowsAsarIntegrityPlan(
             RESOURCE_PRESENT_UPDATE_REQUIRED,
             True,
             "PE ASAR-integrity resource is present and must be updated after repacking",
-            None,
-            None,
-            True,
-            resource_entries,
-            None,
+            **common,
         )
     return WindowsAsarIntegrityPlan(
         RESOURCE_ABSENT_NO_VALIDATION_METADATA,
         True,
-        "No Electron fuse wire or PE ASAR-integrity resource was found; launch validation is required",
-        None,
-        None,
-        False,
-        (),
-        None,
+        "no Electron fuse wire or PE ASAR-integrity resource was found; launch validation is required",
+        **common,
     )
 
 
@@ -279,31 +365,57 @@ def apply_windows_asar_integrity(
     plan: WindowsAsarIntegrityPlan,
 ) -> dict[str, object]:
     """Update only a staged PE resource, preserving fuse state and source files."""
-    _ensure_staged_target(executable)
     if not plan.resolved:
         raise RuntimeError(f"Windows ASAR integrity plan is not buildable: {plan.state}: {plan.reason}")
     digest = asar_header_digest(asar)
-    before = read_pe_integrity_resources(executable)
+    targets = plan.carrier_paths if plan.carrier_paths_known else (executable,)
+    targets = tuple(targets)
+    if not targets:
+        return {
+            "plan": plan.to_dict(),
+            "asar_header": digest.to_dict(),
+            "carriers": [],
+            "resource_updated": False,
+            "resource_before": None,
+            "resource_after": None,
+        }
     updated = False
-    if plan.resource_present:
-        payload = json.dumps(
-            [{"file": EXPECTED_ASAR_RESOURCE, "alg": "sha256", "value": digest.hash}],
-            separators=(",", ":"),
-        )
-        _run_node_json(PE_RESOURCES_SCRIPT, ["update", str(executable)], stdin=payload)
-        updated = True
-    after = read_pe_integrity_resources(executable)
-    if updated:
-        actual = _resource_asar_digest(after)
-        if actual != digest.hash:
-            raise RuntimeError(
-                "staged PE INTEGRITY/ELECTRONASAR resource did not read back the new ASAR header digest"
+    carrier_results: list[dict[str, object]] = []
+    for target in targets:
+        _ensure_staged_target(target)
+        before = read_pe_integrity_resources(target)
+        carrier_updated = False
+        if plan.resource_present:
+            payload = json.dumps(
+                [{"file": EXPECTED_ASAR_RESOURCE, "alg": "sha256", "value": digest.hash}],
+                separators=(",", ":"),
             )
+            target_entries = tuple(_matching_resource_entries(before))
+            if target_entries:
+                _run_node_json(PE_RESOURCES_SCRIPT, ["update", str(target)], stdin=payload)
+                carrier_updated = True
+                updated = True
+        after = read_pe_integrity_resources(target)
+        if carrier_updated:
+            actual = _resource_asar_digest(after)
+            if actual != digest.hash:
+                raise RuntimeError(
+                    f"staged PE INTEGRITY/ELECTRONASAR resource did not read back the new ASAR header digest: {target}"
+                )
+        carrier_results.append(
+            {
+                "path": str(target),
+                "resource_before": before,
+                "resource_after": after,
+                "resource_updated": carrier_updated,
+            }
+        )
     return {
         "plan": plan.to_dict(),
         "asar_header": digest.to_dict(),
-        "resource_before": before,
-        "resource_after": after,
+        "carriers": carrier_results,
+        "resource_before": carrier_results[0]["resource_before"] if carrier_results else None,
+        "resource_after": carrier_results[0]["resource_after"] if carrier_results else None,
         "resource_updated": updated,
     }
 
@@ -351,11 +463,28 @@ def scan_fuse_carriers(mirrored_root: Path) -> dict[str, object]:
                         "count": snapshot.count,
                         "fuses": list(snapshot.fuses),
                         "offset": snapshot.offset,
+                        "asar_integrity_validation": (
+                            snapshot.fuses[4] if snapshot.count > 4 else "NOT PRESENT"
+                        ),
                     }
                 except (OSError, RuntimeError) as error:
                     carrier["fuse_error"] = _safe_error(error)
+                try:
+                    resources = read_pe_integrity_resources(path)
+                    entries = _matching_resource_entries(resources)
+                    carrier["integrity_resource_present"] = bool(entries)
+                    carrier["integrity_resources"] = entries
+                except (OSError, RuntimeError) as error:
+                    carrier["integrity_resource_present"] = False
+                    carrier["integrity_resources"] = []
+                    carrier["integrity_error"] = _safe_error(error)
                 carriers.append(carrier)
         except OSError as error:
             record["error"] = _safe_error(error)
         files.append(record)
-    return {"scanned_files": files, "carriers": carriers, "carrier_count": len(carriers)}
+    return {
+        "scanned_files": files,
+        "carriers": carriers,
+        "carrier_count": len(carriers),
+        "carrier_relative_paths": [str(carrier["relative"]) for carrier in carriers],
+    }

@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestResolveLaunchPathsPrefersChatGPT(t *testing.T) {
+func TestResolveLaunchPathsUsesMetadataSelectedShell(t *testing.T) {
 	root := t.TempDir()
 	appDir := filepath.Join(root, "app")
 	runtimeDir := filepath.Join(root, "runtime")
@@ -27,6 +27,9 @@ func TestResolveLaunchPathsPrefersChatGPT(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if err := os.WriteFile(filepath.Join(root, "launch.json"), []byte(`{"desktop_launch_executable":"app\\ChatGPT.exe"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	paths, err := resolveLaunchPaths(filepath.Join(root, "Codex Subscription Router.exe"))
 	if err != nil {
 		t.Fatal(err)
@@ -39,12 +42,13 @@ func TestResolveLaunchPathsPrefersChatGPT(t *testing.T) {
 	}
 }
 
-func TestResolveLaunchPathsSupportsLegacyCodex(t *testing.T) {
+func TestResolveLaunchPathsSupportsMetadataSelectedCodex(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "app", "resources"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	for _, path := range []string{
+		filepath.Join(root, "app", "ChatGPT.exe"),
 		filepath.Join(root, "app", "Codex.exe"),
 		filepath.Join(root, "runtime", "codex-mux.exe"),
 		filepath.Join(root, "runtime", "codex.real.exe"),
@@ -56,12 +60,59 @@ func TestResolveLaunchPathsSupportsLegacyCodex(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if err := os.WriteFile(filepath.Join(root, "launch.json"), []byte(`{"desktop_launch_executable":"app\\Codex.exe"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	paths, err := resolveLaunchPaths(filepath.Join(root, "router.exe"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.HasSuffix(paths.chatGPT, filepath.Join("app", "Codex.exe")) {
 		t.Fatalf("legacy chatGPT=%q", paths.chatGPT)
+	}
+}
+
+func TestResolveLaunchPathsRequiresLaunchMetadata(t *testing.T) {
+	root := t.TempDir()
+	for _, path := range []string{
+		filepath.Join(root, "app", "ChatGPT.exe"),
+		filepath.Join(root, "runtime", "codex-mux.exe"),
+		filepath.Join(root, "runtime", "codex.real.exe"),
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("fixture"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := resolveLaunchPaths(filepath.Join(root, "router.exe")); err == nil {
+		t.Fatal("expected missing launch metadata to fail closed")
+	}
+}
+
+func TestResolveLaunchPathsRejectsNonRootMetadata(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "app", "resources"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		filepath.Join(root, "app", "ChatGPT.exe"),
+		filepath.Join(root, "runtime", "codex-mux.exe"),
+		filepath.Join(root, "runtime", "codex.real.exe"),
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("fixture"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "launch.json"), []byte(`{"desktop_launch_executable":"app\\resources\\codex.exe"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveLaunchPaths(filepath.Join(root, "router.exe")); err == nil {
+		t.Fatal("expected non-root launch metadata to fail closed")
 	}
 }
 
@@ -76,6 +127,27 @@ func TestBuildEnvironmentReplacesKeysCaseInsensitively(t *testing.T) {
 	}
 	if !strings.Contains(joined, "KEEP=value") {
 		t.Fatalf("environment lost unrelated key: %q", environment)
+	}
+}
+
+func TestBuildEnvironmentIncludesWindowsIsolationContract(t *testing.T) {
+	environment := buildEnvironment(
+		[]string{"CODEX_SPARKLE_ENABLED=true", "CODEX_ELECTRON_USER_DATA_PATH=official"},
+		map[string]string{
+			"CODEX_ELECTRON_USER_DATA_PATH":  `C:\\router\\User Data`,
+			"CODEX_MUX_DESKTOP_USER_DATA":    `C:\\router\\User Data`,
+			"CODEX_SPARKLE_ENABLED":           "false",
+		},
+	)
+	joined := strings.Join(environment, "\n")
+	if !strings.Contains(joined, `CODEX_ELECTRON_USER_DATA_PATH=C:\\router\\User Data`) {
+		t.Fatalf("missing Electron profile override: %q", environment)
+	}
+	if !strings.Contains(joined, `CODEX_MUX_DESKTOP_USER_DATA=C:\\router\\User Data`) {
+		t.Fatalf("missing compatibility profile override: %q", environment)
+	}
+	if !strings.Contains(joined, "CODEX_SPARKLE_ENABLED=false") || strings.Contains(joined, "CODEX_SPARKLE_ENABLED=true") {
+		t.Fatalf("updater switch was not forced off: %q", environment)
 	}
 }
 

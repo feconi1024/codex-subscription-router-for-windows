@@ -90,6 +90,50 @@ class AuthenticodeMetadata:
 
 
 @dataclass(frozen=True)
+class DesktopExecutableCandidate:
+    """Evidence for a root-level Windows Desktop shell candidate."""
+
+    path: Path
+    relative_path: str
+    present: bool
+    file_size: int | None
+    file_version: str | None
+    product_version: str | None
+    authenticode: AuthenticodeMetadata
+    pe_machine: int | None
+    appx_manifest_declared: bool
+    fuse_wire_present: bool
+    fuse: dict[str, object] | None
+    fuse_error: str | None
+    integrity_resource_present: bool
+    integrity_resources: tuple[dict[str, object], ...]
+    integrity_error: str | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "path": str(self.path),
+            "relative_path": self.relative_path,
+            "present": self.present,
+            "file_size": self.file_size,
+            "file_version": self.file_version,
+            "product_version": self.product_version,
+            "authenticode": {
+                "status": self.authenticode.status,
+                "signer": self.authenticode.signer,
+            },
+            "pe_machine": self.pe_machine,
+            "pe_machine_hex": f"0x{self.pe_machine:04x}" if self.pe_machine is not None else None,
+            "appx_manifest_declared": self.appx_manifest_declared,
+            "fuse_wire_present": self.fuse_wire_present,
+            "fuse": self.fuse,
+            "fuse_error": self.fuse_error,
+            "integrity_resource_present": self.integrity_resource_present,
+            "integrity_resources": list(self.integrity_resources),
+            "integrity_error": self.integrity_error,
+        }
+
+
+@dataclass(frozen=True)
 class RealCodexCandidate:
     path: Path
     version: str
@@ -508,6 +552,32 @@ def process_tree_pids(root_pid: int, snapshot: Iterable[RunningProcessCandidate]
     return tuple(result)
 
 
+def attributable_process_pids(
+    root_pid: int,
+    baseline_pids: Iterable[int],
+    snapshot: Iterable[RunningProcessCandidate],
+    mirrored_root: Path,
+    *,
+    seed_pids: Iterable[int] = (),
+) -> tuple[int, ...]:
+    """Track new descendants or mirror-path processes for one launch probe."""
+    baseline = {int(pid) for pid in baseline_pids}
+    rows = list(snapshot)
+    tracked = {int(root_pid), *(int(pid) for pid in seed_pids)}
+    changed = True
+    while changed:
+        changed = False
+        for row in rows:
+            if row.pid in tracked or row.pid in baseline:
+                continue
+            path_match = row.executable is not None and path_is_within(row.executable, mirrored_root)
+            parent_match = row.parent_pid in tracked
+            if path_match or parent_match:
+                tracked.add(row.pid)
+                changed = True
+    return tuple(sorted(tracked))
+
+
 def enumerate_windows_for_processes(pids: Iterable[int]) -> list[dict[str, object]]:
     """Collect visible top-level window evidence without sending input."""
     wanted = {int(pid) for pid in pids}
@@ -606,6 +676,100 @@ def terminate_process_tree(root_pid: int, snapshot: Iterable[RunningProcessCandi
     return {"requested": list(targets), "terminated": terminated, "errors": errors}
 
 
+def terminate_attributed_processes(
+    process_pids: Iterable[int],
+    snapshot: Iterable[RunningProcessCandidate],
+    mirrored_root: Path,
+    *,
+    root_pid: int | None = None,
+) -> dict[str, object]:
+    """Terminate only PIDs tracked for a probe, never protected package processes."""
+    if os.name != "nt":
+        return {"requested": [], "terminated": [], "errors": ["Windows-only process termination"]}
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except (AttributeError, OSError) as error:
+        return {"requested": [], "terminated": [], "errors": [str(error)]}
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.TerminateProcess.restype = ctypes.c_int
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+
+    rows = {row.pid: row for row in snapshot}
+    tracked = tuple(dict.fromkeys(int(pid) for pid in process_pids))
+    requested: list[int] = []
+    skipped: list[str] = []
+
+    def has_mirror_ancestor(pid: int) -> bool:
+        current = rows.get(pid)
+        visited: set[int] = set()
+        while current is not None and current.pid not in visited:
+            visited.add(current.pid)
+            if current.executable is not None and path_is_within(current.executable, mirrored_root):
+                return True
+            if current.parent_pid is None:
+                break
+            current = rows.get(current.parent_pid)
+        return False
+
+    for pid in tracked:
+        row = rows.get(pid)
+        if row is None:
+            continue
+        if row.executable is None:
+            skipped.append(f"pid {pid}: executable path unavailable")
+            continue
+        if is_windowsapps_path(row.executable):
+            skipped.append(f"pid {pid}: refusing protected WindowsApps process {row.executable}")
+            continue
+        if not path_is_within(row.executable, mirrored_root):
+            # A child helper may be system-installed, but it is safe to target
+            # only when the final snapshot still proves a mirror-path ancestor.
+            # This also protects against a root PID being reused after it exits.
+            if pid == root_pid or not has_mirror_ancestor(pid):
+                skipped.append(f"pid {pid}: refusing unattributed process outside mirror ({row.executable})")
+                continue
+        requested.append(pid)
+
+    def depth(pid: int) -> int:
+        count = 0
+        current = rows.get(pid)
+        visited: set[int] = set()
+        while current is not None and current.parent_pid is not None and current.parent_pid not in visited:
+            visited.add(current.parent_pid)
+            count += 1
+            current = rows.get(current.parent_pid)
+        return count
+
+    terminated: list[int] = []
+    errors: list[str] = list(skipped)
+    for pid in sorted(requested, key=depth, reverse=True):
+        handle = kernel32.OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, False, pid)
+        if not handle:
+            continue
+        try:
+            if kernel32.TerminateProcess(handle, 0xC0DE):
+                result = kernel32.WaitForSingleObject(handle, 5_000)
+                if result == WAIT_OBJECT_0:
+                    terminated.append(pid)
+                else:
+                    errors.append(f"pid {pid} did not exit after termination (wait={result})")
+            else:
+                errors.append(_win32_error(f"TerminateProcess failed for pid {pid}"))
+        finally:
+            kernel32.CloseHandle(handle)
+    return {
+        "tracked": list(tracked),
+        "requested": requested,
+        "terminated": terminated,
+        "errors": errors,
+    }
+
+
 def _rows_to_process_candidates(parsed: Any) -> list[RunningProcessCandidate]:
     rows = parsed if isinstance(parsed, list) else [parsed]
     candidates: list[RunningProcessCandidate] = []
@@ -678,28 +842,39 @@ def is_windowsapps_path(path: Path) -> bool:
     return any(part.casefold() == "windowsapps" for part in path.resolve(strict=False).parts)
 
 
-def is_native_windows_executable(path: Path) -> bool:
-    """Validate the PE header and machine type before considering a candidate."""
-    if not path.is_file() or path.is_symlink():
+def path_is_within(path: Path, root: Path) -> bool:
+    """Compare Windows paths without trusting case-sensitive string equality."""
+    try:
+        candidate = os.path.abspath(os.fspath(path))
+        parent = os.path.abspath(os.fspath(root))
+        return os.path.normcase(os.path.commonpath((candidate, parent))) == os.path.normcase(parent)
+    except (OSError, ValueError):
         return False
+
+
+def read_pe_machine(path: Path) -> int | None:
+    """Read the PE COFF machine field without modifying the candidate."""
     try:
         with path.open("rb") as handle:
             header = handle.read(0x1000)
-    except OSError:
-        return False
-    if len(header) < 0x40 or header[:2] != b"MZ":
-        return False
-    pe_offset = int.from_bytes(header[0x3C:0x40], "little")
-    if pe_offset < 0x40 or pe_offset + 6 > len(header):
-        try:
-            with path.open("rb") as handle:
+            if len(header) < 0x40 or header[:2] != b"MZ":
+                return None
+            pe_offset = int.from_bytes(header[0x3C:0x40], "little")
+            if pe_offset < 0x40 or pe_offset + 6 > len(header):
                 handle.seek(pe_offset)
                 pe_header = handle.read(6)
-        except OSError:
-            return False
-    else:
-        pe_header = header[pe_offset : pe_offset + 6]
-    return pe_header[:4] == b"PE\0\0" and int.from_bytes(pe_header[4:6], "little") in WINDOWS_NATIVE_MACHINES
+            else:
+                pe_header = header[pe_offset : pe_offset + 6]
+    except (OSError, ValueError):
+        return None
+    if pe_header[:4] != b"PE\0\0":
+        return None
+    return int.from_bytes(pe_header[4:6], "little")
+
+
+def is_native_windows_executable(path: Path) -> bool:
+    """Validate the PE header and machine type before considering a candidate."""
+    return path.is_file() and not path.is_symlink() and read_pe_machine(path) in WINDOWS_NATIVE_MACHINES
 
 
 def sha256_file(path: Path) -> str:
@@ -754,6 +929,116 @@ def read_authenticode(path: Path) -> AuthenticodeMetadata:
             signer=str(parsed["Signer"]) if parsed.get("Signer") else None,
         )
     return AuthenticodeMetadata(status="Unknown", signer=None)
+
+
+def _manifest_declares_executable(package_root: Path, executable: Path) -> bool:
+    manifest = package_root / "AppxManifest.xml"
+    try:
+        with manifest.open("rb") as handle:
+            root = ET.parse(handle).getroot()
+        relative = executable.resolve(strict=False).relative_to(package_root.resolve(strict=False))
+    except (OSError, ET.ParseError, ValueError):
+        return False
+    expected = relative.as_posix().casefold()
+    return any(
+        isinstance(value, str)
+        and value.replace("\\", "/").casefold() == expected
+        for element in root.iter()
+        if _local_name(element.tag) == "Application"
+        for value in (element.attrib.get("Executable"),)
+    )
+
+
+def inventory_desktop_executables(source: DesktopSource) -> tuple[DesktopExecutableCandidate, ...]:
+    """Inspect only app-root shell candidates, never resources\\codex.exe."""
+    try:
+        from .fuses import SENTINEL, read_fuses
+        from .integrity import read_pe_integrity_resources
+    except ImportError:
+        from fuses import SENTINEL, read_fuses
+        from integrity import read_pe_integrity_resources
+
+    inventory: list[DesktopExecutableCandidate] = []
+    for name in DESKTOP_EXECUTABLE_NAMES:
+        path = source.app_dir / name
+        relative = path.relative_to(source.source_root).as_posix().replace("/", "\\")
+        if not path.is_file():
+            inventory.append(
+                DesktopExecutableCandidate(
+                    path=path,
+                    relative_path=relative,
+                    present=False,
+                    file_size=None,
+                    file_version=None,
+                    product_version=None,
+                    authenticode=AuthenticodeMetadata("NOT PRESENT", None),
+                    pe_machine=None,
+                    appx_manifest_declared=_manifest_declares_executable(source.source_root, path),
+                    fuse_wire_present=False,
+                    fuse=None,
+                    fuse_error=None,
+                    integrity_resource_present=False,
+                    integrity_resources=(),
+                    integrity_error=None,
+                )
+            )
+            continue
+
+        versions = read_file_versions(path)
+        try:
+            file_size = path.stat().st_size
+        except OSError:
+            file_size = None
+        try:
+            data = path.read_bytes()
+        except OSError as error:
+            data = b""
+            fuse_error = _safe_error(error)
+        else:
+            fuse_error = None
+        fuse_wire_present = SENTINEL in data
+        fuse_data: dict[str, object] | None = None
+        if fuse_wire_present:
+            try:
+                snapshot = read_fuses(path)
+                fuse_data = {
+                    "schema_version": snapshot.schema_version,
+                    "count": snapshot.count,
+                    "fuses": list(snapshot.fuses),
+                    "offset": snapshot.offset,
+                }
+            except (OSError, RuntimeError) as error:
+                fuse_error = _safe_error(error)
+        integrity_resources: tuple[dict[str, object], ...] = ()
+        integrity_error: str | None = None
+        try:
+            result = read_pe_integrity_resources(path)
+            values = result.get("resources")
+            if not isinstance(values, list):
+                raise RuntimeError("PE integrity helper returned an invalid resource list")
+            integrity_resources = tuple(value for value in values if isinstance(value, dict))
+        except (OSError, RuntimeError) as error:
+            integrity_error = _safe_error(error)
+        inventory.append(
+            DesktopExecutableCandidate(
+                path=path,
+                relative_path=relative,
+                present=True,
+                file_size=file_size,
+                file_version=versions.get("FileVersion"),
+                product_version=versions.get("ProductVersion"),
+                authenticode=read_authenticode(path),
+                pe_machine=read_pe_machine(path),
+                appx_manifest_declared=_manifest_declares_executable(source.source_root, path),
+                fuse_wire_present=fuse_wire_present,
+                fuse=fuse_data,
+                fuse_error=fuse_error,
+                integrity_resource_present=bool(integrity_resources),
+                integrity_resources=integrity_resources,
+                integrity_error=integrity_error,
+            )
+        )
+    return tuple(inventory)
 
 
 def read_codex_version(path: Path) -> str:

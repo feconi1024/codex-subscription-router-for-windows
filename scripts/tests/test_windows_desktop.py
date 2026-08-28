@@ -23,6 +23,7 @@ from scripts.windows.compatibility import load_compatibility_records
 from scripts.windows.bootstrap import audit_bootstrap, patch_bootstrap
 from scripts.windows.discovery import (
     AuthenticodeMetadata,
+    DesktopExecutableCandidate,
     DesktopSource,
     PackageMetadata,
     RunningProcessCandidate,
@@ -39,10 +40,14 @@ from scripts.windows.discovery import (
     recognize_start_app_aumids,
     select_running_process,
     process_tree_pids,
+    attributable_process_pids,
+    inventory_desktop_executables,
+    path_is_within,
 )
 from scripts.windows.fuses import FUSE_INDEX, FUSE_VALUES, SENTINEL, FuseSnapshot, read_fuses, write_fuse
 from scripts.windows.integrity import (
     FUSE_PRESENT_RESOURCE_MISSING,
+    FUSE_PRESENT_ASAR_VALIDATION_DISABLED,
     RESOURCE_ABSENT_NO_VALIDATION_METADATA,
     RESOURCE_PRESENT_UPDATE_REQUIRED,
     AsarHeaderDigest,
@@ -52,6 +57,15 @@ from scripts.windows.integrity import (
     read_pe_integrity_resources,
     resolve_windows_asar_integrity,
     scan_fuse_carriers,
+)
+from scripts.windows.smoke import (
+    BLOCKED_NATIVE_MODULE,
+    BLOCKED_OTHER_PACKAGE_IDENTITY,
+    BLOCKED_RESOURCE,
+    BLOCKED_SINGLE_INSTANCE_LOCK,
+    BLOCKED_UPDATER_IDENTITY,
+    CRASHED,
+    classify_probe_output,
 )
 from scripts.windows.mirror import (
     DirectoryEnumerationBlockedError,
@@ -192,6 +206,105 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             RunningProcessCandidate(pid=12, name="unrelated.exe", parent_pid=99),
         ]
         self.assertEqual(process_tree_pids(10, snapshot), (10, 11))
+
+    def test_attributed_cleanup_scope_tracks_new_mirror_and_descendant_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            mirror = root / "app"
+            snapshot = [
+                RunningProcessCandidate(pid=10, name="ChatGPT.exe", parent_pid=1, executable=mirror / "ChatGPT.exe"),
+                RunningProcessCandidate(pid=11, name="helper.exe", parent_pid=10, executable=mirror / "helper.exe"),
+                RunningProcessCandidate(pid=12, name="unrelated.exe", parent_pid=99, executable=root / "other" / "unrelated.exe"),
+                RunningProcessCandidate(pid=13, name="old.exe", parent_pid=10, executable=mirror / "old.exe"),
+            ]
+            tracked = attributable_process_pids(10, {13}, snapshot, mirror)
+            self.assertEqual(tracked, (10, 11))
+            self.assertTrue(path_is_within(mirror / "nested.exe", mirror))
+            self.assertFalse(path_is_within(root / "application.exe", mirror))
+
+    def test_desktop_inventory_is_root_only_and_records_absent_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / "app"
+            resources = app / "resources"
+            resources.mkdir(parents=True)
+            write_pe(app / "ChatGPT.exe")
+            (resources / "codex.exe").write_bytes(b"bundled runtime")
+            (root / "AppxManifest.xml").write_text(
+                "<Package><Applications><Application Executable=\"app/ChatGPT.exe\"/></Applications></Package>",
+                encoding="utf-8",
+            )
+            source = DesktopSource(
+                source_root=root,
+                app_dir=app,
+                executable=app / "ChatGPT.exe",
+                resources_dir=resources,
+                app_asar=resources / "app.asar",
+                package=PackageMetadata(name="OpenAI.Codex"),
+                source_kind="fixture",
+                file_version="1.0.0",
+            )
+            with patch(
+                "scripts.windows.discovery.read_file_versions",
+                return_value={"FileVersion": "1.0.0", "ProductVersion": "1.0.0"},
+            ), patch(
+                "scripts.windows.discovery.read_authenticode",
+                return_value=AuthenticodeMetadata("Valid", "CN=OpenAI"),
+            ), patch(
+                "scripts.windows.integrity.read_pe_integrity_resources",
+                return_value={"resources": []},
+            ):
+                inventory = inventory_desktop_executables(source)
+            self.assertEqual([item.relative_path for item in inventory], [r"app\ChatGPT.exe", r"app\Codex.exe"])
+            self.assertTrue(inventory[0].present)
+            self.assertTrue(inventory[0].appx_manifest_declared)
+            self.assertFalse(inventory[1].present)
+            self.assertEqual(inventory[1].authenticode.status, "NOT PRESENT")
+            self.assertNotIn(r"resources\codex.exe", [item.relative_path for item in inventory])
+
+    def test_launch_classification_does_not_treat_plain_windowsapps_path_as_identity(self) -> None:
+        result = classify_probe_output(
+            r"Launching C:\Program Files\WindowsApps\OpenAI.Codex\app\ChatGPT.exe",
+            still_running=False,
+            return_code=3,
+        )
+        self.assertEqual(result["status"], CRASHED)
+        self.assertNotIn("package identity", str(result["relevant_log_lines"]))
+
+    def test_launch_classification_uses_exact_identity_categories_and_preserves_lines(self) -> None:
+        updater_line = "Failed to set up updater: process package ID is missing"
+        updater = classify_probe_output(updater_line, still_running=False, return_code=3)
+        self.assertEqual(updater["status"], BLOCKED_UPDATER_IDENTITY)
+        self.assertIn(updater_line, updater["relevant_log_lines"]["updater_identity"])
+
+        other = classify_probe_output("AppX activation context failed for package identity", still_running=False, return_code=3)
+        self.assertEqual(other["status"], BLOCKED_OTHER_PACKAGE_IDENTITY)
+        single = classify_probe_output("requestSingleInstanceLock returned false", still_running=False, return_code=1)
+        self.assertEqual(single["status"], BLOCKED_SINGLE_INSTANCE_LOCK)
+        native = classify_probe_output("native addon.node could not be found", still_running=False, return_code=1)
+        self.assertEqual(native["status"], BLOCKED_NATIVE_MODULE)
+        resource = classify_probe_output("failed to open resources\\app.asar", still_running=False, return_code=1)
+        self.assertEqual(resource["status"], BLOCKED_RESOURCE)
+
+    def test_integrity_plan_follows_actual_carrier_not_manifest_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable = root / "ChatGPT.exe"
+            carrier = root / "chrome.dll"
+            executable.write_bytes(b"manifest executable")
+            carrier.write_bytes(b"actual carrier")
+            fuse = FuseSnapshot(1, 9, ("on", "off", "on", "on", "off", "off", "off", "on", "on"), 0)
+            with patch("scripts.windows.integrity.read_fuses", return_value=fuse), patch(
+                "scripts.windows.integrity.read_pe_integrity_resources",
+                return_value={"resources": []},
+            ):
+                plan = resolve_windows_asar_integrity(executable, carrier_paths=[carrier])
+            self.assertEqual(plan.state, FUSE_PRESENT_ASAR_VALIDATION_DISABLED)
+            self.assertTrue(plan.resolved)
+            self.assertTrue(plan.carrier_paths_known)
+            self.assertEqual(plan.carrier_paths, (carrier,))
+            self.assertEqual(plan.to_dict()["carrier_records"][0]["relative"], "chrome.dll")
+            self.assertEqual(plan.to_dict()["carrier_records"][0]["fuse"]["fuses"], list(fuse.fuses))
 
     def test_fuse_scan_records_carrier_state_and_scans_dlls(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
