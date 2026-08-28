@@ -719,6 +719,7 @@ def _run_smoke_launch_matrix(args: argparse.Namespace) -> int:
         direct = run_smoke_launch_matrix(source, real, desktop_candidates)
         result: dict[str, object] = {
             "status": direct.get("status"),
+            "reason": direct.get("reason"),
             "direct_launch": direct,
             "desktop_executables": [candidate.to_dict() for candidate in desktop_candidates],
         }
@@ -971,7 +972,7 @@ def _resolve_launch_executable(
         if candidate.relative_path.replace("/", "\\").casefold() == normalized:
             if not candidate.present:
                 raise RuntimeError(f"selected Desktop shell is not present: {candidate.relative_path}")
-            return normalized.replace("/", "\\"), candidate
+            return candidate.relative_path.replace("/", "\\"), candidate
     raise RuntimeError(f"selected Desktop shell was not found in source inventory: {requested}")
 
 

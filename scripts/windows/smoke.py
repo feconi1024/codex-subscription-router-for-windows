@@ -93,8 +93,10 @@ _MISSING_DLL_PATTERNS = (
     r"could not load native module",
 )
 _RESOURCE_PATTERNS = (
-    r"resources[\\/]app\.asar",
-    r"(?:app\.asar|asar).{0,100}(?:not found|missing|cannot|could not|failed)",
+    r"(?:not found|missing|cannot|could not|failed|unable|error).{0,100}resources[\\/]app\.asar",
+    r"resources[\\/]app\.asar.{0,100}(?:not found|missing|cannot|could not|failed|unable|error)",
+    r"(?:not found|missing|cannot|could not|failed|unable|error).{0,100}(?:app\.asar|asar)",
+    r"(?:app\.asar|asar).{0,100}(?:not found|missing|cannot|could not|failed|unable|error)",
     r"cannot find module",
     r"entry point.{0,100}(?:not found|could not)",
     r"failed to open (?:asar|resource)",
@@ -261,6 +263,16 @@ def _flag_lines(text: str, patterns: tuple[str, ...]) -> list[str]:
     return _matching_lines(text, patterns)
 
 
+def _mirror_candidate_path(mirror_root: Path, candidate: DesktopExecutableCandidate) -> Path:
+    relative = candidate.relative_path.replace("/", "\\")
+    parts = [part for part in relative.split("\\") if part]
+    # Inventory paths are package-relative (app\\ChatGPT.exe), while a
+    # Desktop mirror is rooted at the source app directory itself.
+    if parts and parts[0].casefold() == "app":
+        parts = parts[1:]
+    return mirror_root.joinpath(*parts)
+
+
 def _probe_candidate(
     mirror_root: Path,
     workspace_root: Path,
@@ -280,7 +292,7 @@ def _probe_candidate(
             "manual_operation_required": False,
         }
 
-    executable = mirror_root / Path(candidate.relative_path.replace("\\", "/"))
+    executable = _mirror_candidate_path(mirror_root, candidate)
     valid_real, real_error = _validated_real_codex(real)
     if not valid_real:
         return {
@@ -469,6 +481,13 @@ def _probe_candidate(
                 "packaged": _flag_lines(log_text, _PACKAGED_PATTERNS),
                 "enable_updater": _flag_lines(log_text, _ENABLE_UPDATER_PATTERNS),
                 "app_server": _flag_lines(log_text, _APP_SERVER_PATTERNS),
+                "native_module": relevant.get("native_module", []),
+                "resource": relevant.get("resource", []),
+                "single_instance": relevant.get("single_instance", []),
+                "package_identity": (
+                    list(relevant.get("updater_identity", []))
+                    + list(relevant.get("other_package_identity", []))
+                ),
             },
             "relevant_log_lines": relevant,
             "log_tail": log_text,

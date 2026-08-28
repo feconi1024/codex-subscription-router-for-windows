@@ -26,6 +26,7 @@ from scripts.windows.discovery import (
     DesktopExecutableCandidate,
     DesktopSource,
     PackageMetadata,
+    RealCodexCandidate,
     RunningProcessCandidate,
     SourceDiagnostics,
     SourceProbeResult,
@@ -65,6 +66,7 @@ from scripts.windows.smoke import (
     BLOCKED_SINGLE_INSTANCE_LOCK,
     BLOCKED_UPDATER_IDENTITY,
     CRASHED,
+    _probe_candidate,
     classify_probe_output,
 )
 from scripts.windows.mirror import (
@@ -285,6 +287,121 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         self.assertEqual(native["status"], BLOCKED_NATIVE_MODULE)
         resource = classify_probe_output("failed to open resources\\app.asar", still_running=False, return_code=1)
         self.assertEqual(resource["status"], BLOCKED_RESOURCE)
+
+    def test_minimal_bootstrap_patch_has_no_renderer_or_ui_bridge_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            extracted = Path(temporary)
+            build = extracted / ".vite" / "build"
+            build.mkdir(parents=True)
+            bootstrap_path = build / "bootstrap-fixture.js"
+            main_path = build / "main-fixture.js"
+            bootstrap_path.write_text(
+                "e.app.setPath(`userData`,x({appDataPath:e.app.getPath(`appData`),"
+                "buildFlavor:`stable`,env:process.env}))"
+                "await u.initialize();try{let{runMainAppStartup:startup}=x}",
+                encoding="utf-8",
+            )
+            main_path.write_text("renderer sentinel", encoding="utf-8")
+            before_main = main_path.read_text(encoding="utf-8")
+            report = patch_bootstrap(
+                extracted,
+                Path(__file__).resolve().parents[2],
+                patch_user_data=False,
+                disable_updater=True,
+                inject_ui_test_bridge=False,
+            )
+            self.assertEqual(report.strategy, "updater-only")
+            self.assertFalse(report.user_data_patched)
+            self.assertTrue(report.updater_disabled)
+            self.assertFalse(report.ui_test_bridge_injected)
+            self.assertIsNone(report.ui_test_bridge)
+            self.assertEqual(main_path.read_text(encoding="utf-8"), before_main)
+            self.assertNotIn("await u.initialize();", bootstrap_path.read_text(encoding="utf-8"))
+            self.assertNotIn("CODEX_MUX_UI_TESTS", main_path.read_text(encoding="utf-8"))
+
+    def test_probe_contract_uses_temporary_profiles_and_cli_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            mirror = root / "mirror"
+            mirror.mkdir()
+            executable = mirror / "ChatGPT.exe"
+            executable.write_bytes(b"desktop")
+            real_path = root / "codex.exe"
+            write_pe(real_path)
+            candidate = DesktopExecutableCandidate(
+                path=executable,
+                relative_path=r"app\ChatGPT.exe",
+                present=True,
+                file_size=executable.stat().st_size,
+                file_version="1.0.0",
+                product_version="1.0.0",
+                authenticode=AuthenticodeMetadata("Valid", "CN=OpenAI"),
+                pe_machine=0x8664,
+                appx_manifest_declared=True,
+                fuse_wire_present=False,
+                fuse=None,
+                fuse_error=None,
+                integrity_resource_present=False,
+                integrity_resources=(),
+                integrity_error=None,
+            )
+            real = RealCodexCandidate(
+                path=real_path,
+                version="codex-cli test",
+                sha256="a" * 64,
+                authenticode=AuthenticodeMetadata("Valid", "CN=OpenAI"),
+                modified_time=0,
+                valid_native=True,
+            )
+            captured: dict[str, object] = {}
+
+            class FakeProcess:
+                pid = 91234
+
+                def poll(self) -> int:
+                    return 0
+
+                def terminate(self) -> None:
+                    return None
+
+                def wait(self, timeout: float | None = None) -> int:
+                    del timeout
+                    return 0
+
+            def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
+                captured["command"] = command
+                captured["env"] = kwargs["env"]
+                stdout = kwargs["stdout"]
+                assert hasattr(stdout, "write")
+                stdout.write("packaged=true enableUpdater=false app-server ready\\n")
+                return FakeProcess()
+
+            with patch("scripts.windows.smoke.os.name", "nt"), patch(
+                "scripts.windows.smoke.subprocess.Popen", side_effect=fake_popen
+            ), patch("scripts.windows.smoke.discover_process_snapshot_native", return_value=[]), patch(
+                "scripts.windows.smoke.enumerate_windows_for_processes", return_value=[]
+            ), patch(
+                "scripts.windows.smoke.terminate_attributed_processes",
+                return_value={"tracked": [91234], "requested": [], "terminated": [], "errors": []},
+            ), patch("scripts.windows.smoke._official_instance_present", return_value=False), patch(
+                "scripts.windows.smoke.time.sleep"
+            ):
+                result = _probe_candidate(
+                    mirror,
+                    root,
+                    real,
+                    candidate,
+                    timeout_seconds=0,
+                )
+            self.assertEqual(result["status"], CRASHED)
+            self.assertEqual(result["profile_isolation"]["contract_valid"], True)
+            self.assertEqual(result["profile_isolation"]["sparkle_enabled"], False)
+            self.assertIn("--user-data-dir=", captured["command"][1])
+            environment = captured["env"]
+            self.assertEqual(environment["CODEX_CLI_PATH"], str(real_path))
+            self.assertEqual(environment["CODEX_ELECTRON_USER_DATA_PATH"], result["profile_isolation"]["user_data"])
+            self.assertEqual(environment["CODEX_HOME"], result["profile_isolation"]["codex_home"])
+            self.assertEqual(environment["CODEX_SPARKLE_ENABLED"], "false")
 
     def test_integrity_plan_follows_actual_carrier_not_manifest_executable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
