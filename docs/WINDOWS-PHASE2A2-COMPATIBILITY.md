@@ -117,7 +117,7 @@ identity requirement.
 | ASAR-integrity strategy | `RESOLVED` as `RESOURCE_ABSENT_NO_VALIDATION_METADATA` |
 | Unmodified mirror startup | `BLOCKED_PACKAGE_IDENTITY` |
 | Patched build/startup | Not run because Gate A failed |
-| CI Windows job | Pending after this push; must execute project steps |
+| CI Windows job | `PASS`; run [33168938990](https://github.com/feconi1024/codex-subscription-router-for-windows/actions/runs/33168938990) executed checkout, pinned Go setup, Go test/vet, Node/dependency install, both native builds, Python compile, and 31 helper tests |
 
 The Windows Actions job must still provide hosted Go/build evidence. A CI setup
 failure before checkout or project steps is not evidence of a passing Windows
