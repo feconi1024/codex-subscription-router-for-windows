@@ -498,6 +498,15 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         result = classify_probe_output("fatal: unrelated startup failure", still_running=False, return_code=1)
         self.assertEqual(result["status"], CRASHED)
 
+    def test_forced_probe_cleanup_gpu_exit_is_not_sandbox_evidence(self) -> None:
+        result = classify_probe_output(
+            "[gpu_process_host] GPU process exited unexpectedly: exit_code=49374",
+            still_running=True,
+            return_code=None,
+        )
+        self.assertEqual(result["status"], PASS)
+        self.assertTrue(result["chromium_sandbox"]["cleanup_artifact_only"])
+
     def test_phase2a4_final_layout_root_uses_localappdata_and_is_disposable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with patch("scripts.windows.smoke.os.name", "nt"), patch(

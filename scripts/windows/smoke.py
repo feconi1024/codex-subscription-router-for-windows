@@ -140,6 +140,7 @@ _GPU_EXIT_CODE_PATTERN = re.compile(
     r"(?:exit(?:_code| code)?|status|code)\s*[:=]\s*(0x[0-9a-f]+|-?\d+)",
     re.IGNORECASE,
 )
+_PROBE_TERMINATION_EXIT_CODE = "49374"  # 0xC0DE used only for attributed cleanup.
 _RENDERER_FAILURE_PATTERNS = (
     r"renderer.{0,100}(?:exited|crash|failed|failure|sandbox|not usable|unexpected)",
     r"(?:exited|crash|failed|failure|sandbox|not usable|unexpected).{0,100}renderer",
@@ -248,6 +249,16 @@ def classify_probe_output(
     resource_lines = _matching_lines(log_text, _RESOURCE_PATTERNS)
     crash_lines = _matching_lines(log_text, _CRASH_PATTERNS)
     chromium_sandbox = _chromium_sandbox_evidence(log_text)
+    cleanup_artifact_only = (
+        still_running
+        and chromium_sandbox["evidence"] is True
+        and chromium_sandbox["gpu_child_exit_codes"]
+        and set(chromium_sandbox["gpu_child_exit_codes"]) == {_PROBE_TERMINATION_EXIT_CODE}
+        and not re.search(r"gpu process isn't usable|0x80000003|-2147483645", log_text, re.IGNORECASE)
+    )
+    if cleanup_artifact_only:
+        chromium_sandbox["evidence"] = False
+        chromium_sandbox["cleanup_artifact_only"] = True
 
     # A stable process or a visible window without fatal evidence is the only
     # positive result. Identity errors are considered before generic crashes so
