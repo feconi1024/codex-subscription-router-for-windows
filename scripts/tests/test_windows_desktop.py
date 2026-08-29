@@ -679,6 +679,17 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         canary.assert_not_called()
         discover.assert_not_called()
 
+    def test_phase2a5_powershell_runner_forwards_python_flags(self) -> None:
+        runner = (Path(__file__).resolve().parents[2] / "scripts" / "windows" / "run_phase2a5_host_validation.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("[CmdletBinding(PositionalBinding = $false)]", runner)
+        self.assertIn(
+            "Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path))",
+            runner,
+        )
+        self.assertIn("$pythonArguments += $RunnerArguments", runner)
+
     def test_payload_acl_strategy_is_explicit_and_default_is_non_mutating(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

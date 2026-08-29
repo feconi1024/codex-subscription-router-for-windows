@@ -1,6 +1,8 @@
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
-    [string]$RepositoryRoot = (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)),
+    # Python-style --flags must remain in RunnerArguments instead of binding to
+    # the optional repository-root parameter.
+    [string]$RepositoryRoot = (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path))),
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$RunnerArguments
 )
