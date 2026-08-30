@@ -99,6 +99,11 @@ source disposable rebuild after the fix passed Node `v24.15.0` for the
 bootstrap/main bundles, UI bridge, initial renderer, profile, plugin, and
 conversation-thread assets.
 
+The implementation commit for this fix is
+`161ef5e48f39c308704319511ed574c2f7c17046`.  Both required CI jobs,
+`checks` and `windows-go-core`, passed for that exact commit in GitHub Actions
+run `33307218376`.
+
 The injected helper now sets the independent
 `__codexMuxRendererPatchLoaded` marker at the start of renderer execution.
 The bridge reports that marker, the account-menu injection/mount/load state,
