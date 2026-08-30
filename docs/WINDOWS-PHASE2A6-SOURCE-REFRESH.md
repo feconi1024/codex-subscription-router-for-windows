@@ -127,5 +127,6 @@ required the exact renderer adaptation recorded above.  It is not added to
 ## CI result
 
 The local Python, JavaScript, and release checks pass.  The required remote
-`checks` and `windows-go-core` jobs are run against the pushed commit and will
-be recorded here before this round is closed.
+`checks` and `windows-go-core` jobs both passed for commit `12bd7a5`
+(`12bd7a57b62923e6f693d2471fc4c7557b69dc8c`) in GitHub Actions run
+`33300587378`.
