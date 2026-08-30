@@ -33,6 +33,38 @@ The existing Phase 2A.4 CI baseline was green before this round.  The current
 round must still pass both `checks` and `windows-go-core` before compatibility
 promotion.
 
+## Router UI runtime-gate fix
+
+The patched-shell smoke no longer treats the upstream English `Open profile
+menu` button as proof that the Router account menu rendered.  Each reviewed
+renderer variant now records a Router-owned injection marker at the exact
+`usageItems` replacement.  `CodexMuxAccountMenu` records mounted, account-load,
+count, and request-failure state using only non-sensitive values, and the UI
+test bridge observes that state under `debug.router`.
+
+The public Phase 2A.5 probe artifact now includes sanitized
+`chatgpt_classification`, `router_account_menu`, and `production_gate` fields.
+When a UI gate fails, it retains only native button aria labels, types, and
+geometry; body text, root HTML, image data, account identity, and control
+tokens are excluded.  The upstream profile trigger remains diagnostic-only as
+`native_profile_trigger_observed`.
+
+Regression coverage proves that Router markers pass without an upstream
+profile trigger, an upstream trigger without Router markers fails, each
+Router runtime failure has an explicit status, and public artifacts do not
+leak identity or token data.
+
+The implementation result for commit
+`692796b32cf4e95d67e7fa3488f6e2fe3a8c887d` is:
+
+```text
+PHASE 2A.5 ROUTER UI RUNTIME GATE FIX PASS
+```
+
+The required `checks` and `windows-go-core` jobs both passed for that exact
+commit in GitHub Actions run `33304158356`.  Native compatibility promotion
+still requires the independent external-host rerun below.
+
 ## Patched-shell staging layout fix
 
 The failed native run for commit `646fde9a4dc59de145e8a3faa9a0c0be0e1c5a19`
@@ -89,7 +121,7 @@ Not yet run in this workspace.  The required manual operation is:
 
 ```powershell
 Set-Location -LiteralPath 'E:\Projects\codex-subscription-router-for-windows'
-.\scripts\windows\run_phase2a5_host_validation.ps1
+.\scripts\windows\run_phase2a5_host_validation.ps1 --ci-verified
 ```
 
 The runner prints the process, package identity, physical LOCALAPPDATA,
