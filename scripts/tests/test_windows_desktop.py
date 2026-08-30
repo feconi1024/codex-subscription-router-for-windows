@@ -27,6 +27,8 @@ from scripts.patch_app_windows import (
     build_windows_desktop,
     pack_asar,
     probe_go_toolchain,
+    resolve_staged_launch_path,
+    validate_staged_layout,
     verify_asar_listing,
 )
 from scripts.windows.compatibility import (
@@ -1161,6 +1163,63 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         source = inspect.getsource(build_windows_desktop)
         self.assertIn("staged_source_executable = staged_app / source.executable.name", source)
         self.assertNotIn("staged / source.executable.name", source)
+        self.assertIn("selected_staged_desktop = resolve_staged_launch_path(staged, selected_launch_executable)", source)
+        self.assertNotIn("staged_app / Path(selected_launch_executable", source)
+
+    def test_staged_launch_path_uses_installation_root_relative_metadata(self) -> None:
+        staged_root = Path(r"C:\staged\Codex Subscription Router")
+        chatgpt = resolve_staged_launch_path(staged_root, r"app\ChatGPT.exe")
+        codex = resolve_staged_launch_path(staged_root, r"app\Codex.exe")
+        self.assertEqual(chatgpt, staged_root / "app" / "ChatGPT.exe")
+        self.assertEqual(codex, staged_root / "app" / "Codex.exe")
+        self.assertNotEqual(chatgpt, staged_root / "app" / "app" / "ChatGPT.exe")
+
+    def test_staged_launch_path_rejects_unsafe_or_unsupported_metadata(self) -> None:
+        staged_root = Path(r"C:\staged\Codex Subscription Router")
+        for launch_executable in (
+            r"..\ChatGPT.exe",
+            r"C:\Program Files\ChatGPT.exe",
+            r"\\server\share\ChatGPT.exe",
+            r"resources\ChatGPT.exe",
+            "arbitrary.exe",
+        ):
+            with self.subTest(launch_executable=launch_executable), self.assertRaises(RuntimeError):
+                resolve_staged_launch_path(staged_root, launch_executable)
+
+    def test_staged_layout_fixture_passes_and_reports_exact_missing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            staged_root = Path(temporary) / "staged"
+            required_layout = {
+                "launcher": staged_root / "Codex Subscription Router.exe",
+                "mux": staged_root / "runtime" / "codex-mux.exe",
+                "real_codex": staged_root / "runtime" / "codex.real.exe",
+                "selected_desktop": resolve_staged_launch_path(staged_root, r"app\ChatGPT.exe"),
+                "source_desktop": staged_root / "app" / "ChatGPT.exe",
+                "app_asar": staged_root / "app" / "resources" / "app.asar",
+                "launch_metadata": staged_root / "launch.json",
+                "control_token": staged_root / "runtime" / ".codex-mux" / "control-token",
+            }
+            for path in required_layout.values():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"fixture")
+            (required_layout["launch_metadata"]).write_text(
+                '{"schema_version":1,"desktop_launch_executable":"app\\\\ChatGPT.exe"}\n',
+                encoding="utf-8",
+            )
+            required_layout["control_token"].write_text("fixture-token\n", encoding="utf-8")
+
+            launch_config = json.loads(required_layout["launch_metadata"].read_text(encoding="utf-8"))
+            self.assertEqual(launch_config["desktop_launch_executable"], r"app\ChatGPT.exe")
+            result = validate_staged_layout(required_layout)
+            self.assertEqual(result["status"], "PASS")
+
+            missing_path = required_layout["selected_desktop"]
+            missing_path.unlink()
+            with self.assertRaises(RuntimeError) as raised:
+                validate_staged_layout(required_layout)
+            message = str(raised.exception)
+            self.assertIn(f"missing selected_desktop={missing_path}", message)
+            self.assertNotIn("fixture-token", message)
 
     def test_bootstrap_dry_run_audit_matches_fixture(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

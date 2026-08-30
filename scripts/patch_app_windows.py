@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Mapping
 
 try:
@@ -1301,6 +1301,54 @@ def _resolve_launch_executable(
     raise RuntimeError(f"selected Desktop shell was not found in source inventory: {requested}")
 
 
+_STAGED_LAUNCH_EXECUTABLES = {
+    r"app\chatgpt.exe": "ChatGPT.exe",
+    r"app\codex.exe": "Codex.exe",
+}
+
+
+def resolve_staged_launch_path(staged_root: Path, launch_executable: str) -> Path:
+    """Resolve installation-root-relative launch metadata inside a staged tree."""
+
+    if not isinstance(launch_executable, str) or not launch_executable:
+        raise RuntimeError(
+            "desktop launch executable must be exactly app\\ChatGPT.exe or app\\Codex.exe"
+        )
+    normalized = launch_executable.replace("/", "\\")
+    windows_path = PureWindowsPath(normalized)
+    if (
+        windows_path.anchor
+        or windows_path.drive
+        or any(part in {".", ".."} for part in windows_path.parts)
+    ):
+        raise RuntimeError(
+            "desktop launch executable must be a relative app\\ChatGPT.exe or app\\Codex.exe path"
+        )
+    executable_name = _STAGED_LAUNCH_EXECUTABLES.get(normalized.casefold())
+    if executable_name is None:
+        raise RuntimeError(
+            "desktop launch executable must be exactly app\\ChatGPT.exe or app\\Codex.exe"
+        )
+    return staged_root / "app" / executable_name
+
+
+def validate_staged_layout(required_layout: Mapping[str, Path]) -> dict[str, object]:
+    """Validate a staged install and identify every missing required file."""
+
+    missing = [
+        (name, path)
+        for name, path in required_layout.items()
+        if not path.is_file()
+    ]
+    if missing:
+        details = "; ".join(f"missing {name}={path}" for name, path in missing)
+        raise RuntimeError(f"staged Windows Desktop layout is incomplete; {details}")
+    return {
+        "status": "PASS",
+        "required_files": {name: str(path) for name, path in required_layout.items()},
+    }
+
+
 def _payload_acl_for_strategy(
     staged_app: Path,
     *,
@@ -1579,20 +1627,18 @@ def build_windows_desktop(
         (staged / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
         # The launcher owns the environment contract; this static check keeps the
         # generated layout honest without starting the official UI in Round 1.
-        if not all(
-            path.is_file()
-            for path in (
-                launcher,
-                mux,
-                staged_real,
-                staged_app / Path(selected_launch_executable.replace("\\", "/")),
-                staged_source_executable,
-                staged_resources / "app.asar",
-                staged / "launch.json",
-                staged_control_token,
-            )
-        ):
-            raise RuntimeError("staged Windows Desktop layout is incomplete")
+        selected_staged_desktop = resolve_staged_launch_path(staged, selected_launch_executable)
+        required_layout = {
+            "launcher": launcher,
+            "mux": mux,
+            "real_codex": staged_real,
+            "selected_desktop": selected_staged_desktop,
+            "source_desktop": staged_source_executable,
+            "app_asar": staged_resources / "app.asar",
+            "launch_metadata": staged / "launch.json",
+            "control_token": staged_control_token,
+        }
+        validate_staged_layout(required_layout)
         backup = _atomic_install(staged, destination, force)
     print(f"Windows Desktop staged at {destination}")
     if backup is not None:
