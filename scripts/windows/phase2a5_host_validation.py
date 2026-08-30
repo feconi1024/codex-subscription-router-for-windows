@@ -35,13 +35,16 @@ try:
         PHASE2A5_HOST_CONTEXT_BLOCKED,
         PHASE2A5_PATCHED_SHELL_BLOCKED,
         ROUTER_DESKTOP_AUTH_REQUIRED,
+        ROUTER_DESKTOP_AUTH_NOT_PERSISTED,
+        ROUTER_DESKTOP_AUTH_LOST_AFTER_REBUILD,
+        DESKTOP_AUTH_BOOT_AUTHENTICATED,
         DESKTOP_AUTH_PREPARED,
         PHASE2A5_FAIL,
         PATCHED_SHELL_PASS,
         final_layout_smoke_root,
         run_patched_shell_smoke,
         run_phase2a5_sandbox_validation,
-        validation_profile_root,
+        validation_profile_layout,
     )
     from .integrity import asar_header_digest
     from .reviewed_sources import (
@@ -71,13 +74,16 @@ except ImportError:
         PHASE2A5_HOST_CONTEXT_BLOCKED,
         PHASE2A5_PATCHED_SHELL_BLOCKED,
         ROUTER_DESKTOP_AUTH_REQUIRED,
+        ROUTER_DESKTOP_AUTH_NOT_PERSISTED,
+        ROUTER_DESKTOP_AUTH_LOST_AFTER_REBUILD,
+        DESKTOP_AUTH_BOOT_AUTHENTICATED,
         DESKTOP_AUTH_PREPARED,
         PHASE2A5_FAIL,
         PATCHED_SHELL_PASS,
         final_layout_smoke_root,
         run_patched_shell_smoke,
         run_phase2a5_sandbox_validation,
-        validation_profile_root,
+        validation_profile_layout,
     )
     from windows.integrity import asar_header_digest
     from windows.reviewed_sources import (
@@ -546,11 +552,109 @@ def _public_termination(value: object) -> dict[str, object]:
     return output
 
 
+def _public_cleanup(value: object) -> dict[str, object]:
+    """Keep cleanup evidence useful without exporting process or token payloads."""
+
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, object] = {}
+    for key in (
+        "persistent",
+        "preserved",
+        "removed",
+        "path_virtualized",
+    ):
+        if isinstance(value.get(key), bool):
+            output[key] = value[key]
+    for key in ("requested_path", "resolved_path", "path"):
+        item = value.get(key)
+        if isinstance(item, str) and len(item) <= 1000:
+            output[key] = item
+    for key in ("tracked", "requested", "terminated", "terminated_by_popen"):
+        item = value.get(key)
+        if isinstance(item, list):
+            output[key] = [pid for pid in item if type(pid) is int and pid >= 0][:200]
+    errors = value.get("errors")
+    if isinstance(errors, list):
+        output["error_count"] = len([error for error in errors if isinstance(error, str)])
+    observed = value.get("external_processes_observed")
+    if isinstance(observed, list):
+        output["external_processes_observed"] = [
+            {
+                "name": item["name"][:100],
+                "cleanup_required": False,
+            }
+            for item in observed
+            if isinstance(item, dict)
+            and isinstance(item.get("name"), str)
+            and item.get("cleanup_required") is False
+        ][:50]
+    return output
+
+
+_PUBLIC_GRACEFUL_SHUTDOWN_STATUSES = {
+    "NOT_REQUIRED",
+    "REQUESTED",
+    "EXITED",
+    "FAILED",
+    "FORCED_CLEANUP",
+}
+
+
+def _public_graceful_shutdown(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, object] = {}
+    for key in ("attempted", "requested", "succeeded"):
+        if isinstance(value.get(key), bool):
+            output[key] = value[key]
+    status = value.get("status")
+    if isinstance(status, str) and status in _PUBLIC_GRACEFUL_SHUTDOWN_STATUSES:
+        output["status"] = status
+    quiescence = value.get("quiescence_seconds")
+    if isinstance(quiescence, (int, float)) and not isinstance(quiescence, bool) and 0 <= quiescence <= 60:
+        output["quiescence_seconds"] = quiescence
+    error = value.get("error")
+    if isinstance(error, str) and len(error) <= 500:
+        output["error"] = error
+    return output
+
+
+_PUBLIC_AUTH_PERSISTENCE_STATUSES = {
+    "NOT_RUN",
+    "AUTH_REQUIRED",
+    "UNKNOWN",
+    "AUTHENTICATED",
+    "AUTHENTICATED_BUT_GRACEFUL_SHUTDOWN_FAILED",
+    "FAILED",
+}
+
+
+def _public_auth_persistence(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, object] = {}
+    for key in ("initial_login", "restart_check", "post_rebuild_check"):
+        stage = value.get(key)
+        if not isinstance(stage, dict):
+            continue
+        safe_stage: dict[str, object] = {}
+        status = stage.get("status")
+        if isinstance(status, str) and status in _PUBLIC_AUTH_PERSISTENCE_STATUSES:
+            safe_stage["status"] = status
+        graceful = stage.get("graceful_shutdown")
+        if isinstance(graceful, str) and graceful in {"PASS", "FAILED", "NOT_RUN"}:
+            safe_stage["graceful_shutdown"] = graceful
+        if safe_stage:
+            output[key] = safe_stage
+    return output
+
+
 def _public_validation_profile(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
         return {}
     output: dict[str, object] = {}
-    for key in ("root", "user_data"):
+    for key in ("root", "user_data", "codex_home", "mux_home", "patched_shell"):
         item = value.get(key)
         if isinstance(item, str) and len(item) <= 1000:
             output[key] = item
@@ -573,7 +677,7 @@ def _public_probe(result: object) -> object:
         "return_code",
         "still_running_at_timeout",
         "manual_operation_required",
-        "cleanup",
+        "graceful_shutdown",
         "profile_isolation",
         "chromium_sandbox",
         "production_sandbox_flags_present",
@@ -588,7 +692,6 @@ def _public_probe(result: object) -> object:
         "command",
         "development_only",
         "build_metadata_summary",
-        "smoke_root_cleanup",
         "go_toolchain",
     )
     output = {key: result[key] for key in allowed if key in result}
@@ -611,6 +714,12 @@ def _public_probe(result: object) -> object:
         ][-20:]
     if "termination" in result:
         output["termination"] = _public_termination(result.get("termination"))
+    if "cleanup" in result:
+        output["cleanup"] = _public_cleanup(result.get("cleanup"))
+    if "smoke_root_cleanup" in result:
+        output["smoke_root_cleanup"] = _public_cleanup(result.get("smoke_root_cleanup"))
+    if "graceful_shutdown" in result:
+        output["graceful_shutdown"] = _public_graceful_shutdown(result.get("graceful_shutdown"))
     if "windows" in result:
         output["windows"] = _public_windows(result.get("windows"))
     if "validation_profile" in result:
@@ -625,6 +734,7 @@ def _public_probe(result: object) -> object:
                 "outside_profile_touch_detected",
                 "user_data",
                 "codex_home",
+                "mux_home",
                 "code_cli_path",
                 "sparkle_enabled",
                 "argument_user_data_dir",
@@ -678,6 +788,8 @@ def _public_probe(result: object) -> object:
             "ROUTER_RENDERER_RUNTIME_ERROR",
             "ROUTER_UI_NOT_READY",
             "ROUTER_DESKTOP_AUTH_REQUIRED",
+            "ROUTER_DESKTOP_AUTH_NOT_PERSISTED",
+            "ROUTER_DESKTOP_AUTH_LOST_AFTER_REBUILD",
             "ROUTER_DESKTOP_AUTH_UNKNOWN",
             "ROUTER_PROFILE_CONTROLLER_NOT_READY",
             "ROUTER_PROFILE_ACTIVATION_FAILED",
@@ -789,11 +901,12 @@ def _public_sandbox(result: dict[str, object]) -> dict[str, object]:
         "official_package_unchanged",
         "native_evidence_usable",
         "production_acl_strategy",
-        "smoke_root_cleanup",
         "manual_operation_required",
     ):
         if key in result:
             output[key] = result[key]
+    if "smoke_root_cleanup" in result:
+        output["smoke_root_cleanup"] = _public_cleanup(result.get("smoke_root_cleanup"))
     for key in ("probe_a_normal", "probe_b_disable_gpu_sandbox", "probe_c_acl_normal_sandbox"):
         if key in result:
             output[key] = _public_probe(result[key])
@@ -805,40 +918,35 @@ def _resolve_validation_profile_root(
     local_appdata: Path,
     override: Path | None = None,
 ) -> Path:
-    """Resolve a persistent profile only inside the Router-owned local tree."""
+    """Resolve the single persistent profile boundary with shared path rules."""
 
-    owner_root = (local_appdata.expanduser() / "Codex Subscription Router").resolve(strict=False)
-    requested_root = (
-        override.expanduser()
-        if override is not None
-        else validation_profile_root(local_appdata)
+    return validation_profile_layout(local_appdata, override).root
+
+
+def _validation_profile_summary(root: Path, local_appdata: Path | None = None) -> dict[str, object]:
+    layout = validation_profile_layout(local_appdata, root)
+    return layout.to_dict(
+        exists=all(
+            path.is_dir()
+            for path in (layout.user_data, layout.codex_home, layout.mux_home)
+        ),
+        preserved=True,
     )
-    # Windows may expose the same directory through an 8.3 alias (for
-    # example ``RUNNER~1``) in one value and its long name in another. Resolve
-    # both the ownership boundary and the selected profile before comparing
-    # them, otherwise a valid profile can be rejected as being outside the
-    # Router-owned tree on hosted runners.
-    root = requested_root.resolve(strict=False)
-    if "windowsapps" in str(root).casefold():
-        raise RuntimeError("the persistent Router validation profile must be outside WindowsApps")
+
+
+def _persistent_profile_state_is_intact(layout: object) -> bool:
+    if not hasattr(layout, "root"):
+        return False
+    paths = (
+        layout.root,
+        layout.user_data,
+        layout.codex_home,
+        layout.mux_home,
+    )
     try:
-        root.relative_to(owner_root)
-    except ValueError as error:
-        raise RuntimeError(
-            "the persistent Router validation profile must remain under the Router-owned local app tree"
-        ) from error
-    return root
-
-
-def _validation_profile_summary(root: Path) -> dict[str, object]:
-    user_data = root / "User Data"
-    return {
-        "root": str(root),
-        "user_data": str(user_data),
-        "persistent": True,
-        "preserved": True,
-        "exists": user_data.is_dir(),
-    }
+        return all(path.is_dir() and not path.is_symlink() for path in paths)
+    except OSError:
+        return False
 
 
 def _run_external_patched_shell(
@@ -850,6 +958,7 @@ def _run_external_patched_shell(
     reviewed_source: Mapping[str, object] | None = None,
     go_toolchain: Mapping[str, object] | None = None,
     validation_profile_root: Path | None = None,
+    local_appdata: Path | None = None,
 ) -> dict[str, object]:
     """Build and smoke either a disposable shell or the persistent auth shell."""
 
@@ -863,6 +972,24 @@ def _run_external_patched_shell(
         }
 
     persistent = validation_profile_root is not None
+    persistent_local_appdata = local_appdata
+    profile_layout = None
+    if persistent:
+        try:
+            if persistent_local_appdata is None:
+                persistent_local_appdata = (
+                    validation_profile_root.expanduser().resolve(strict=False).parent.parent
+                )
+            profile_layout = validation_profile_layout(
+                persistent_local_appdata,
+                validation_profile_root,
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            return {
+                "status": PHASE2A5_PATCHED_SHELL_BLOCKED,
+                "reason": f"persistent validation profile was rejected: {_safe_error(error)}",
+                "manual_operation_required": True,
+            }
     cleanup: dict[str, object] = {}
     result: dict[str, object]
     try:
@@ -872,6 +999,7 @@ def _run_external_patched_shell(
             prefix="phase2a5-patched-",
             persistent=persistent,
             persistent_root=validation_profile_root,
+            persistent_local_appdata=persistent_local_appdata,
         ) as root:
             if cleanup.get("path_virtualized") is True:
                 result = {
@@ -880,7 +1008,7 @@ def _run_external_patched_shell(
                     "manual_operation_required": True,
                 }
             else:
-                destination = root / "patched-shell"
+                destination = profile_layout.patched_shell if profile_layout is not None else root / "patched-shell"
                 metadata = build_windows_desktop(
                     source,
                     selected_real,
@@ -889,16 +1017,21 @@ def _run_external_patched_shell(
                     allow_untested_source=False,
                     reviewed_source=reviewed_source,
                     payload_acl_strategy=acl_strategy,
+                    mux_home_override=(profile_layout.mux_home if profile_layout is not None else None),
+                    validation_profile_local_appdata=persistent_local_appdata,
                 )
                 result = run_patched_shell_smoke(
                     destination,
                     selected_real,
                     timeout_seconds=timeout_seconds,
                     disposable_root=not persistent,
-                    user_data_override=(root / "User Data") if persistent else None,
+                    user_data_override=(profile_layout.user_data if profile_layout is not None else None),
+                    codex_home_override=(profile_layout.codex_home if profile_layout is not None else None),
+                    mux_home_override=(profile_layout.mux_home if profile_layout is not None else None),
                     preserve_user_data=persistent,
                     auth_required=persistent,
                     validation_profile_root_override=root if persistent else None,
+                    validation_profile_local_appdata=persistent_local_appdata,
                 )
                 result["build_metadata_summary"] = {
                     "destination": str(destination),
@@ -921,18 +1054,60 @@ def _run_external_patched_shell(
         result["reason"] = "the disposable patched-shell root was not cleaned up successfully"
         result["manual_operation_required"] = True
     if persistent:
-        result["validation_profile"] = {
-            "root": str(validation_profile_root),
-            "user_data": str(validation_profile_root / "User Data"),
-            "persistent": True,
-            "preserved": cleanup.get("preserved") is True,
-            "exists": (validation_profile_root / "User Data").is_dir(),
-            "authenticated": (
+        if profile_layout is not None:
+            result["validation_profile"] = profile_layout.to_dict(
+                exists=_persistent_profile_state_is_intact(profile_layout),
+                preserved=cleanup.get("preserved") is True,
+            )
+            result["validation_profile"]["authenticated"] = (
                 isinstance(result.get("desktop_auth"), dict)
                 and result["desktop_auth"].get("state") == "AUTHENTICATED"
-            ),
-        }
+            )
+            if not _persistent_profile_state_is_intact(profile_layout):
+                result["status"] = PHASE2A5_PATCHED_SHELL_BLOCKED
+                result["reason"] = "persistent Router state roots were not preserved outside patched-shell"
+                result["manual_operation_required"] = True
     return result
+
+
+def _auth_state_from_boot(boot: object) -> str:
+    if not isinstance(boot, dict):
+        return "UNKNOWN"
+    auth = boot.get("desktop_auth")
+    state = auth.get("state") if isinstance(auth, dict) else None
+    return state if state in {"AUTHENTICATED", "AUTH_REQUIRED", "UNKNOWN"} else "UNKNOWN"
+
+
+def _auth_boot_succeeded(boot: object) -> bool:
+    if not isinstance(boot, dict):
+        return False
+    return (
+        _auth_state_from_boot(boot) == "AUTHENTICATED"
+        and isinstance(boot.get("graceful_shutdown"), dict)
+        and boot["graceful_shutdown"].get("succeeded") is True
+    )
+
+
+def _auth_persistence_stage(boot: object) -> dict[str, str]:
+    state = _auth_state_from_boot(boot)
+    graceful = (
+        boot.get("graceful_shutdown")
+        if isinstance(boot, dict) and isinstance(boot.get("graceful_shutdown"), dict)
+        else {}
+    )
+    if state == "AUTHENTICATED" and graceful.get("succeeded") is True:
+        status = "AUTHENTICATED"
+        graceful_status = "PASS"
+    elif state == "AUTHENTICATED":
+        status = "AUTHENTICATED_BUT_GRACEFUL_SHUTDOWN_FAILED"
+        graceful_status = "FAILED"
+    elif state == "AUTH_REQUIRED":
+        status = "AUTH_REQUIRED"
+        graceful_status = "NOT_RUN"
+    else:
+        status = "UNKNOWN" if isinstance(boot, dict) else "FAILED"
+        graceful_status = "NOT_RUN"
+    return {"status": status, "graceful_shutdown": graceful_status}
 
 
 def prepare_desktop_auth(
@@ -944,7 +1119,7 @@ def prepare_desktop_auth(
     artifact_path: Path | None = None,
     validation_profile: Path | None = None,
 ) -> dict[str, object]:
-    """Build and foreground-launch the persistent profile for manual login."""
+    """Prepare persistent Desktop authentication and prove it survives restart/rebuild."""
 
     repo_root = repo_root.expanduser().resolve(strict=False)
     runtime = collect_startup_runtime(repo_root)
@@ -964,6 +1139,13 @@ def prepare_desktop_auth(
         "real_codex": None,
         "patched_shell": None,
         "validation_profile": None,
+        "auth_boots": [],
+        "auth_persistence": {
+            "initial_login": {"status": "NOT_RUN", "graceful_shutdown": "NOT_RUN"},
+            "restart_check": {"status": "NOT_RUN", "graceful_shutdown": "NOT_RUN"},
+            "post_rebuild_check": {"status": "NOT_RUN", "graceful_shutdown": "NOT_RUN"},
+        },
+        "rebuild": None,
         "manual_operation_required": True,
     }
 
@@ -1049,51 +1231,64 @@ def prepare_desktop_auth(
             "candidates": [str(candidate.path) for candidate in real_candidates],
         }
         local_appdata = Path(raw_local_appdata) if isinstance(raw_local_appdata, str) and raw_local_appdata else Path.home() / "AppData" / "Local"
-        profile_root = _resolve_validation_profile_root(local_appdata, validation_profile)
-        profile_root.mkdir(parents=True, exist_ok=True)
-        (profile_root / "User Data").mkdir(parents=True, exist_ok=True)
-        result["validation_profile"] = _validation_profile_summary(profile_root)
+        layout = validation_profile_layout(local_appdata, validation_profile)
+        layout.root.mkdir(parents=True, exist_ok=True)
+        for path in (layout.user_data, layout.codex_home, layout.mux_home):
+            if path.is_symlink():
+                raise RuntimeError(f"refusing a symlinked persistent Router state path: {path}")
+            path.mkdir(parents=True, exist_ok=True)
+        result["validation_profile"] = layout.to_dict(
+            exists=_persistent_profile_state_is_intact(layout),
+            preserved=True,
+        )
 
-        destination = profile_root / "patched-shell"
-        metadata = build_windows_desktop(
-            source,
-            selected_real,
-            destination,
-            force=True,
-            allow_untested_source=False,
-            reviewed_source=reviewed_source,
-            payload_acl_strategy=PAYLOAD_ACL_NONE,
-        )
-        prepared = run_patched_shell_smoke(
-            destination,
-            selected_real,
-            timeout_seconds=max(float(timeout_seconds), 60.0),
-            disposable_root=False,
-            user_data_override=profile_root / "User Data",
-            preserve_user_data=True,
-            auth_required=True,
-            authentication_preparation=True,
-            validation_profile_root_override=profile_root,
-        )
-        prepared["build_metadata_summary"] = _public_build_metadata_summary(
-            {
+        destination = layout.patched_shell
+
+        def build_profile() -> dict[str, object]:
+            metadata = build_windows_desktop(
+                source,
+                selected_real,
+                destination,
+                force=True,
+                allow_untested_source=False,
+                reviewed_source=reviewed_source,
+                payload_acl_strategy=PAYLOAD_ACL_NONE,
+                mux_home_override=layout.mux_home,
+                validation_profile_local_appdata=local_appdata,
+            )
+            return {
                 "destination": str(destination),
+                "force": True,
                 "desktop_launch_executable": metadata.get("desktop_launch_executable"),
                 "payload_acl_strategy": metadata.get("payload_acl_strategy"),
                 "source_app_asar_sha256": metadata.get("source_app_asar_sha256"),
                 "renderer_syntax_validation": metadata.get("renderer_syntax_validation"),
             }
-        )
-        result["patched_shell"] = prepared
-        if prepared.get("status") == DESKTOP_AUTH_PREPARED:
-            result.update(
-                {
-                    "status": DESKTOP_AUTH_PREPARED,
-                    "reason": "manual Desktop login was detected and the Router validation profile was preserved",
-                    "manual_operation_required": False,
-                }
+
+        def boot(*, fail_if_auth_required: bool) -> dict[str, object]:
+            return run_patched_shell_smoke(
+                destination,
+                selected_real,
+                timeout_seconds=max(float(timeout_seconds), 60.0),
+                disposable_root=False,
+                user_data_override=layout.user_data,
+                codex_home_override=layout.codex_home,
+                mux_home_override=layout.mux_home,
+                preserve_user_data=True,
+                auth_required=True,
+                authentication_preparation=True,
+                fail_if_auth_required=fail_if_auth_required,
+                validation_profile_root_override=layout.root,
+                validation_profile_local_appdata=local_appdata,
             )
-        elif prepared.get("status") == ROUTER_DESKTOP_AUTH_REQUIRED:
+
+        initial_build = build_profile()
+        first_boot = boot(fail_if_auth_required=False)
+        first_boot["build_metadata_summary"] = _public_build_metadata_summary(initial_build)
+        result["auth_boots"].append(first_boot)
+        result["patched_shell"] = first_boot
+        result["auth_persistence"]["initial_login"] = _auth_persistence_stage(first_boot)
+        if _auth_state_from_boot(first_boot) != "AUTHENTICATED":
             result.update(
                 {
                     "status": ROUTER_DESKTOP_AUTH_REQUIRED,
@@ -1101,14 +1296,86 @@ def prepare_desktop_auth(
                     "manual_operation_required": True,
                 }
             )
-        else:
+            return finish()
+        if not _auth_boot_succeeded(first_boot) or not _persistent_profile_state_is_intact(layout):
             result.update(
                 {
                     "status": PHASE2A5_PATCHED_SHELL_BLOCKED,
-                    "reason": prepared.get("reason", "Desktop authentication preparation did not complete"),
+                    "reason": "initial authenticated Desktop boot did not finish with graceful shutdown and preserved state",
                     "manual_operation_required": True,
                 }
             )
+            return finish()
+
+        second_boot = boot(fail_if_auth_required=True)
+        result["auth_boots"].append(second_boot)
+        result["patched_shell"] = second_boot
+        result["auth_persistence"]["restart_check"] = _auth_persistence_stage(second_boot)
+        if _auth_state_from_boot(second_boot) != "AUTHENTICATED":
+            result.update(
+                {
+                    "status": ROUTER_DESKTOP_AUTH_NOT_PERSISTED,
+                    "reason": "Desktop authentication was not available on the second boot without manual interaction",
+                    "manual_operation_required": True,
+                }
+            )
+            return finish()
+        if not _auth_boot_succeeded(second_boot) or not _persistent_profile_state_is_intact(layout):
+            result.update(
+                {
+                    "status": PHASE2A5_PATCHED_SHELL_BLOCKED,
+                    "reason": "second authenticated Desktop boot did not finish with graceful shutdown and preserved state",
+                    "manual_operation_required": True,
+                }
+            )
+            return finish()
+
+        rebuild = build_profile()
+        result["rebuild"] = _public_build_metadata_summary(rebuild)
+        if not _persistent_profile_state_is_intact(layout):
+            result.update(
+                {
+                    "status": PHASE2A5_PATCHED_SHELL_BLOCKED,
+                    "reason": "persistent Router state roots were not preserved across the forced patched-shell rebuild",
+                    "manual_operation_required": True,
+                }
+            )
+            return finish()
+
+        third_boot = boot(fail_if_auth_required=True)
+        result["auth_boots"].append(third_boot)
+        result["patched_shell"] = third_boot
+        result["auth_persistence"]["post_rebuild_check"] = _auth_persistence_stage(third_boot)
+        if _auth_state_from_boot(third_boot) != "AUTHENTICATED":
+            result.update(
+                {
+                    "status": ROUTER_DESKTOP_AUTH_LOST_AFTER_REBUILD,
+                    "reason": "Desktop authentication was lost after rebuilding patched-shell",
+                    "manual_operation_required": True,
+                }
+            )
+            return finish()
+        if not _auth_boot_succeeded(third_boot) or not _persistent_profile_state_is_intact(layout):
+            result.update(
+                {
+                    "status": PHASE2A5_PATCHED_SHELL_BLOCKED,
+                    "reason": "post-rebuild authenticated Desktop boot did not finish with graceful shutdown and preserved state",
+                    "manual_operation_required": True,
+                }
+            )
+            return finish()
+
+        result.update(
+            {
+                "status": DESKTOP_AUTH_PREPARED,
+                "reason": "Desktop authentication survived restart and forced patched-shell rebuild",
+                "validation_profile": layout.to_dict(
+                    exists=_persistent_profile_state_is_intact(layout),
+                    preserved=True,
+                ),
+                "manual_operation_required": False,
+            }
+        )
     except (PackagingBlockedError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         result.update({"status": PHASE2A5_FAIL, "reason": _safe_error(error), "manual_operation_required": True})
     return finish()
@@ -1135,6 +1402,9 @@ def _artifact_result(result: dict[str, object]) -> dict[str, object]:
         "acl_strategy_verdict",
         "patched_shell",
         "validation_profile",
+        "auth_boots",
+        "auth_persistence",
+        "rebuild",
         "mux_chain",
         "ci",
         "phase2b_ready",
@@ -1148,6 +1418,12 @@ def _artifact_result(result: dict[str, object]) -> dict[str, object]:
             output[key] = _public_probe(result[key])
         elif key == "validation_profile":
             output[key] = _public_validation_profile(result[key])
+        elif key == "auth_boots":
+            output[key] = [_public_probe(item) for item in result[key] if isinstance(item, dict)]
+        elif key == "auth_persistence":
+            output[key] = _public_auth_persistence(result[key])
+        elif key == "rebuild":
+            output[key] = _public_build_metadata_summary(result[key])
         else:
             output[key] = result[key]
     return output
@@ -1266,7 +1542,7 @@ def run_phase2a5_host_validation(
         if artifact_path is not None:
             write_artifact(artifact_path, result)
         return result
-    result["validation_profile"] = _validation_profile_summary(profile_root)
+    result["validation_profile"] = _validation_profile_summary(profile_root, local_appdata)
 
     try:
         source, diagnostics = discover_desktop_source(source_override)
@@ -1347,6 +1623,7 @@ def run_phase2a5_host_validation(
                             else None
                         ),
                         validation_profile_root=profile_root,
+                        local_appdata=local_appdata,
                     )
                     result["patched_shell"] = patched
                     result["mux_chain"] = {
@@ -1494,10 +1771,17 @@ def main() -> int:
             validation_profile=args.validation_profile,
         )
         if result.get("manual_operation_required"):
-            print(
-                "Manual operation required: complete normal ChatGPT login in the opened "
-                "Router validation window; credentials are never read by this workflow."
-            )
+            if result.get("status") == ROUTER_DESKTOP_AUTH_REQUIRED:
+                print(
+                    "Manual operation required: complete normal ChatGPT login in the opened "
+                    "Router validation window; credentials are never read by this workflow."
+                )
+            else:
+                print(
+                    "Manual operation required: inspect the persistent desktop-auth result "
+                    "and resolve the reported state before retrying; credentials are never "
+                    "read by this workflow."
+                )
         print(f"Phase 2A.5 Desktop authentication preparation: {result.get('status')}")
         print(json.dumps(_artifact_result(result), indent=2, ensure_ascii=False))
         return 0 if result.get("status") == DESKTOP_AUTH_PREPARED else 1

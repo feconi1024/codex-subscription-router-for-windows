@@ -85,6 +85,7 @@ try:
         run_phase2a4_sandbox_validation,
         run_smoke_launch_matrix,
         run_unmodified_mirror_smoke,
+        validation_profile_layout,
     )
     from .windows.mirror import (
         MirrorReport,
@@ -167,6 +168,7 @@ except ImportError:
         run_phase2a4_sandbox_validation,
         run_smoke_launch_matrix,
         run_unmodified_mirror_smoke,
+        validation_profile_layout,
     )
     from windows.mirror import (
         MirrorReport,
@@ -1442,6 +1444,8 @@ def build_windows_desktop(
     bootstrap_user_data_patch: bool | None = None,
     bootstrap_disable_updater: bool | None = None,
     payload_acl_strategy: str | None = None,
+    mux_home_override: Path | None = None,
+    validation_profile_local_appdata: Path | None = None,
 ) -> dict[str, object]:
     destination = destination.expanduser().resolve(strict=False)
     if (
@@ -1503,7 +1507,36 @@ def build_windows_desktop(
         )
     go_executable = go_executable_or_raise()
     asar = ensure_asar_tool()
-    token = load_or_create_token()
+    persistent_mux_home = (
+        mux_home_override.expanduser().resolve(strict=False)
+        if mux_home_override is not None
+        else None
+    )
+    if persistent_mux_home is not None:
+        if validation_profile_local_appdata is not None:
+            profile_local_appdata_path = validation_profile_local_appdata
+        else:
+            profile_local_appdata = os.environ.get("LOCALAPPDATA")
+            profile_local_appdata_path = (
+                Path(profile_local_appdata)
+                if profile_local_appdata
+                else persistent_mux_home.parent.parent.parent
+            )
+        try:
+            profile_layout = validation_profile_layout(
+                profile_local_appdata_path,
+                persistent_mux_home.parent,
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            raise RuntimeError(f"persistent CODEX_MUX_HOME is outside the Router validation profile: {error}") from error
+        if persistent_mux_home != profile_layout.mux_home:
+            raise RuntimeError("persistent CODEX_MUX_HOME must be the validation profile's mux-home directory")
+        if any(path.is_symlink() for path in (profile_layout.root, profile_layout.user_data, profile_layout.codex_home, persistent_mux_home)):
+            raise RuntimeError("persistent Router validation state cannot use symlinked paths")
+        if persistent_mux_home == destination or persistent_mux_home.is_relative_to(destination):
+            raise RuntimeError("persistent CODEX_MUX_HOME must remain outside patched-shell")
+        persistent_mux_home.mkdir(parents=True, exist_ok=True)
+    token = load_or_create_token(persistent_mux_home)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".codex-router-windows-", dir=destination.parent) as temporary:
         temporary_root = Path(temporary)
@@ -1611,18 +1644,20 @@ def build_windows_desktop(
             copy_unpacked_tree(generated_unpacked, staged_resources / "app.asar.unpacked")
 
         staged_runtime.mkdir(parents=True, exist_ok=True)
-        staged_mux_home = staged_runtime / ".codex-mux"
-        staged_mux_home.mkdir(parents=True, exist_ok=True)
-        # The launcher deliberately points the mux at the Router-owned state
-        # directory. Copy the already validated local control token into that
-        # disposable staging tree so the patched renderer and mux authenticate
-        # to the same local server without falling back to the official state.
-        staged_control_token = staged_mux_home / "control-token"
-        staged_control_token.write_text(token + "\n", encoding="utf-8")
-        try:
-            staged_control_token.chmod(0o600)
-        except OSError:
-            pass
+        staged_mux_home = None
+        if persistent_mux_home is None:
+            staged_mux_home = staged_runtime / ".codex-mux"
+            staged_mux_home.mkdir(parents=True, exist_ok=True)
+            # Disposable builds keep their token beside the runtime. Persistent
+            # builds keep the complete mux home outside patched-shell instead.
+            staged_control_token = staged_mux_home / "control-token"
+            staged_control_token.write_text(token + "\n", encoding="utf-8")
+            try:
+                staged_control_token.chmod(0o600)
+            except OSError:
+                pass
+        else:
+            staged_control_token = persistent_mux_home / "control-token"
         mux = staged_runtime / "codex-mux.exe"
         staged_real = staged_runtime / "codex.real.exe"
         launcher = staged / "Codex Subscription Router.exe"
@@ -1630,8 +1665,9 @@ def build_windows_desktop(
         build_go_binary("./cmd/codex-router-launcher", launcher, go_executable)
         copy_byte_identical(real.path, staged_real)
 
-        (staged / "User Data").mkdir(parents=True, exist_ok=True)
-        (staged / "codex-home").mkdir(parents=True, exist_ok=True)
+        if persistent_mux_home is None:
+            (staged / "User Data").mkdir(parents=True, exist_ok=True)
+            (staged / "codex-home").mkdir(parents=True, exist_ok=True)
         launch_config = {
             "schema_version": 1,
             "desktop_launch_executable": selected_launch_executable,
@@ -1660,6 +1696,23 @@ def build_windows_desktop(
             "status": "PATCHABLE" if reviewed_ok else "GENERIC_TEST_ESCAPE_HATCH",
             "reason": reviewed_reason,
         }
+        metadata["state_boundary"] = {
+            "persistent": persistent_mux_home is not None,
+            "user_data": (
+                str(persistent_mux_home.parent / "User Data")
+                if persistent_mux_home is not None
+                else str(staged / "User Data")
+            ),
+            "codex_home": (
+                str(persistent_mux_home.parent / "codex-home")
+                if persistent_mux_home is not None
+                else str(staged / "codex-home")
+            ),
+            "mux_home": str(persistent_mux_home or staged_mux_home),
+            "persistent_state_outside_patched_shell": persistent_mux_home is not None,
+        }
+        if persistent_mux_home is not None:
+            metadata["staged_layout"]["user_data"] = None
         (staged / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
         # The launcher owns the environment contract; this static check keeps the
         # generated layout honest without starting the official UI in Round 1.

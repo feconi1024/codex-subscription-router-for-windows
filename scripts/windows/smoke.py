@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
 import urllib.error
@@ -98,6 +99,10 @@ DIRECT_LAUNCH_FAIL = "DIRECT_LAUNCH_FAIL"
 MINIMAL_BOOTSTRAP_PASS = "MINIMAL_BOOTSTRAP_PASS"
 MINIMAL_BOOTSTRAP_IDENTITY_BLOCKED = "MINIMAL_BOOTSTRAP_IDENTITY_BLOCKED"
 MINIMAL_BOOTSTRAP_FAIL = "MINIMAL_BOOTSTRAP_FAIL"
+
+DESKTOP_AUTH_BOOT_AUTHENTICATED = "DESKTOP_AUTH_BOOT_AUTHENTICATED"
+ROUTER_DESKTOP_AUTH_NOT_PERSISTED = "ROUTER_DESKTOP_AUTH_NOT_PERSISTED"
+ROUTER_DESKTOP_AUTH_LOST_AFTER_REBUILD = "ROUTER_DESKTOP_AUTH_LOST_AFTER_REBUILD"
 
 
 # These are intentionally narrow. In particular, a path containing
@@ -365,9 +370,10 @@ def _profile_path_evidence(
     *,
     user_data: Path,
     codex_home: Path,
+    mux_home: Path | None = None,
     real_codex: Path,
 ) -> dict[str, object]:
-    allowed = (user_data, codex_home, real_codex.parent)
+    allowed = tuple(path for path in (user_data, codex_home, mux_home, real_codex.parent) if path is not None)
     production_markers = (
         r"\\\.codex(?:\\|$)",
         r"\\appdata\\roaming\\codex(?:\\|$)",
@@ -725,6 +731,39 @@ def native_evidence_is_usable(cleanup_status: dict[str, object]) -> bool:
 
 def validation_profile_root(local_appdata: Path | None = None) -> Path:
     """Return the Router-owned persistent Desktop validation profile root."""
+    return validation_profile_layout(local_appdata).root
+
+
+@dataclass(frozen=True)
+class ValidationProfileLayout:
+    """The persistent state boundary and the rebuildable shell location."""
+
+    root: Path
+    user_data: Path
+    codex_home: Path
+    mux_home: Path
+    patched_shell: Path
+
+    def to_dict(self, *, exists: bool | None = None, preserved: bool = True) -> dict[str, object]:
+        result: dict[str, object] = {
+            "root": str(self.root),
+            "user_data": str(self.user_data),
+            "codex_home": str(self.codex_home),
+            "mux_home": str(self.mux_home),
+            "patched_shell": str(self.patched_shell),
+            "persistent": True,
+            "preserved": preserved,
+        }
+        if exists is not None:
+            result["exists"] = exists
+        return result
+
+
+def validation_profile_layout(
+    local_appdata: Path | None = None,
+    profile_root: Path | None = None,
+) -> ValidationProfileLayout:
+    """Resolve every persistent path under the Router-owned profile boundary."""
 
     if local_appdata is None:
         local_appdata_value = os.environ.get("LOCALAPPDATA")
@@ -733,10 +772,33 @@ def validation_profile_root(local_appdata: Path | None = None) -> Path:
             if local_appdata_value
             else Path.home() / "AppData" / "Local"
         )
-    root = local_appdata.expanduser() / "Codex Subscription Router" / VALIDATION_PROFILE_DIRNAME
+    owner_root = (local_appdata.expanduser() / "Codex Subscription Router").resolve(strict=False)
+    expected_root = (owner_root / VALIDATION_PROFILE_DIRNAME).resolve(strict=False)
+    requested_root = profile_root.expanduser() if profile_root is not None else expected_root
+    root = requested_root.resolve(strict=False)
     if is_windowsapps_path(root):
         raise RuntimeError("the Router validation profile must be outside WindowsApps")
-    return root
+    if root != expected_root:
+        raise RuntimeError(
+            "the persistent Router validation profile must remain under "
+            "%LOCALAPPDATA%\\Codex Subscription Router\\_validation-profile"
+        )
+    layout = ValidationProfileLayout(
+        root=root,
+        user_data=root / VALIDATION_USER_DATA_DIRNAME,
+        codex_home=root / VALIDATION_CODEX_HOME_DIRNAME,
+        mux_home=root / VALIDATION_MUX_HOME_DIRNAME,
+        patched_shell=root / VALIDATION_PATCHED_SHELL_DIRNAME,
+    )
+    for name, path in (
+        ("User Data", layout.user_data),
+        ("CODEX_HOME", layout.codex_home),
+        ("CODEX_MUX_HOME", layout.mux_home),
+        ("patched-shell", layout.patched_shell),
+    ):
+        if is_windowsapps_path(path) or not path_is_within(path, layout.root):
+            raise RuntimeError(f"persistent {name} escaped the Router validation profile")
+    return layout
 
 
 ROUTER_RENDERER_NOT_LOADED = "ROUTER_RENDERER_NOT_LOADED"
@@ -753,6 +815,11 @@ ROUTER_MENU_ACCOUNTS_LOADING = "ROUTER_MENU_ACCOUNTS_LOADING"
 ROUTER_MENU_ACCOUNTS_LOAD_FAILED = "ROUTER_MENU_ACCOUNTS_LOAD_FAILED"
 DESKTOP_AUTH_PREPARED = "DESKTOP_AUTH_PREPARED"
 VALIDATION_PROFILE_DIRNAME = "_validation-profile"
+VALIDATION_USER_DATA_DIRNAME = "User Data"
+VALIDATION_CODEX_HOME_DIRNAME = "codex-home"
+VALIDATION_MUX_HOME_DIRNAME = "mux-home"
+VALIDATION_PATCHED_SHELL_DIRNAME = "patched-shell"
+AUTH_PERSISTENCE_QUIESCENCE_SECONDS = 2.0
 
 _DESKTOP_AUTH_STATES = {"AUTHENTICATED", "AUTH_REQUIRED", "UNKNOWN"}
 
@@ -976,16 +1043,22 @@ def run_patched_shell_smoke(
     diagnostic_arguments: Iterable[str] = (),
     development_only: bool = False,
     user_data_override: Path | None = None,
+    codex_home_override: Path | None = None,
+    mux_home_override: Path | None = None,
     preserve_user_data: bool = False,
     auth_required: bool = False,
     authentication_preparation: bool = False,
+    fail_if_auth_required: bool = False,
     validation_profile_root_override: Path | None = None,
+    validation_profile_local_appdata: Path | None = None,
 ) -> dict[str, object]:
-    """Launch a disposable built Router and verify the production path contract.
+    """Launch a built Router and verify the production path contract.
 
     This probe never logs in, sends account mutations, or removes an
     installation. ``disposable_root`` is explicit so callers cannot
     accidentally point the probe at a user's existing Router installation.
+    Persistent authenticated validation must provide the complete
+    ``ValidationProfileLayout`` boundary through the three override paths.
     """
     if os.name != "nt":
         return {
@@ -1009,7 +1082,16 @@ def run_patched_shell_smoke(
             "manual_operation_required": True,
         }
     root = installation_root.expanduser().resolve(strict=False)
-    if not disposable_root and user_data_override is None:
+    persistent_requested = any(
+        value is not None
+        for value in (
+            user_data_override,
+            codex_home_override,
+            mux_home_override,
+            validation_profile_root_override,
+        )
+    )
+    if not disposable_root and not persistent_requested:
         return {
             "status": PATCHED_SHELL_BLOCKED,
             "reason": "patched-shell smoke requires an explicitly disposable Router root or an explicit validation profile",
@@ -1026,47 +1108,144 @@ def run_patched_shell_smoke(
 
     launcher = root / "Codex Subscription Router.exe"
     app_root = root / "app"
-    user_data = (
-        user_data_override.expanduser().resolve(strict=False)
-        if user_data_override is not None
-        else root / "User Data"
-    )
-    if user_data_override is not None:
-        validation_root = (
-            validation_profile_root_override.expanduser().resolve(strict=False)
-            if validation_profile_root_override is not None
-            else validation_profile_root()
-        )
-        if is_windowsapps_path(validation_root) or not path_is_within(user_data, validation_root) or is_windowsapps_path(user_data):
+    profile_layout: ValidationProfileLayout | None = None
+    if persistent_requested:
+        try:
+            profile_layout = validation_profile_layout(
+                local_appdata=(
+                    validation_profile_local_appdata
+                    if validation_profile_local_appdata is not None
+                    else (
+                        validation_profile_root_override.expanduser().resolve(strict=False).parent.parent
+                        if validation_profile_root_override is not None
+                        else None
+                    )
+                ),
+                profile_root=(
+                    validation_profile_root_override
+                    if validation_profile_root_override is not None
+                    else None
+                )
+            )
+        except (OSError, RuntimeError, ValueError) as error:
             return {
                 "status": PATCHED_SHELL_BLOCKED,
-                "reason": "user-data override must remain inside the Router-owned validation profile",
+                "reason": f"persistent validation profile was rejected: {error}",
                 "installation_root": str(root),
+                "manual_operation_required": True,
+            }
+        if root != profile_layout.patched_shell:
+            return {
+                "status": PATCHED_SHELL_BLOCKED,
+                "reason": "persistent patched-shell smoke must launch the profile's patched-shell directory",
+                "installation_root": str(root),
+                "validation_profile": profile_layout.to_dict(),
                 "manual_operation_required": True,
             }
         if not preserve_user_data:
             return {
                 "status": PATCHED_SHELL_BLOCKED,
-                "reason": "persistent validation user data requires explicit preservation",
+                "reason": "persistent validation state requires explicit preservation",
                 "installation_root": str(root),
+                "validation_profile": profile_layout.to_dict(),
                 "manual_operation_required": True,
             }
-        user_data.mkdir(parents=True, exist_ok=True)
-    if auth_required and user_data_override is None:
+        overrides = {
+            "User Data": user_data_override,
+            "CODEX_HOME": codex_home_override,
+            "CODEX_MUX_HOME": mux_home_override,
+        }
+        expected_paths = {
+            "User Data": profile_layout.user_data,
+            "CODEX_HOME": profile_layout.codex_home,
+            "CODEX_MUX_HOME": profile_layout.mux_home,
+        }
+        for name, override in overrides.items():
+            if override is not None and override.expanduser().resolve(strict=False) != expected_paths[name]:
+                return {
+                    "status": PATCHED_SHELL_BLOCKED,
+                    "reason": f"persistent {name} override must equal its Router-owned validation profile path",
+                    "installation_root": str(root),
+                    "validation_profile": profile_layout.to_dict(),
+                    "manual_operation_required": True,
+                }
+        if auth_required and any(override is None for override in overrides.values()):
+            return {
+                "status": PATCHED_SHELL_BLOCKED,
+                "reason": "authenticated Desktop validation requires explicit User Data, CODEX_HOME, and CODEX_MUX_HOME overrides",
+                "installation_root": str(root),
+                "validation_profile": profile_layout.to_dict(),
+                "manual_operation_required": True,
+            }
+        user_data = expected_paths["User Data"]
+        codex_home = expected_paths["CODEX_HOME"]
+        mux_home = expected_paths["CODEX_MUX_HOME"]
+        for name, path in expected_paths.items():
+            if is_windowsapps_path(path) or not path_is_within(path, profile_layout.root):
+                return {
+                    "status": PATCHED_SHELL_BLOCKED,
+                    "reason": f"persistent {name} escaped the Router-owned validation profile",
+                    "installation_root": str(root),
+                    "validation_profile": profile_layout.to_dict(),
+                    "manual_operation_required": True,
+                }
+            if path.is_symlink():
+                return {
+                    "status": PATCHED_SHELL_BLOCKED,
+                    "reason": f"refusing a symlinked persistent {name} path",
+                    "installation_root": str(root),
+                    "validation_profile": profile_layout.to_dict(),
+                    "manual_operation_required": True,
+                }
+            path.mkdir(parents=True, exist_ok=True)
+    else:
+        user_data = root / VALIDATION_USER_DATA_DIRNAME
+        codex_home = root / VALIDATION_CODEX_HOME_DIRNAME
+        runtime = root / "runtime"
+        mux_home = runtime / ".codex-mux"
+    if auth_required and not persistent_requested:
         return {
             "status": PATCHED_SHELL_BLOCKED,
             "reason": "authenticated Desktop validation requires the persistent Router validation profile",
             "installation_root": str(root),
             "manual_operation_required": True,
         }
-    codex_home = root / "codex-home"
-    runtime = root / "runtime"
+    if persistent_requested:
+        runtime = root / "runtime"
+        forbidden_state_paths = (
+            root / VALIDATION_USER_DATA_DIRNAME,
+            root / VALIDATION_CODEX_HOME_DIRNAME,
+            runtime / ".codex-mux",
+        )
+        if any(path.exists() for path in forbidden_state_paths):
+            return {
+                "status": PATCHED_SHELL_BLOCKED,
+                "reason": "persistent Router state must remain outside patched-shell",
+                "installation_root": str(root),
+                "validation_profile": profile_layout.to_dict() if profile_layout is not None else None,
+                "manual_operation_required": True,
+            }
     mux = runtime / "codex-mux.exe"
     staged_real = runtime / "codex.real.exe"
-    mux_home = runtime / ".codex-mux"
     control_token = mux_home / "control-token"
-    required = (launcher, app_root, user_data, codex_home, mux, staged_real, control_token)
-    missing = [str(path.relative_to(root)) for path in required if not path.exists()]
+    required = (
+        ("launcher", launcher),
+        ("app", app_root),
+        ("user_data", user_data),
+        ("codex_home", codex_home),
+        ("mux", mux),
+        ("real_codex", staged_real),
+        ("control_token", control_token),
+    )
+    missing = []
+    for name, path in required:
+        if path.exists():
+            continue
+        try:
+            display = str(path.relative_to(root))
+        except ValueError:
+            display = str(path)
+        missing.append(f"{name}={display}")
     if missing:
         return {
             "status": PATCHED_SHELL_BLOCKED,
@@ -1074,7 +1253,10 @@ def run_patched_shell_smoke(
             "installation_root": str(root),
             "manual_operation_required": False,
         }
-    if any(path.is_symlink() for path in (root, launcher, app_root, user_data, codex_home, runtime, mux, staged_real, mux_home, control_token)):
+    if any(
+        path.is_symlink()
+        for path in (root, launcher, app_root, user_data, codex_home, runtime, mux, staged_real, mux_home, control_token)
+    ):
         return {
             "status": PATCHED_SHELL_BLOCKED,
             "reason": "refusing symlinked Router smoke paths",
@@ -1095,14 +1277,14 @@ def run_patched_shell_smoke(
     except OSError as error:
         return {
             "status": PATCHED_SHELL_BLOCKED,
-            "reason": f"could not read disposable control-token: {error}",
+            "reason": f"could not read Router control-token: {error}",
             "installation_root": str(root),
             "manual_operation_required": False,
         }
     if re.fullmatch(r"[0-9a-f]{64}", token) is None:
         return {
             "status": PATCHED_SHELL_BLOCKED,
-            "reason": "disposable control-token is not a valid 32-byte hexadecimal token",
+            "reason": "Router control-token is not a valid 32-byte hexadecimal token",
             "installation_root": str(root),
             "manual_operation_required": False,
         }
@@ -1123,6 +1305,10 @@ def run_patched_shell_smoke(
             "ELECTRON_ENABLE_STACK_DUMPING": "1",
         }
     )
+    if profile_layout is not None:
+        environment["CODEX_MUX_PERSISTENT_PROFILE_ROOT"] = str(profile_layout.root)
+    else:
+        environment.pop("CODEX_MUX_PERSISTENT_PROFILE_ROOT", None)
     # The patched renderer has the repository control port compiled into its
     # request URLs. Diagnostic arguments are accepted only for the explicit,
     # disposable development-only escape hatch.
@@ -1167,6 +1353,12 @@ def run_patched_shell_smoke(
         activation_attempted = False
         activation_succeeded = False
         authentication_confirmed = False
+        authentication_confirmed_at: float | None = None
+        graceful_shutdown_attempted = False
+        graceful_shutdown_requested = False
+        graceful_shutdown_succeeded = False
+        graceful_shutdown_status = "NOT_REQUIRED"
+        graceful_shutdown_error: str | None = None
         mux_process_observed = False
         real_codex_process_observed = False
         deadline = time.monotonic() + timeout_seconds
@@ -1206,8 +1398,17 @@ def run_patched_shell_smoke(
                 activation_attempted=activation_attempted,
                 activation_succeeded=activation_succeeded,
             )
-            if router_account_menu.get("desktop_auth", {}).get("state") == "AUTHENTICATED":
+            if (
+                fail_if_auth_required
+                and authentication_preparation
+                and auth_required
+                and router_account_menu.get("status") == ROUTER_DESKTOP_AUTH_REQUIRED
+            ):
+                break
+            desktop_auth = router_account_menu.get("desktop_auth")
+            if isinstance(desktop_auth, dict) and desktop_auth.get("state") == "AUTHENTICATED":
                 authentication_confirmed = True
+                authentication_confirmed_at = authentication_confirmed_at or time.monotonic()
             if (
                 not authentication_preparation
                 and authentication_confirmed
@@ -1231,7 +1432,34 @@ def run_patched_shell_smoke(
                     activation_attempted=activation_attempted,
                     activation_succeeded=activation_succeeded,
                 )
-            if authentication_preparation and authentication_confirmed:
+            if (
+                authentication_preparation
+                and authentication_confirmed
+                and authentication_confirmed_at is not None
+                and not graceful_shutdown_attempted
+                and time.monotonic() - authentication_confirmed_at >= AUTH_PERSISTENCE_QUIESCENCE_SECONDS
+                and ui_status == 200
+            ):
+                graceful_shutdown_attempted = True
+                graceful_shutdown_status = "REQUESTED"
+                action_url = (
+                    "http://127.0.0.1:48124/v1/test/app-state?"
+                    "action=desktop-auth-graceful-quit&debug=0&delayMs=0"
+                )
+                action_status, action_body, action_error = _http_json_get(
+                    action_url,
+                    headers={"x-codex-mux-token": token},
+                )
+                if action_status == 200 and isinstance(action_body, dict) and action_body.get("ok") is True:
+                    graceful_shutdown_requested = True
+                else:
+                    graceful_shutdown_status = "FAILED"
+                    graceful_shutdown_error = "graceful Desktop shutdown was not accepted"
+                    if action_error:
+                        graceful_shutdown_error = "graceful Desktop shutdown request failed"
+            if graceful_shutdown_requested and process.poll() is not None:
+                graceful_shutdown_succeeded = True
+                graceful_shutdown_status = "EXITED"
                 break
             mux_observed = any(
                 _process_path_matches(row, mux)
@@ -1251,6 +1479,7 @@ def run_patched_shell_smoke(
                 and router_account_menu["pass"]
                 and mux_process_observed
                 and real_codex_process_observed
+                and (not authentication_preparation or graceful_shutdown_succeeded)
             ):
                 break
             if process.poll() is not None:
@@ -1258,6 +1487,9 @@ def run_patched_shell_smoke(
             time.sleep(0.25)
 
         return_code = process.poll() if process is not None else None
+        if graceful_shutdown_requested and return_code is not None:
+            graceful_shutdown_succeeded = True
+            graceful_shutdown_status = "EXITED"
         final_snapshot = discover_process_snapshot_native()
         if process is not None:
             attributed.update(
@@ -1291,6 +1523,9 @@ def run_patched_shell_smoke(
                 cleanup.setdefault("terminated_by_popen", []).append(process.pid)
             except (OSError, subprocess.SubprocessError) as error:
                 cleanup.setdefault("errors", []).append(f"root cleanup: {error}")
+
+        if authentication_preparation and graceful_shutdown_attempted and not graceful_shutdown_succeeded:
+            graceful_shutdown_status = "FORCED_CLEANUP" if harness_requested_termination else "FAILED"
 
     log_text = _tail(log_path)
     if temporary_log_path is not None:
@@ -1357,7 +1592,11 @@ def run_patched_shell_smoke(
     )
     required_pass = bool(production_gate["pass"])
     if authentication_preparation:
-        required_pass = authentication_confirmed and not cleanup.get("errors")
+        required_pass = (
+            authentication_confirmed
+            and graceful_shutdown_succeeded
+            and not cleanup.get("errors")
+        )
     if development_only and not required_pass:
         required_pass = all(
             value
@@ -1365,7 +1604,7 @@ def run_patched_shell_smoke(
             if key != "production_sandbox"
         )
     status = (
-        DESKTOP_AUTH_PREPARED
+        DESKTOP_AUTH_BOOT_AUTHENTICATED
         if authentication_preparation and required_pass
         else ROUTER_DESKTOP_AUTH_REQUIRED
         if auth_required and router_account_menu.get("status") == ROUTER_DESKTOP_AUTH_REQUIRED
@@ -1378,7 +1617,7 @@ def run_patched_shell_smoke(
     return {
         "status": status,
         "reason": (
-            "persistent Desktop validation profile reached authenticated renderer state"
+            "persistent Desktop boot reached authenticated renderer state and exited gracefully"
             if authentication_preparation and required_pass
             else "the persistent Desktop validation profile requires normal interactive ChatGPT login"
             if auth_required and router_account_menu.get("status") == ROUTER_DESKTOP_AUTH_REQUIRED
@@ -1404,6 +1643,29 @@ def run_patched_shell_smoke(
             "activation_succeeded": activation_succeeded,
         },
         "runtime_errors": router_account_menu.get("runtime_errors", []),
+        "validation_profile": (
+            profile_layout.to_dict(
+                exists=all(
+                    path.is_dir()
+                    for path in (
+                        profile_layout.user_data,
+                        profile_layout.codex_home,
+                        profile_layout.mux_home,
+                    )
+                ),
+                preserved=True,
+            )
+            if profile_layout is not None
+            else None
+        ),
+        "graceful_shutdown": {
+            "attempted": graceful_shutdown_attempted,
+            "requested": graceful_shutdown_requested,
+            "succeeded": graceful_shutdown_succeeded,
+            "status": graceful_shutdown_status,
+            "quiescence_seconds": AUTH_PERSISTENCE_QUIESCENCE_SECONDS,
+            "error": graceful_shutdown_error,
+        },
         "termination": {
             "harness_timeout_reached": timeout_reached,
             "harness_requested_termination": harness_requested_termination,
@@ -1567,23 +1829,24 @@ def final_layout_smoke_root(
     prefix: str = "phase2a4-",
     persistent: bool = False,
     persistent_root: Path | None = None,
+    persistent_local_appdata: Path | None = None,
 ) -> Iterator[Path]:
     """Create a disposable root, or preserve the Router auth profile explicitly."""
     if persistent:
         if os.name != "nt":
             raise RuntimeError("persistent Desktop authentication preparation is Windows-only")
-        root = (
-            persistent_root.expanduser()
-            if persistent_root is not None
-            else validation_profile_root()
-        ).resolve(strict=False)
-        if is_windowsapps_path(root):
-            raise RuntimeError("the persistent Router validation profile must be outside WindowsApps")
+        layout = validation_profile_layout(
+            local_appdata=persistent_local_appdata,
+            profile_root=persistent_root,
+        )
+        root = layout.root
         if root.is_symlink():
             raise RuntimeError("refusing a symlinked persistent Router validation profile")
         root.mkdir(parents=True, exist_ok=True)
-        (root / "User Data").mkdir(parents=True, exist_ok=True)
-        (root / "codex-home").mkdir(parents=True, exist_ok=True)
+        for path in (layout.user_data, layout.codex_home, layout.mux_home):
+            if path.is_symlink():
+                raise RuntimeError(f"refusing a symlinked persistent Router state path: {path}")
+            path.mkdir(parents=True, exist_ok=True)
         if cleanup_status is not None:
             cleanup_status.update(
                 {
@@ -1594,6 +1857,9 @@ def final_layout_smoke_root(
                     "preserved": True,
                     "removed": False,
                     "error": None,
+                    "validation_profile": layout.to_dict(
+                        exists=all(path.is_dir() for path in (layout.user_data, layout.codex_home, layout.mux_home))
+                    ),
                 }
             )
         try:

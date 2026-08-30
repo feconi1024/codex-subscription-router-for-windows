@@ -714,22 +714,12 @@ def terminate_attributed_processes(
     tracked = tuple(dict.fromkeys(int(pid) for pid in process_pids))
     requested: list[int] = []
     skipped: list[str] = []
+    external_processes_observed: list[dict[str, object]] = []
+    external_process_pids: set[int] = set()
     allowed_paths = {
         path.expanduser().resolve(strict=False)
         for path in allowed_executable_paths
     }
-
-    def has_mirror_ancestor(pid: int) -> bool:
-        current = rows.get(pid)
-        visited: set[int] = set()
-        while current is not None and current.pid not in visited:
-            visited.add(current.pid)
-            if current.executable is not None and path_is_within(current.executable, mirrored_root):
-                return True
-            if current.parent_pid is None:
-                break
-            current = rows.get(current.parent_pid)
-        return False
 
     for pid in tracked:
         row = rows.get(pid)
@@ -738,16 +728,24 @@ def terminate_attributed_processes(
         if row.executable is None:
             skipped.append(f"pid {pid}: executable path unavailable")
             continue
+        owned_path = path_is_within(row.executable, mirrored_root) or row.executable.resolve(strict=False) in allowed_paths
+        if not owned_path:
+            # Parentage alone does not make an external OAuth browser Router
+            # owned. Keep the ownership boundary strict: only mirror paths and
+            # explicitly allowed executable paths can be cleanup targets.
+            if pid not in external_process_pids:
+                name = Path(row.name).name[:100]
+                external_processes_observed.append(
+                    {
+                        "name": name,
+                        "cleanup_required": False,
+                    }
+                )
+                external_process_pids.add(pid)
+            continue
         if is_windowsapps_path(row.executable):
             skipped.append(f"pid {pid}: refusing protected WindowsApps process {row.executable}")
             continue
-        if not path_is_within(row.executable, mirrored_root) and row.executable.resolve(strict=False) not in allowed_paths:
-            # A child helper may be system-installed, but it is safe to target
-            # only when the final snapshot still proves a mirror-path ancestor.
-            # This also protects against a root PID being reused after it exits.
-            if pid == root_pid or not has_mirror_ancestor(pid):
-                skipped.append(f"pid {pid}: refusing unattributed process outside mirror ({row.executable})")
-                continue
         requested.append(pid)
 
     def depth(pid: int) -> int:
@@ -782,6 +780,7 @@ def terminate_attributed_processes(
         "requested": requested,
         "terminated": terminated,
         "errors": errors,
+        "external_processes_observed": external_processes_observed,
     }
 
 

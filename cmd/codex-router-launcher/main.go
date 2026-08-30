@@ -11,13 +11,17 @@ import (
 )
 
 const (
-	chatGPTExecutableName = "ChatGPT.exe"
-	legacyExecutableName  = "Codex.exe"
-	muxExecutableName     = "codex-mux.exe"
-	realCodexName         = "codex.real.exe"
-	userDataDirectoryName = "User Data"
-	muxStateDirectoryName = ".codex-mux"
-	launchMetadataName    = "launch.json"
+	chatGPTExecutableName  = "ChatGPT.exe"
+	legacyExecutableName   = "Codex.exe"
+	muxExecutableName      = "codex-mux.exe"
+	realCodexName          = "codex.real.exe"
+	userDataDirectoryName  = "User Data"
+	codexHomeDirectoryName = "codex-home"
+	muxHomeDirectoryName   = "mux-home"
+	validationProfileName  = "_validation-profile"
+	validationOwnerName    = "Codex Subscription Router"
+	muxStateDirectoryName  = ".codex-mux"
+	launchMetadataName     = "launch.json"
 )
 
 type launchMetadata struct {
@@ -48,20 +52,43 @@ func run() int {
 		fmt.Fprintf(os.Stderr, "Codex Subscription Router: %v\n", err)
 		return 1
 	}
-	if err := os.MkdirAll(paths.userData, 0o700); err != nil {
+	userData := paths.userData
+	muxHome := filepath.Join(paths.root, "runtime", muxStateDirectoryName)
+	codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME"))
+	persistentProfileRoot := strings.TrimSpace(os.Getenv("CODEX_MUX_PERSISTENT_PROFILE_ROOT"))
+	if persistentProfileRoot != "" {
+		if os.Getenv("CODEX_MUX_UI_TESTS") != "1" {
+			fmt.Fprintln(os.Stderr, "Codex Subscription Router: persistent validation profile is test-only")
+			return 1
+		}
+		profileRoot, profileErr := resolvePersistentProfileRoot(persistentProfileRoot)
+		if profileErr != nil {
+			fmt.Fprintf(os.Stderr, "Codex Subscription Router: %v\n", profileErr)
+			return 1
+		}
+		userData = filepath.Join(profileRoot, userDataDirectoryName)
+		codexHome = filepath.Join(profileRoot, codexHomeDirectoryName)
+		muxHome = filepath.Join(profileRoot, muxHomeDirectoryName)
+	}
+	if err := os.MkdirAll(userData, 0o700); err != nil {
 		fmt.Fprintf(os.Stderr, "Codex Subscription Router: create isolated user data: %v\n", err)
 		return 1
 	}
 
 	environment := buildEnvironment(os.Environ(), map[string]string{
-		"CODEX_CLI_PATH":              paths.mux,
-		"CODEX_MUX_REAL_CODEX":        paths.real,
-		"CODEX_MUX_HOME":              filepath.Join(paths.root, "runtime", muxStateDirectoryName),
-		"CODEX_MUX_DESKTOP_USER_DATA": paths.userData,
-		"CODEX_ELECTRON_USER_DATA_PATH": paths.userData,
-		"CODEX_SPARKLE_ENABLED":       "false",
+		"CODEX_CLI_PATH":                paths.mux,
+		"CODEX_MUX_REAL_CODEX":          paths.real,
+		"CODEX_MUX_HOME":                muxHome,
+		"CODEX_MUX_DESKTOP_USER_DATA":   userData,
+		"CODEX_ELECTRON_USER_DATA_PATH": userData,
+		"CODEX_SPARKLE_ENABLED":         "false",
 	})
-	arguments := isolatedArguments(os.Args[1:], paths.userData)
+	if persistentProfileRoot != "" {
+		environment = buildEnvironment(environment, map[string]string{
+			"CODEX_HOME": codexHome,
+		})
+	}
+	arguments := isolatedArguments(os.Args[1:], userData)
 	command := exec.Command(paths.chatGPT, arguments...)
 	command.Dir = paths.appDir
 	command.Env = environment
@@ -77,6 +104,33 @@ func run() int {
 		return 1
 	}
 	return 0
+}
+
+func resolvePersistentProfileRoot(requested string) (string, error) {
+	root, err := filepath.Abs(filepath.Clean(requested))
+	if err != nil {
+		return "", fmt.Errorf("resolve persistent validation profile: %w", err)
+	}
+	if strings.EqualFold(filepath.Base(root), validationProfileName) == false ||
+		strings.EqualFold(filepath.Base(filepath.Dir(root)), validationOwnerName) == false {
+		return "", fmt.Errorf(
+			"persistent validation profile must be %s\\%s",
+			validationOwnerName,
+			validationProfileName,
+		)
+	}
+	if localAppData := strings.TrimSpace(os.Getenv("LOCALAPPDATA")); localAppData != "" {
+		expected, expectedErr := filepath.Abs(filepath.Join(localAppData, validationOwnerName, validationProfileName))
+		if expectedErr != nil || !strings.EqualFold(filepath.Clean(root), filepath.Clean(expected)) {
+			return "", errors.New("persistent validation profile is not under LOCALAPPDATA\\Codex Subscription Router")
+		}
+	}
+	for _, component := range strings.FieldsFunc(root, func(r rune) bool { return r == '\\' || r == '/' }) {
+		if strings.EqualFold(component, "WindowsApps") {
+			return "", errors.New("persistent validation profile must be outside WindowsApps")
+		}
+	}
+	return root, nil
 }
 
 func resolveLaunchPaths(launcher string) (launchPaths, error) {

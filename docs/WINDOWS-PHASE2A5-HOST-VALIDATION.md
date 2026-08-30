@@ -21,6 +21,12 @@ This round adds:
 - the user-started `scripts/windows/run_phase2a5_host_validation.ps1` runner;
 - the user-started `scripts/windows/prepare_phase2a5_desktop_auth.ps1` persistent
   Desktop-authentication preparation runner;
+- one typed Router-owned persistent profile boundary for `User Data`,
+  `CODEX_HOME`, `CODEX_MUX_HOME`, and rebuildable `patched-shell`;
+- persistent launcher environment routing and a token-protected, test-only
+  graceful Desktop quit action;
+- external OAuth-browser observation without treating an unowned browser as a
+  cleanup target;
 - an ignored `docs/generated/WINDOWS-PHASE2A5-HOST-RESULT.json` artifact path.
 
 Phase 2A.6 adds a second fail-closed gate before the native probes: the
@@ -213,12 +219,23 @@ patched shell passes and the result is reviewed.
 ## Desktop authentication preparation
 
 The disposable infrastructure smoke uses a fresh `User Data` directory and
-does not ask the operator to log in.  The authenticated Router UI gate uses a
-separate persistent profile at:
+does not ask the operator to log in.  The authenticated Router UI gate uses one
+Router-owned persistent profile at:
 
 ```text
-%LOCALAPPDATA%\Codex Subscription Router\_validation-profile\User Data
+%LOCALAPPDATA%\Codex Subscription Router\_validation-profile\
+  User Data\
+  codex-home\
+  mux-home\
+  patched-shell\
 ```
+
+`User Data` is the Electron/Chromium profile, `codex-home` is the persistent
+`CODEX_HOME`, and `mux-home` is the complete persistent `CODEX_MUX_HOME`
+(`state.json`, account homes, and `control-token`).  None of these state roots
+is staged under `patched-shell`; a forced rebuild replaces only that shell.
+The launcher accepts this external mapping only for the token-protected UI-test
+environment and rejects profile paths outside the exact Router-owned boundary.
 
 From an independently opened ordinary PowerShell, start the one-time
 preparation workflow:
@@ -232,19 +249,36 @@ The workflow builds the exact reviewed patched shell, keeps the normal
 Chromium sandbox and `NONE` ACL strategy, and waits up to 15 minutes for the
 user to complete normal ChatGPT login in the visible Router window.  It does
 not read, copy, print, or automate credentials, cookies, local storage, or
-official Desktop profile files.  The profile is preserved after the window is
-closed or authentication is detected.
+official Desktop profile files.
 
-After authentication is detected, rerun the external validator with its
-explicit CI gate:
+Preparation then requires all three bounded boots:
+
+1. Boot 1 permits the manual login, waits for `AUTHENTICATED` and a short
+   quiescence interval, and requests normal Electron `app.quit()` shutdown.
+2. Boot 2 reuses the same build and all three persistent roots without manual
+   interaction.  `AUTH_REQUIRED` returns
+   `ROUTER_DESKTOP_AUTH_NOT_PERSISTED`.
+3. The workflow force-rebuilds only `patched-shell`, verifies the external
+   state roots remain intact, and performs Boot 3 with no manual interaction.
+   `AUTH_REQUIRED` returns `ROUTER_DESKTOP_AUTH_LOST_AFTER_REBUILD`.
+
+Only after Boot 3 is authenticated and gracefully shut down does the workflow
+report `DESKTOP_AUTH_PREPARED`.  The public artifact records the safe
+`validation_profile` paths and `auth_persistence` results for all three boots;
+control tokens and account identity are excluded.
+
+After the preparation command reports `DESKTOP_AUTH_PREPARED`, rerun the
+external validator with its explicit CI gate:
 
 ```powershell
 .\scripts\windows\run_phase2a5_host_validation.ps1 --ci-verified
 ```
 
-If the preparation window is closed before login completes, the result remains
-`ROUTER_DESKTOP_AUTH_REQUIRED`; this is a prerequisite result, not a Router
-injection failure or a Phase 2B signal.
+If the first preparation window is closed before login completes, the result
+remains `ROUTER_DESKTOP_AUTH_REQUIRED`.  A second-boot failure is reported as
+`ROUTER_DESKTOP_AUTH_NOT_PERSISTED`; a post-rebuild failure is reported as
+`ROUTER_DESKTOP_AUTH_LOST_AFTER_REBUILD`.  These are prerequisite results, not
+Router injection failures or Phase 2B signals.
 
 ## Verdict policy
 
@@ -261,6 +295,8 @@ PHASE 2A.5 PATCHED SHELL BLOCKED
 PHASE 2A.5 SOURCE REVIEW REQUIRED
 PHASE 2A.5 SOURCE CHANGED DURING VALIDATION
 PATCHED SHELL TOOLCHAIN BLOCKED
+ROUTER_DESKTOP_AUTH_NOT_PERSISTED
+ROUTER_DESKTOP_AUTH_LOST_AFTER_REBUILD
 PHASE 2A.5 FAIL
 ```
 
@@ -269,7 +305,16 @@ PHASE 2A.5 FAIL
 ## Next manual operation
 
 Both CI gates are now green.  From an independently opened ordinary
-PowerShell, run the native validation with the explicit CI gate:
+PowerShell, run the one-time Desktop authentication preparation first:
+
+```powershell
+Set-Location -LiteralPath 'E:\Projects\codex-subscription-router-for-windows'
+.\scripts\windows\prepare_phase2a5_desktop_auth.ps1
+```
+
+Complete normal ChatGPT login only in the visible validation window.  After it
+reports `DESKTOP_AUTH_PREPARED`, run the native validation with the explicit CI
+gate:
 
 ```powershell
 Set-Location -LiteralPath 'E:\Projects\codex-subscription-router-for-windows'

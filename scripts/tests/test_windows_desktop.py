@@ -7,7 +7,7 @@ import json
 import subprocess
 import tempfile
 import unittest
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
@@ -25,6 +25,7 @@ from scripts.patch_common import (
 )
 from scripts.patch_app_windows import (
     _patched_javascript_assets,
+    _atomic_install,
     _payload_acl_for_strategy,
     audit_windows_source,
     build_windows_desktop,
@@ -62,6 +63,7 @@ from scripts.windows.discovery import (
     select_running_process,
     process_tree_pids,
     attributable_process_pids,
+    terminate_attributed_processes,
     inventory_desktop_executables,
     select_authoritative_desktop_candidate,
     path_is_within,
@@ -95,6 +97,8 @@ from scripts.windows.smoke import (
     PASS,
     ROUTER_MENU_ACCOUNTS_LOAD_FAILED,
     ROUTER_DESKTOP_AUTH_REQUIRED,
+    ROUTER_DESKTOP_AUTH_NOT_PERSISTED,
+    ROUTER_DESKTOP_AUTH_LOST_AFTER_REBUILD,
     ROUTER_DESKTOP_AUTH_UNKNOWN,
     ROUTER_MENU_NOT_INJECTED_AFTER_OPEN,
     ROUTER_PROFILE_ACTIVATION_FAILED,
@@ -113,6 +117,8 @@ from scripts.windows.smoke import (
     native_evidence_is_usable,
     router_account_menu_gate,
     run_patched_shell_smoke,
+    DESKTOP_AUTH_BOOT_AUTHENTICATED,
+    validation_profile_layout,
 )
 from scripts.windows.host_context import (
     APPMODEL_ERROR_NO_PACKAGE,
@@ -127,6 +133,7 @@ from scripts.windows.phase2a5_host_validation import (
     PHASE2A5_DIRECT_HOST_PASS,
     DESKTOP_AUTH_PREPARED,
     _go_toolchain_report,
+    _artifact_result,
     _public_probe,
     _run_external_patched_shell,
     _source_identity,
@@ -271,6 +278,91 @@ def write_exact_26_825_renderer_fixture(root: Path) -> dict[str, object]:
     return values
 
 
+@contextmanager
+def mocked_prepare_desktop_auth(root: Path, boots: list[dict[str, object]]):
+    local_appdata = root / "local"
+    source = SimpleNamespace(executable=root / "WindowsApps" / "app" / "ChatGPT.exe")
+    selected = SimpleNamespace(
+        path=root / "codex.exe",
+        version="codex-cli test",
+        sha256="b" * 64,
+        authenticode=SimpleNamespace(status="Valid", signer="CN=OpenAI"),
+    )
+    metadata = {
+        "desktop_launch_executable": "app\\ChatGPT.exe",
+        "payload_acl_strategy": PAYLOAD_ACL_NONE,
+        "source_app_asar_sha256": "c" * 64,
+        "renderer_syntax_validation": {"status": "PASS", "parser": "node"},
+    }
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch(
+                "scripts.windows.phase2a5_host_validation.collect_startup_runtime",
+                return_value={"go_toolchain": {"selected": "go.exe", "usable": True, "probes": []}},
+            )
+        )
+        stack.enter_context(
+            patch(
+                "scripts.windows.phase2a5_host_validation.detect_windows_host_context",
+                return_value={"has_package_identity": False, "LOCALAPPDATA": str(local_appdata)},
+            )
+        )
+        stack.enter_context(
+            patch(
+                "scripts.windows.phase2a5_host_validation.run_localappdata_canary",
+                return_value={"filesystem_virtualized": False},
+            )
+        )
+        stack.enter_context(
+            patch(
+                "scripts.windows.phase2a5_host_validation.discover_desktop_source",
+                return_value=(source, SourceDiagnostics()),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "scripts.windows.phase2a5_host_validation._source_identity",
+                return_value={
+                    "package_name": "OpenAI.Codex",
+                    "package_version": "26.825.5331.0",
+                    "architecture": "X64",
+                    "app_file_version": "151.0.7922.174",
+                    "app_asar_sha256": "c" * 64,
+                    "app_asar_header_sha256": "d" * 64,
+                },
+            )
+        )
+        stack.enter_context(
+            patch(
+                "scripts.windows.phase2a5_host_validation.find_reviewed_source",
+                return_value={"renderer_variant": "windows-26.825"},
+            )
+        )
+        stack.enter_context(
+            patch(
+                "scripts.windows.phase2a5_host_validation.reviewed_source_is_patchable",
+                return_value=(True, "exact reviewed source"),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "scripts.windows.phase2a5_host_validation.discover_real_codex",
+                return_value=(selected, [selected]),
+            )
+        )
+        build = stack.enter_context(
+            patch("scripts.windows.phase2a5_host_validation.build_windows_desktop", return_value=metadata)
+        )
+        smoke = stack.enter_context(
+            patch(
+                "scripts.windows.phase2a5_host_validation.run_patched_shell_smoke",
+                side_effect=[dict(boot) for boot in boots],
+            )
+        )
+        result = prepare_desktop_auth(repo_root=root, timeout_seconds=900)
+        yield result, build, smoke, local_appdata
+
+
 class WindowsDesktopHelpersTests(unittest.TestCase):
     def test_windows_bootstrap_isolates_profile_and_disables_updater(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -362,6 +454,81 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             self.assertEqual(tracked, (10, 11))
             self.assertTrue(path_is_within(mirror / "nested.exe", mirror))
             self.assertFalse(path_is_within(root / "application.exe", mirror))
+
+    def test_external_oauth_browser_is_observed_but_not_a_cleanup_target(self) -> None:
+        class NativeCall:
+            def __init__(self, value: object, callback=None):
+                self.value = value
+                self.callback = callback
+                self.argtypes = None
+                self.restype = None
+
+            def __call__(self, *args: object) -> object:
+                return self.callback(*args) if self.callback is not None else self.value
+
+        opened: list[int] = []
+        def record_open(*args: object) -> int:
+            opened.append(int(args[-1]))
+            return 1
+
+        kernel32 = SimpleNamespace(
+            OpenProcess=NativeCall(1, record_open),
+            TerminateProcess=NativeCall(1),
+            WaitForSingleObject=NativeCall(0),
+            CloseHandle=NativeCall(1),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            mirror = Path(temporary) / "patched-shell"
+            rows = [
+                RunningProcessCandidate(10, "ChatGPT.exe", executable=mirror / "ChatGPT.exe"),
+                RunningProcessCandidate(
+                    11,
+                    "msedge.exe",
+                    parent_pid=10,
+                    executable=Path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
+                ),
+            ]
+            with patch("scripts.windows.discovery.os.name", "nt"), patch(
+                "scripts.windows.discovery.ctypes.WinDLL",
+                return_value=kernel32,
+            ):
+                result = terminate_attributed_processes({10, 11}, rows, mirror, root_pid=10)
+        self.assertEqual(result["requested"], [10])
+        self.assertEqual(opened, [10])
+        self.assertEqual(result["terminated"], [10])
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(
+            result["external_processes_observed"],
+            [{"name": "msedge.exe", "cleanup_required": False}],
+        )
+
+    def test_owned_router_process_cleanup_failure_remains_a_failure(self) -> None:
+        class NativeCall:
+            def __init__(self, value: object):
+                self.value = value
+                self.argtypes = None
+                self.restype = None
+
+            def __call__(self, *_args: object) -> object:
+                return self.value
+
+        kernel32 = SimpleNamespace(
+            OpenProcess=NativeCall(1),
+            TerminateProcess=NativeCall(1),
+            WaitForSingleObject=NativeCall(1),
+            CloseHandle=NativeCall(1),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            mirror = Path(temporary) / "patched-shell"
+            rows = [RunningProcessCandidate(12, "codex-mux.exe", executable=mirror / "runtime" / "codex-mux.exe")]
+            with patch("scripts.windows.discovery.os.name", "nt"), patch(
+                "scripts.windows.discovery.ctypes.WinDLL",
+                return_value=kernel32,
+            ):
+                result = terminate_attributed_processes({12}, rows, mirror, root_pid=12)
+        self.assertEqual(result["requested"], [12])
+        self.assertEqual(result["terminated"], [])
+        self.assertTrue(any("pid 12 did not exit" in error for error in result["errors"]))
 
     def test_desktop_inventory_is_root_only_and_records_absent_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1069,6 +1236,45 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         self.assertNotIn("stack", encoded)
         self.assertNotIn("token=secret", encoded)
 
+    def test_public_auth_artifact_contains_safe_profile_and_persistence_verdicts(self) -> None:
+        raw = {
+            "status": DESKTOP_AUTH_PREPARED,
+            "validation_profile": {
+                "root": r"C:\Users\test\AppData\Local\Codex Subscription Router\_validation-profile",
+                "user_data": r"C:\Users\test\AppData\Local\Codex Subscription Router\_validation-profile\User Data",
+                "codex_home": r"C:\Users\test\AppData\Local\Codex Subscription Router\_validation-profile\codex-home",
+                "mux_home": r"C:\Users\test\AppData\Local\Codex Subscription Router\_validation-profile\mux-home",
+                "patched_shell": r"C:\Users\test\AppData\Local\Codex Subscription Router\_validation-profile\patched-shell",
+                "persistent": True,
+                "preserved": True,
+                "exists": True,
+                "secret": "control-token-secret",
+            },
+            "auth_persistence": {
+                "initial_login": {"status": "AUTHENTICATED", "graceful_shutdown": "PASS"},
+                "restart_check": {"status": "AUTHENTICATED", "graceful_shutdown": "PASS"},
+                "post_rebuild_check": {"status": "AUTHENTICATED", "graceful_shutdown": "PASS"},
+            },
+            "patched_shell": {
+                "status": DESKTOP_AUTH_BOOT_AUTHENTICATED,
+                "desktop_auth": {"state": "AUTHENTICATED", "email": "user@example.com"},
+                "cleanup": {"errors": ["control-token-secret"]},
+                "graceful_shutdown": {"succeeded": True, "status": "EXITED"},
+            },
+        }
+        artifact = _artifact_result(raw)
+        encoded = json.dumps(artifact, sort_keys=True)
+        self.assertTrue(
+            set(("root", "user_data", "codex_home", "mux_home", "patched_shell"))
+            <= set(artifact["validation_profile"])
+        )
+        self.assertTrue(
+            set(("initial_login", "restart_check", "post_rebuild_check"))
+            <= set(artifact["auth_persistence"])
+        )
+        self.assertNotIn("control-token-secret", encoded)
+        self.assertNotIn("user@example.com", encoded)
+
     def test_router_runtime_markers_are_exposed_by_bridge_and_account_menu(self) -> None:
         account_menu = (Path(__file__).resolve().parents[2] / "ui" / "account-menu.js").read_text(
             encoding="utf-8"
@@ -1094,6 +1300,8 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             self.assertIn(marker, bridge)
         self.assertIn("__codexMuxAccountMenuInjected", bridge)
         self.assertIn("profile-router-open", bridge)
+        self.assertIn("desktop-auth-graceful-quit", bridge)
+        self.assertIn("app.quit()", bridge)
         self.assertIn("render-process-gone", bridge)
         self.assertIn("unhandledrejection", account_menu)
         self.assertNotIn("text:element.textContent.trim().slice(0,80)", bridge)
@@ -1297,6 +1505,198 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             self.assertFalse(cleanup["removed"])
             self.assertTrue(cleanup["preserved"])
 
+    def test_validation_profile_layout_keeps_all_persistent_roots_outside_patched_shell(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            layout = validation_profile_layout(Path(temporary) / "local")
+            self.assertEqual(layout.root.name, "_validation-profile")
+            self.assertEqual(layout.user_data.parent, layout.root)
+            self.assertEqual(layout.codex_home.parent, layout.root)
+            self.assertEqual(layout.mux_home.parent, layout.root)
+            self.assertEqual(layout.patched_shell.parent, layout.root)
+            for state_path in (layout.user_data, layout.codex_home, layout.mux_home):
+                self.assertFalse(state_path.is_relative_to(layout.patched_shell))
+
+    def test_patched_shell_smoke_routes_persistent_codex_and_mux_homes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            local_appdata = root / "local"
+            layout = validation_profile_layout(local_appdata)
+            runtime = layout.patched_shell / "runtime"
+            (layout.patched_shell / "app").mkdir(parents=True)
+            runtime.mkdir(parents=True)
+            (layout.patched_shell / "Codex Subscription Router.exe").write_bytes(b"launcher")
+            (runtime / "codex-mux.exe").write_bytes(b"mux")
+            (runtime / "codex.real.exe").write_bytes(b"real")
+            layout.mux_home.mkdir(parents=True)
+            (layout.mux_home / "control-token").write_text("a" * 64, encoding="utf-8")
+            real = RealCodexCandidate(
+                path=root / "codex.exe",
+                version="test",
+                sha256="b" * 64,
+                authenticode=AuthenticodeMetadata("Valid", "CN=OpenAI"),
+                modified_time=0.0,
+                valid_native=True,
+            )
+            real.path.write_bytes(b"real")
+            ui_body = {
+                "debug": {
+                    "router": {
+                        "rendererPatchLoaded": True,
+                        "accountMenuInjected": True,
+                        "accountMenuMounted": True,
+                        "accountsLoaded": True,
+                        "accountCount": 1,
+                        "requestFailed": False,
+                    },
+                    "desktop_auth": {"state": "AUTHENTICATED"},
+                    "renderer_runtime": {
+                        "readyState": "complete",
+                        "rootPresent": True,
+                        "composerPresent": True,
+                        "profileControllerReady": True,
+                        "runtimeErrorCount": 0,
+                    },
+                    "profile_controller": {"ready": True},
+                }
+            }
+            captured: dict[str, object] = {}
+
+            class FinishedProcess:
+                pid = 1234
+
+                def poll(self) -> int:
+                    return 0
+
+                def terminate(self) -> None:
+                    return None
+
+                def wait(self, timeout: float | None = None) -> int:
+                    return 0
+
+            def fake_http(url: str, **_kwargs: object):
+                if "/health" in url:
+                    return 200, {"ok": True}, None
+                return 200, ui_body, None
+
+            with patch("scripts.windows.smoke.os.name", "nt"), patch.dict(
+                "scripts.windows.smoke.os.environ",
+                {"LOCALAPPDATA": str(local_appdata)},
+                clear=False,
+            ), patch(
+                "scripts.windows.smoke.subprocess.Popen",
+                side_effect=lambda _command, **kwargs: (captured.update(kwargs) or FinishedProcess()),
+            ), patch(
+                "scripts.windows.smoke.discover_process_snapshot_native",
+                return_value=[],
+            ), patch(
+                "scripts.windows.smoke._official_instance_present",
+                return_value=False,
+            ), patch(
+                "scripts.windows.smoke.enumerate_windows_for_processes",
+                return_value=[],
+            ), patch(
+                "scripts.windows.smoke.terminate_attributed_processes",
+                return_value={"tracked": [1234], "requested": [], "terminated": [], "errors": []},
+            ), patch("scripts.windows.smoke._http_json_get", side_effect=fake_http), patch(
+                "scripts.windows.smoke.time.sleep",
+                return_value=None,
+            ):
+                run_patched_shell_smoke(
+                    layout.patched_shell,
+                    real,
+                    timeout_seconds=1.0,
+                    disposable_root=False,
+                    user_data_override=layout.user_data,
+                    codex_home_override=layout.codex_home,
+                    mux_home_override=layout.mux_home,
+                    preserve_user_data=True,
+                    auth_required=True,
+                    validation_profile_root_override=layout.root,
+                    validation_profile_local_appdata=local_appdata,
+                )
+            environment = captured["env"]
+            self.assertIsInstance(environment, dict)
+            self.assertEqual(environment["CODEX_HOME"], str(layout.codex_home))
+            self.assertEqual(environment["CODEX_MUX_HOME"], str(layout.mux_home))
+            self.assertEqual(environment["CODEX_ELECTRON_USER_DATA_PATH"], str(layout.user_data))
+            self.assertEqual(environment["CODEX_MUX_PERSISTENT_PROFILE_ROOT"], str(layout.root))
+
+    def test_patched_shell_smoke_keeps_disposable_state_under_installation_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "disposable"
+            runtime = root / "runtime"
+            (root / "app").mkdir(parents=True)
+            (runtime / ".codex-mux").mkdir(parents=True)
+            (root / "User Data").mkdir()
+            (root / "codex-home").mkdir()
+            (root / "Codex Subscription Router.exe").write_bytes(b"launcher")
+            (runtime / "codex-mux.exe").write_bytes(b"mux")
+            (runtime / "codex.real.exe").write_bytes(b"real")
+            (runtime / ".codex-mux" / "control-token").write_text("a" * 64, encoding="utf-8")
+            real = RealCodexCandidate(
+                path=Path(temporary) / "codex.exe",
+                version="test",
+                sha256="b" * 64,
+                authenticode=AuthenticodeMetadata("Valid", "CN=OpenAI"),
+                modified_time=0.0,
+                valid_native=True,
+            )
+            real.path.write_bytes(b"real")
+            captured: dict[str, object] = {}
+
+            class FinishedProcess:
+                pid = 1235
+
+                def poll(self) -> int:
+                    return 0
+
+            with patch("scripts.windows.smoke.os.name", "nt"), patch(
+                "scripts.windows.smoke.subprocess.Popen",
+                side_effect=lambda _command, **kwargs: (captured.update(kwargs) or FinishedProcess()),
+            ), patch(
+                "scripts.windows.smoke.discover_process_snapshot_native",
+                return_value=[],
+            ), patch(
+                "scripts.windows.smoke._official_instance_present",
+                return_value=False,
+            ), patch(
+                "scripts.windows.smoke.enumerate_windows_for_processes",
+                return_value=[],
+            ), patch(
+                "scripts.windows.smoke.terminate_attributed_processes",
+                return_value={"tracked": [1235], "requested": [], "terminated": [], "errors": []},
+            ), patch(
+                "scripts.windows.smoke._http_json_get",
+                side_effect=lambda url, **_kwargs: (
+                    (200, {"ok": True}, None)
+                    if "/health" in url
+                    else (200, {"debug": {}}, None)
+                ),
+            ), patch("scripts.windows.smoke.time.sleep", return_value=None):
+                run_patched_shell_smoke(root, real, timeout_seconds=1.0, disposable_root=True)
+            environment = captured["env"]
+            self.assertEqual(environment["CODEX_HOME"], str(root / "codex-home"))
+            self.assertEqual(environment["CODEX_MUX_HOME"], str(runtime / ".codex-mux"))
+            self.assertNotIn("CODEX_MUX_PERSISTENT_PROFILE_ROOT", environment)
+
+    def test_force_rebuild_uses_recoverable_backup_without_touching_persistent_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / "_validation-profile" / "patched-shell"
+            staged = root / "staged"
+            destination.mkdir(parents=True)
+            (destination / "old-marker").write_text("old", encoding="utf-8")
+            staged.mkdir()
+            (staged / "new-marker").write_text("new", encoding="utf-8")
+            userprofile = root / "userprofile"
+            with patch.dict(os.environ, {"USERPROFILE": str(userprofile)}, clear=False):
+                backup = _atomic_install(staged, destination, force=True)
+            self.assertIsNotNone(backup)
+            self.assertTrue((backup / "old-marker").is_file())
+            self.assertTrue((destination / "new-marker").is_file())
+            self.assertFalse((destination / "old-marker").exists())
+            self.assertTrue((userprofile / ".codex-mux" / "backups").is_dir())
+
     def test_persistent_external_shell_uses_auth_profile_without_disposable_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             profile = Path(temporary) / "Codex Subscription Router" / "_validation-profile"
@@ -1328,10 +1728,15 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                 )
             self.assertTrue(profile.is_dir())
             self.assertTrue((profile / "User Data").is_dir())
+            self.assertTrue((profile / "codex-home").is_dir())
+            self.assertTrue((profile / "mux-home").is_dir())
             build.assert_called_once()
             self.assertTrue(build.call_args.kwargs["force"])
+            self.assertEqual(build.call_args.kwargs["mux_home_override"], resolved_profile / "mux-home")
             smoke.assert_called_once()
             self.assertEqual(smoke.call_args.kwargs["user_data_override"], resolved_profile / "User Data")
+            self.assertEqual(smoke.call_args.kwargs["codex_home_override"], resolved_profile / "codex-home")
+            self.assertEqual(smoke.call_args.kwargs["mux_home_override"], resolved_profile / "mux-home")
             self.assertTrue(smoke.call_args.kwargs["preserve_user_data"])
             self.assertTrue(smoke.call_args.kwargs["auth_required"])
             self.assertEqual(result["status"], ROUTER_DESKTOP_AUTH_REQUIRED)
@@ -1389,11 +1794,26 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                 },
             ) as build, patch(
                 "scripts.windows.phase2a5_host_validation.run_patched_shell_smoke",
-                return_value={
-                    "status": DESKTOP_AUTH_PREPARED,
-                    "desktop_auth": {"state": "AUTHENTICATED"},
-                    "manual_operation_required": False,
-                },
+                side_effect=[
+                    {
+                        "status": DESKTOP_AUTH_BOOT_AUTHENTICATED,
+                        "desktop_auth": {"state": "AUTHENTICATED"},
+                        "graceful_shutdown": {"succeeded": True, "status": "EXITED"},
+                        "manual_operation_required": False,
+                    },
+                    {
+                        "status": DESKTOP_AUTH_BOOT_AUTHENTICATED,
+                        "desktop_auth": {"state": "AUTHENTICATED"},
+                        "graceful_shutdown": {"succeeded": True, "status": "EXITED"},
+                        "manual_operation_required": False,
+                    },
+                    {
+                        "status": DESKTOP_AUTH_BOOT_AUTHENTICATED,
+                        "desktop_auth": {"state": "AUTHENTICATED"},
+                        "graceful_shutdown": {"succeeded": True, "status": "EXITED"},
+                        "manual_operation_required": False,
+                    },
+                ],
             ) as smoke:
                 result = prepare_desktop_auth(
                     repo_root=root,
@@ -1403,12 +1823,66 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             self.assertEqual(result["status"], DESKTOP_AUTH_PREPARED)
             self.assertFalse(result["manual_operation_required"])
             self.assertEqual(result["validation_profile"]["root"], str(profile))
-            build.assert_called_once()
-            self.assertTrue(build.call_args.kwargs["force"])
-            self.assertEqual(build.call_args.kwargs["payload_acl_strategy"], PAYLOAD_ACL_NONE)
-            smoke.assert_called_once()
-            self.assertEqual(smoke.call_args.kwargs["user_data_override"], profile / "User Data")
-            self.assertTrue(smoke.call_args.kwargs["authentication_preparation"])
+            self.assertEqual(build.call_count, 2)
+            self.assertTrue(all(call.kwargs["force"] for call in build.call_args_list))
+            self.assertEqual(build.call_args_list[0].kwargs["payload_acl_strategy"], PAYLOAD_ACL_NONE)
+            self.assertEqual(build.call_args_list[0].kwargs["validation_profile_local_appdata"], local_appdata)
+            self.assertEqual(build.call_args_list[1].kwargs["mux_home_override"], profile / "mux-home")
+            self.assertEqual(build.call_args_list[1].kwargs["validation_profile_local_appdata"], local_appdata)
+            self.assertEqual(smoke.call_count, 3)
+            for call in smoke.call_args_list:
+                self.assertEqual(call.kwargs["user_data_override"], profile / "User Data")
+                self.assertEqual(call.kwargs["codex_home_override"], profile / "codex-home")
+                self.assertEqual(call.kwargs["mux_home_override"], profile / "mux-home")
+                self.assertTrue(call.kwargs["authentication_preparation"])
+            self.assertEqual(result["auth_persistence"]["restart_check"]["status"], "AUTHENTICATED")
+            self.assertEqual(result["auth_persistence"]["post_rebuild_check"]["status"], "AUTHENTICATED")
+
+    def test_desktop_auth_restart_failure_returns_explicit_not_persisted_status(self) -> None:
+        authenticated = {
+            "status": DESKTOP_AUTH_BOOT_AUTHENTICATED,
+            "desktop_auth": {"state": "AUTHENTICATED"},
+            "graceful_shutdown": {"succeeded": True, "status": "EXITED"},
+        }
+        required = {
+            "status": ROUTER_DESKTOP_AUTH_REQUIRED,
+            "desktop_auth": {"state": "AUTH_REQUIRED"},
+            "graceful_shutdown": {"succeeded": False, "status": "NOT_REQUIRED"},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            with mocked_prepare_desktop_auth(Path(temporary), [authenticated, required]) as (
+                result,
+                build,
+                smoke,
+                _local_appdata,
+            ):
+                self.assertEqual(result["status"], ROUTER_DESKTOP_AUTH_NOT_PERSISTED)
+                self.assertEqual(result["auth_persistence"]["restart_check"]["status"], "AUTH_REQUIRED")
+                self.assertEqual(build.call_count, 1)
+                self.assertEqual(smoke.call_count, 2)
+
+    def test_desktop_auth_post_rebuild_failure_returns_explicit_lost_status(self) -> None:
+        authenticated = {
+            "status": DESKTOP_AUTH_BOOT_AUTHENTICATED,
+            "desktop_auth": {"state": "AUTHENTICATED"},
+            "graceful_shutdown": {"succeeded": True, "status": "EXITED"},
+        }
+        required = {
+            "status": ROUTER_DESKTOP_AUTH_REQUIRED,
+            "desktop_auth": {"state": "AUTH_REQUIRED"},
+            "graceful_shutdown": {"succeeded": False, "status": "NOT_REQUIRED"},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            with mocked_prepare_desktop_auth(Path(temporary), [authenticated, authenticated, required]) as (
+                result,
+                build,
+                smoke,
+                _local_appdata,
+            ):
+                self.assertEqual(result["status"], ROUTER_DESKTOP_AUTH_LOST_AFTER_REBUILD)
+                self.assertEqual(result["auth_persistence"]["post_rebuild_check"]["status"], "AUTH_REQUIRED")
+                self.assertEqual(build.call_count, 2)
+                self.assertEqual(smoke.call_count, 3)
 
     def test_phase2a5_host_flow_routes_ui_acceptance_through_persistent_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

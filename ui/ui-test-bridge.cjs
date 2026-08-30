@@ -643,6 +643,16 @@ async function runAction(window, action, delayMs) {
   await new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
+async function requestGracefulDesktopQuit() {
+  const window = await observationWindow();
+  if (!window) return { ok: false, status: "NO_WINDOW" };
+  const auth = await readDesktopAuth(window);
+  if (auth.state !== "AUTHENTICATED") {
+    return { ok: false, status: auth.state };
+  }
+  return { ok: true, status: "QUIT_REQUESTED" };
+}
+
 async function capture(action, delayMs, includeDebug) {
   let window = action === null ? await observationWindow() : mainWindow();
   if (!window) throw new Error("Codex Subscription Router has no main window");
@@ -728,6 +738,7 @@ function start() {
 	  action !== "appshots-settings-trigger" &&
 	  action !== "computer-use-details" &&
 	  action !== "submit-computer-use" &&
+      action !== "desktop-auth-graceful-quit" &&
       action !== "quota-thread" &&
       action !== "first-thread" &&
       action !== "back-to-app" &&
@@ -743,6 +754,22 @@ function start() {
     }
     const includeDebug = url.searchParams.get("debug") === "1";
     try {
+      if (action === "desktop-auth-graceful-quit") {
+        const outcome = await requestGracefulDesktopQuit();
+        if (!outcome.ok) {
+          writeJson(response, 409, outcome);
+          return;
+        }
+        writeJson(response, 200, outcome);
+        // Let the HTTP response flush before requesting Electron's normal
+        // shutdown path. This is deliberately app.quit(), never a process kill.
+        setImmediate(() => {
+          try {
+            app.quit();
+          } catch {}
+        });
+        return;
+      }
       writeJson(response, 200, await capture(action, delayMs, includeDebug));
     } catch (error) {
       writeJson(response, 500, { error: error.message });

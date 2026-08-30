@@ -134,9 +134,9 @@ func TestBuildEnvironmentIncludesWindowsIsolationContract(t *testing.T) {
 	environment := buildEnvironment(
 		[]string{"CODEX_SPARKLE_ENABLED=true", "CODEX_ELECTRON_USER_DATA_PATH=official"},
 		map[string]string{
-			"CODEX_ELECTRON_USER_DATA_PATH":  `C:\\router\\User Data`,
-			"CODEX_MUX_DESKTOP_USER_DATA":    `C:\\router\\User Data`,
-			"CODEX_SPARKLE_ENABLED":           "false",
+			"CODEX_ELECTRON_USER_DATA_PATH": `C:\\router\\User Data`,
+			"CODEX_MUX_DESKTOP_USER_DATA":   `C:\\router\\User Data`,
+			"CODEX_SPARKLE_ENABLED":         "false",
 		},
 	)
 	joined := strings.Join(environment, "\n")
@@ -160,6 +160,29 @@ func TestBuildEnvironmentIncludesRouterOwnedMuxHome(t *testing.T) {
 	if strings.Contains(joined, "CODEX_MUX_HOME=official") ||
 		!strings.Contains(joined, `CODEX_MUX_HOME=C:\\router\\runtime\\.codex-mux`) {
 		t.Fatalf("mux state root was not isolated: %q", environment)
+	}
+}
+
+func TestResolvePersistentProfileRootRequiresRouterOwnedLocalAppDataPath(t *testing.T) {
+	localAppData := t.TempDir()
+	t.Setenv("LOCALAPPDATA", localAppData)
+	expected := filepath.Join(localAppData, validationOwnerName, validationProfileName)
+	resolved, err := resolvePersistentProfileRoot(expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != expected {
+		t.Fatalf("resolved=%q, expected=%q", resolved, expected)
+	}
+
+	for _, unsafe := range []string{
+		filepath.Join(localAppData, validationOwnerName, validationProfileName, "nested"),
+		filepath.Join(localAppData, "other", validationProfileName),
+		filepath.Join(localAppData, "WindowsApps", validationOwnerName, validationProfileName),
+	} {
+		if _, err := resolvePersistentProfileRoot(unsafe); err == nil {
+			t.Fatalf("expected persistent profile path %q to be rejected", unsafe)
+		}
 	}
 }
 
