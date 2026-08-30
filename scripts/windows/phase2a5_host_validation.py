@@ -329,6 +329,40 @@ def _public_button_diagnostics(buttons: object) -> list[dict[str, object]]:
     return output
 
 
+def _public_build_metadata_summary(value: object) -> dict[str, object]:
+    """Keep build metadata bounded when copying it into the public artifact."""
+
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, object] = {}
+    for key in ("destination", "desktop_launch_executable", "payload_acl_strategy", "source_app_asar_sha256"):
+        item = value.get(key)
+        if isinstance(item, str) and len(item) <= 500:
+            output[key] = item
+    syntax = value.get("renderer_syntax_validation")
+    if isinstance(syntax, dict):
+        safe_syntax: dict[str, object] = {}
+        status = syntax.get("status")
+        if isinstance(status, str) and status in {"PASS", "BLOCKED"}:
+            safe_syntax["status"] = status
+        parser = syntax.get("parser")
+        if isinstance(parser, str) and parser == "node":
+            safe_syntax["parser"] = parser
+        version = syntax.get("version")
+        if isinstance(version, str) and len(version) <= 50:
+            safe_syntax["version"] = version
+        validated_assets = syntax.get("validated_assets")
+        if isinstance(validated_assets, list):
+            safe_syntax["validated_assets"] = [
+                item[:200]
+                for item in validated_assets
+                if isinstance(item, str)
+            ][:100]
+        if safe_syntax:
+            output["renderer_syntax_validation"] = safe_syntax
+    return output
+
+
 def _public_probe(result: object) -> object:
     if not isinstance(result, dict):
         return result
@@ -361,6 +395,10 @@ def _public_probe(result: object) -> object:
         "go_toolchain",
     )
     output = {key: result[key] for key in allowed if key in result}
+    if "build_metadata_summary" in result:
+        output["build_metadata_summary"] = _public_build_metadata_summary(
+            result.get("build_metadata_summary")
+        )
     profile = result.get("profile_isolation")
     if isinstance(profile, dict):
         output["profile_isolation"] = {
@@ -402,7 +440,14 @@ def _public_probe(result: object) -> object:
     router_account_menu = result.get("router_account_menu")
     if isinstance(router_account_menu, dict):
         safe_router_menu: dict[str, object] = {}
-        for key in ("injected", "mounted", "accounts_loaded", "request_failed", "pass"):
+        for key in (
+            "renderer_loaded",
+            "injected",
+            "mounted",
+            "accounts_loaded",
+            "request_failed",
+            "pass",
+        ):
             value = router_account_menu.get(key)
             if isinstance(value, bool):
                 safe_router_menu[key] = value
@@ -416,6 +461,7 @@ def _public_probe(result: object) -> object:
             "ROUTER_MENU_NOT_MOUNTED",
             "ROUTER_MENU_ACCOUNTS_LOADING",
             "ROUTER_MENU_ACCOUNTS_LOAD_FAILED",
+            "ROUTER_RENDERER_NOT_LOADED",
         }:
             safe_router_menu["status"] = status
         output["router_account_menu"] = safe_router_menu
@@ -573,6 +619,7 @@ def _run_external_patched_shell(
                     "desktop_launch_executable": metadata.get("desktop_launch_executable"),
                     "payload_acl_strategy": metadata.get("payload_acl_strategy"),
                     "source_app_asar_sha256": metadata.get("source_app_asar_sha256"),
+                    "renderer_syntax_validation": metadata.get("renderer_syntax_validation"),
                 }
     except (PackagingBlockedError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         result = {

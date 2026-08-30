@@ -24,11 +24,138 @@ function writeJson(response, status, body) {
   response.end(JSON.stringify(body));
 }
 
+function allWindows() {
+  return BrowserWindow.getAllWindows().filter((window) => {
+    try {
+      return !window.isDestroyed();
+    } catch {
+      return false;
+    }
+  });
+}
+
 function mainWindow() {
-  const windows = BrowserWindow.getAllWindows().filter(
-    (window) => !window.isDestroyed() && window.getBounds().width >= 700,
-  );
-  return windows.find((window) => window.isVisible()) ?? windows[0];
+  const windows = allWindows().filter((window) => {
+    try {
+      return window.getBounds().width >= 700;
+    } catch {
+      return false;
+    }
+  });
+  return windows.find((window) => safeVisible(window)) ?? windows[0];
+}
+
+function safeVisible(window) {
+  try {
+    return window.isVisible();
+  } catch {
+    return false;
+  }
+}
+
+function safeLoading(window) {
+  try {
+    return window.webContents.isLoading();
+  } catch {
+    return false;
+  }
+}
+
+function safeWebContentsId(window) {
+  try {
+    return window.webContents.id;
+  } catch {
+    return null;
+  }
+}
+
+function safeBounds(window) {
+  try {
+    const bounds = window.getBounds();
+    return {
+      x: bounds.x,
+      y: bounds.y,
+      width: bounds.width,
+      height: bounds.height,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function safeUrl(window) {
+  try {
+    const parsed = new URL(window.webContents.getURL());
+    return { origin: parsed.origin, pathname: parsed.pathname };
+  } catch {
+    return null;
+  }
+}
+
+function emptyRouterFlags() {
+  return {
+    rendererPatchLoaded: false,
+    accountMenuInjected: false,
+    accountMenuMounted: false,
+    accountsLoaded: false,
+    accountCount: 0,
+    requestFailed: false,
+  };
+}
+
+async function readRouterFlags(window) {
+  if (!window) return emptyRouterFlags();
+  try {
+    const flags = await window.webContents.executeJavaScript(`(() => {
+      const state=globalThis.__codexMuxAccountMenuState??{};
+      return {
+        rendererPatchLoaded:globalThis.__codexMuxRendererPatchLoaded===true,
+        accountMenuInjected:globalThis.__codexMuxAccountMenuInjected===true,
+        accountMenuMounted:globalThis.__codexMuxAccountMenuMounted===true,
+        accountsLoaded:state.accountsLoaded===true,
+        accountCount:Number.isSafeInteger(state.accountCount)&&state.accountCount>=0?state.accountCount:0,
+        requestFailed:state.requestFailed===true,
+      };
+    })()`);
+    return {
+      rendererPatchLoaded: flags?.rendererPatchLoaded === true,
+      accountMenuInjected: flags?.accountMenuInjected === true,
+      accountMenuMounted: flags?.accountMenuMounted === true,
+      accountsLoaded: flags?.accountsLoaded === true,
+      accountCount:
+        Number.isSafeInteger(flags?.accountCount) && flags.accountCount >= 0
+          ? flags.accountCount
+          : 0,
+      requestFailed: flags?.requestFailed === true,
+    };
+  } catch {
+    return emptyRouterFlags();
+  }
+}
+
+async function observationWindow() {
+  for (const window of allWindows()) {
+    const flags = await readRouterFlags(window);
+    if (flags.rendererPatchLoaded) return window;
+  }
+  return mainWindow();
+}
+
+async function windowDiagnostics() {
+  const summaries = [];
+  for (const window of allWindows()) {
+    const flags = await readRouterFlags(window);
+    summaries.push({
+      webContentsId: safeWebContentsId(window),
+      visible: safeVisible(window),
+      bounds: safeBounds(window),
+      isLoading: safeLoading(window),
+      url: safeUrl(window),
+      rendererPatchLoaded: flags.rendererPatchLoaded,
+      accountMenuInjected: flags.accountMenuInjected,
+    });
+  }
+  return summaries;
 }
 
 async function runAction(window, action, delayMs) {
@@ -330,36 +457,29 @@ async function runAction(window, action, delayMs) {
 }
 
 async function capture(action, delayMs, includeDebug) {
-  let window = mainWindow();
+  let window = action === null ? await observationWindow() : mainWindow();
   if (!window) throw new Error("Codex Subscription Router has no main window");
   if (action !== null) await runAction(window, action, delayMs);
-  window = mainWindow() ?? window;
+  window = (await observationWindow()) ?? window;
   const image = await window.webContents.capturePage();
   const result = {
     bounds: window.getContentBounds(),
     imageBase64: image.toPNG().toString("base64"),
   };
   if (includeDebug) {
+    const routerFlags = await readRouterFlags(window);
     result.debug = await window.webContents.executeJavaScript(`(() => {
       const composer=document.querySelector('textarea[placeholder]')??document.querySelector('[contenteditable="true"]');
-      const describe=element=>{const rect=element.getBoundingClientRect(); return {ariaLabel:element.getAttribute('aria-label'),disabled:element.disabled,type:element.type,rect:{x:rect.x,y:rect.y,width:rect.width,height:rect.height}}};
-      const accountMenuState=globalThis.__codexMuxAccountMenuState??{};
+      const describe=element=>{const rect=element.getBoundingClientRect(); const label=element.getAttribute('aria-label'); return {ariaLabel:label==='Open profile menu'||/^Show (combined )?profile stats$/.test(label||'')?label:null,disabled:element.disabled,type:element.type,rect:{x:rect.x,y:rect.y,width:rect.width,height:rect.height}}};
       return {
         readyState: document.readyState,
-        href: location.href,
-        bodyText: document.body?.innerText?.trim().slice(0,500)??null,
-        rootHtml: document.querySelector('#root')?.innerHTML?.slice(0,1_000)??null,
         composer:composer?describe(composer):null,
         buttons:[...document.querySelectorAll('button')].filter(button=>{const rect=button.getBoundingClientRect();return rect.width>0&&rect.height>0&&rect.bottom>innerHeight-180}).map(describe),
-        router:{
-          accountMenuInjected:globalThis.__codexMuxAccountMenuInjected===true,
-          accountMenuMounted:globalThis.__codexMuxAccountMenuMounted===true,
-          accountsLoaded:accountMenuState.accountsLoaded===true,
-          accountCount:Number.isSafeInteger(accountMenuState.accountCount)&&accountMenuState.accountCount>=0?accountMenuState.accountCount:0,
-          requestFailed:accountMenuState.requestFailed===true,
-        },
       };
     })()`);
+    result.debug.url = safeUrl(window);
+    result.debug.router = routerFlags;
+    result.debug.windows = await windowDiagnostics();
     result.diagnostics = diagnostics.slice(-50);
   }
   return result;

@@ -1,3 +1,5 @@
+globalThis.__codexMuxRendererPatchLoaded = true;
+
 const CODEX_MUX_API = "http://127.0.0.1:__CODEX_MUX_CONTROL_PORT__/v1";
 const CODEX_MUX_TOKEN = "__CODEX_MUX_CONTROL_TOKEN__";
 let codexMuxLoginActive = false;

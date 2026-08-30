@@ -8,14 +8,19 @@ import json
 import os
 import re
 import secrets
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PROJECT_VERSION = (PROJECT_ROOT / "VERSION").read_text(encoding="utf-8").strip()
 DEFAULT_STATE_ROOT = Path.home() / ".codex-mux"
 CONTROL_PORT = 48123
+RENDERER_SYNTAX_BLOCKED = "PHASE 2A.5 RENDERER SYNTAX BLOCKED"
 
 
 @dataclass(frozen=True)
@@ -145,6 +150,20 @@ def _require_unique(text: str, anchor: str, message: str) -> None:
     count = text.count(anchor)
     if count != 1:
         raise RuntimeError(f"{message} (anchor count: {count})")
+
+
+def _require_usage_value_anchor(bundle: str, values: dict[str, object]) -> str:
+    """Require a usage-menu anchor outside the native destructuring binding."""
+
+    usage_anchor = str(values["usage_slot"])
+    component_anchor = str(values["component_anchor"])
+    if usage_anchor in component_anchor:
+        raise RuntimeError(
+            "renderer usage menu slot resolves to the native destructuring binding; "
+            "a value-site anchor is required"
+        )
+    _require_unique(bundle, usage_anchor, "could not find the native ChatGPT usage menu value slot")
+    return usage_anchor
 
 
 def _require_asset(assets: list[Path], anchor: str, message: str) -> Path:
@@ -695,7 +714,10 @@ def _windows_26_825_renderer_values() -> dict[str, object]:
         "reset_mutation_replacement": reset_mutation_replacement,
         "usage_header": usage_header,
         "usage_header_replacement": usage_header_replacement,
-        "usage_slot": "usageItems:h",
+        # ``usageItems:h`` belongs to ZCc's object-destructuring binding. The
+        # native profile-menu call later passes its computed value as ``wt``;
+        # patch that value site so the binding remains valid JavaScript.
+        "usage_slot": "usageItems:wt",
         "usage_slot_replacement": (
             "usageItems:(globalThis.__codexMuxAccountMenuInjected=true,"
             "(0,l8.jsx)(CodexMuxAccountMenu,{}))"
@@ -1649,8 +1671,7 @@ def _patch_legacy_renderer(
     usage_header_anchor = str(values["usage_header"])
     _require_unique(bundle, usage_header_anchor, "could not find the native Usage sheet header")
     bundle = bundle.replace(usage_header_anchor, str(values["usage_header_replacement"]), 1)
-    usage_anchor = str(values["usage_slot"])
-    _require_unique(bundle, usage_anchor, "could not find the native ChatGPT usage menu slot")
+    usage_anchor = _require_usage_value_anchor(bundle, values)
     bundle = bundle.replace(usage_anchor, str(values["usage_slot_replacement"]), 1)
 
     for anchor in values["open_change"]:
@@ -1817,8 +1838,7 @@ def _patch_windows_26_820_renderer(
         str(values["usage_header_replacement"]),
         1,
     )
-    usage_anchor = str(values["usage_slot"])
-    _require_unique(bundle, usage_anchor, "could not find the native ChatGPT usage menu slot")
+    usage_anchor = _require_usage_value_anchor(bundle, values)
     bundle = bundle.replace(usage_anchor, str(values["usage_slot_replacement"]), 1)
 
     for anchor in values["open_change"]:
@@ -1993,8 +2013,7 @@ def _patch_windows_26_825_renderer(
         str(values["usage_header_replacement"]),
         1,
     )
-    usage_anchor = str(values["usage_slot"])
-    _require_unique(bundle, usage_anchor, "could not find the native ChatGPT usage menu slot")
+    usage_anchor = _require_usage_value_anchor(bundle, values)
     bundle = bundle.replace(usage_anchor, str(values["usage_slot_replacement"]), 1)
 
     for anchor in values["open_change"]:
@@ -2077,6 +2096,147 @@ def _patch_windows_26_825_renderer(
     thread = thread.replace(summary_anchor, summary_replacement, 1)
     thread_path.write_text(thread, encoding="utf-8")
     return audit
+
+
+def _syntax_error_details(output: str) -> tuple[int | None, int | None, str]:
+    """Extract only a safe location and concise parser message from Node."""
+
+    lines = output.splitlines()
+    line_number: int | None = None
+    column_number: int | None = None
+    for index, line in enumerate(lines):
+        location = re.search(r":(?P<line>\d+)(?::(?P<column>\d+))?\s*$", line.strip())
+        if location is None:
+            continue
+        line_number = int(location.group("line"))
+        if location.group("column") is not None:
+            column_number = int(location.group("column"))
+        for following in lines[index + 1 : index + 4]:
+            caret = following.find("^")
+            if caret >= 0:
+                column_number = caret + 1
+                break
+        break
+    message = "syntax check failed"
+    for line in lines:
+        match = re.search(r"SyntaxError:\s*(?P<message>.+)", line)
+        if match:
+            message = " ".join(match.group("message").split())[:300]
+            break
+    return line_number, column_number, message
+
+
+def _syntax_asset_name(path: Path, root: Path | None) -> str:
+    """Return a source-safe asset label without exposing source contents."""
+
+    if root is not None:
+        try:
+            return path.resolve(strict=False).relative_to(root.resolve(strict=False)).as_posix()
+        except ValueError:
+            pass
+    return path.name
+
+
+def validate_patched_javascript_syntax(
+    assets: Iterable[Path],
+    *,
+    root: Path | None = None,
+) -> dict[str, object]:
+    """Parse patched JavaScript assets with Node without executing them.
+
+    Renderer chunks are copied to temporary ``.mjs`` files so Node uses its
+    module grammar for the ESM-shaped assets. CommonJS bridge files retain a
+    ``.cjs`` suffix. Only a bounded parser error is returned to callers; the
+    minified source is never included in the failure message.
+    """
+
+    unique_assets: list[Path] = []
+    seen: set[Path] = set()
+    for asset in assets:
+        path = Path(asset)
+        if path.suffix.casefold() not in {".js", ".mjs", ".cjs"}:
+            continue
+        resolved = path.resolve(strict=False)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique_assets.append(path)
+    if not unique_assets:
+        raise RuntimeError(f"{RENDERER_SYNTAX_BLOCKED}: no JavaScript assets were supplied")
+
+    node = shutil.which("node")
+    if node is None:
+        raise RuntimeError(
+            f"{RENDERER_SYNTAX_BLOCKED}: asset={_syntax_asset_name(unique_assets[0], root)}; "
+            "parser=node; version=unavailable; line=unknown; column=unknown; "
+            "error=Node runtime not found"
+        )
+    try:
+        version_result = subprocess.run(
+            [node, "--version"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+        parser_version = (version_result.stdout or version_result.stderr).strip().splitlines()
+        parser_version = parser_version[0] if parser_version else "unknown"
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError(
+            f"{RENDERER_SYNTAX_BLOCKED}: asset={_syntax_asset_name(unique_assets[0], root)}; "
+            f"parser=node; version=unavailable; line=unknown; column=unknown; "
+            f"error=unable to query Node version: {' '.join(str(error).split())[:240]}"
+        ) from error
+
+    validated: list[str] = []
+    with tempfile.TemporaryDirectory(prefix=".codex-router-js-check-") as temporary:
+        temporary_root = Path(temporary)
+        for index, asset in enumerate(unique_assets):
+            display_name = _syntax_asset_name(asset, root)
+            if not asset.is_file():
+                raise RuntimeError(
+                    f"{RENDERER_SYNTAX_BLOCKED}: asset={display_name}; parser=node; version={parser_version}; "
+                    "line=unknown; column=unknown; error=asset not found"
+                )
+            suffix = ".cjs" if asset.suffix.casefold() == ".cjs" else ".mjs"
+            parse_path = temporary_root / f"asset-{index}{suffix}"
+            try:
+                shutil.copyfile(asset, parse_path)
+                checked = subprocess.run(
+                    [node, "--check", str(parse_path)],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=60,
+                )
+            except (OSError, subprocess.SubprocessError) as error:
+                raise RuntimeError(
+                    f"{RENDERER_SYNTAX_BLOCKED}: asset={display_name}; parser=node; version={parser_version}; "
+                    "line=unknown; column=unknown; "
+                    f"error=parser invocation failed: {' '.join(str(error).split())[:240]}"
+                ) from error
+            if checked.returncode != 0:
+                parser_output = checked.stderr or checked.stdout
+                line_number, column_number, message = _syntax_error_details(parser_output)
+                line_text = str(line_number) if line_number is not None else "unknown"
+                column_text = str(column_number) if column_number is not None else "unknown"
+                raise RuntimeError(
+                    f"{RENDERER_SYNTAX_BLOCKED}: asset={display_name}; parser=node; version={parser_version}; "
+                    f"line={line_text}; column={column_text}; error={message}"
+                )
+            validated.append(display_name)
+    return {
+        "status": "PASS",
+        "parser": "node",
+        "version": parser_version,
+        "validated_assets": validated,
+    }
 
 
 def patch_renderer(

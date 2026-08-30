@@ -723,6 +723,7 @@ def native_evidence_is_usable(cleanup_status: dict[str, object]) -> bool:
     )
 
 
+ROUTER_RENDERER_NOT_LOADED = "ROUTER_RENDERER_NOT_LOADED"
 ROUTER_MENU_NOT_INJECTED = "ROUTER_MENU_NOT_INJECTED"
 ROUTER_MENU_NOT_MOUNTED = "ROUTER_MENU_NOT_MOUNTED"
 ROUTER_MENU_ACCOUNTS_LOADING = "ROUTER_MENU_ACCOUNTS_LOADING"
@@ -737,6 +738,7 @@ def _router_account_menu_evidence(ui_body: object) -> dict[str, object]:
     if type(account_count) is not int or account_count < 0:
         account_count = 0
     return {
+        "renderer_loaded": router.get("rendererPatchLoaded") is True,
         "injected": router.get("accountMenuInjected") is True,
         "mounted": router.get("accountMenuMounted") is True,
         "accounts_loaded": router.get("accountsLoaded") is True,
@@ -757,7 +759,9 @@ def router_account_menu_gate(
     component was injected, mounted, or able to load account state.
     """
     evidence = _router_account_menu_evidence(ui_body)
-    if not evidence["injected"]:
+    if not evidence["renderer_loaded"]:
+        status = ROUTER_RENDERER_NOT_LOADED
+    elif not evidence["injected"]:
         status = ROUTER_MENU_NOT_INJECTED
     elif mounting_expected and not evidence["mounted"]:
         status = ROUTER_MENU_NOT_MOUNTED

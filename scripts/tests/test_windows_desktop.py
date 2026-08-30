@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.patch_common import (
+    RENDERER_SYNTAX_BLOCKED,
     _plugin_mapping_anchors,
     audit_renderer_anchors,
     compare_renderer_contract,
@@ -20,8 +21,10 @@ from scripts.patch_common import (
     patch_renderer,
     renderer_variant_template,
     select_renderer_variant,
+    validate_patched_javascript_syntax,
 )
 from scripts.patch_app_windows import (
+    _patched_javascript_assets,
     _payload_acl_for_strategy,
     audit_windows_source,
     build_windows_desktop,
@@ -93,6 +96,7 @@ from scripts.windows.smoke import (
     ROUTER_MENU_ACCOUNTS_LOAD_FAILED,
     ROUTER_MENU_NOT_INJECTED,
     ROUTER_MENU_NOT_MOUNTED,
+    ROUTER_RENDERER_NOT_LOADED,
     build_production_gate,
     _probe_candidate,
     classify_probe_output,
@@ -193,6 +197,63 @@ def write_exact_26_820_renderer_fixture(root: Path) -> dict[str, object]:
     (assets / "plugins-page-26-820.js").write_text(str(values["plugin_anchor"]), encoding="utf-8")
     (assets / "local-conversation-thread-26-820.js").write_text(
         str(values["thread_anchor"]) + " " + str(values["thread_summary_anchor"]),
+        encoding="utf-8",
+    )
+    return values
+
+
+def write_exact_26_825_renderer_fixture(root: Path) -> dict[str, object]:
+    """Create a valid, bounded fixture for the reviewed 26.825 contract."""
+
+    values = renderer_variant_template("windows-26.825")
+    webview = root / "webview"
+    assets = webview / "assets"
+    assets.mkdir(parents=True)
+    tick = chr(96)
+    bundle_parts = [
+        "const QCc={c:()=>33};const l8={jsx:()=>null,jsxs:()=>null,Fragment:null};",
+        str(values["component_anchor"]) + ";return h}",
+        "const s=false,c=()=>{},N=null,Ot=null;",
+        "const openMenu={" + str(values["open_change"][0]) + "};",
+        "const openPreserved={" + str(values["open_preserved"]) + "};",
+        "function usageWindow(){let v=null,g=null;let y=v;if(g!=null){y=g;}return y}",
+        "function twc(){let wt=null;return (0,l8.jsx)(ZCc,{usageItems:wt,workspaceSettingsRightIcon:null})}",
+    ]
+    for key in (
+        "app_server_anchor",
+        "profile_query",
+        "usage_modal",
+        "reset_query",
+        "reset_mutation",
+        "usage_header",
+    ):
+        bundle_parts.append(f"/* {values[key]} */")
+    for spec in values["plugin_mappings"]:
+        if spec["name"] == "mcpServerStatus/list RPC call":
+            # The call anchor is intentionally a substring of the reviewed
+            # listMcpServers wrapper; keeping a second copy would make the
+            # exact-anchor audit ambiguous.
+            continue
+        bundle_parts.append(f"/* {spec['current']} */")
+    for message in (
+        f"defaultMessage:{tick}You’re out of Codex and Work usage{tick}",
+        f"defaultMessage:{tick}You’ve used all Codex and Work usage{tick}",
+        f"defaultMessage:{tick}You’ve reached your usage limit{tick}",
+    ):
+        bundle_parts.append(f"/* {message} */")
+
+    (webview / "index.html").write_text("connect-src &#39;self&#39;", encoding="utf-8")
+    (assets / "app-initial-26-825.js").write_text("\n".join(bundle_parts), encoding="utf-8")
+    (assets / "profile-26-825.js").write_text(
+        " ".join(f"/* {values[key]} */" for key in ("profile_avatar", "profile_name", "profile_identity")),
+        encoding="utf-8",
+    )
+    (assets / "plugins-page-26-825.js").write_text(
+        f"/* {values['plugin_anchor']} */",
+        encoding="utf-8",
+    )
+    (assets / "local-conversation-thread-26-825.js").write_text(
+        f"/* {values['thread_anchor']} */\n/* {values['thread_summary_anchor']} */",
         encoding="utf-8",
     )
     return values
@@ -567,6 +628,7 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         router_ui = {
             "debug": {
                 "router": {
+                    "rendererPatchLoaded": True,
                     "accountMenuInjected": True,
                     "accountMenuMounted": True,
                     "accountsLoaded": True,
@@ -583,6 +645,7 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         upstream_only = {
             "debug": {
                 "router": {
+                    "rendererPatchLoaded": True,
                     "accountMenuInjected": False,
                     "accountMenuMounted": False,
                     "accountsLoaded": False,
@@ -606,6 +669,7 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         base = {
             "debug": {
                 "router": {
+                    "rendererPatchLoaded": True,
                     "accountMenuInjected": False,
                     "accountMenuMounted": False,
                     "accountsLoaded": False,
@@ -625,6 +689,9 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         result = router_account_menu_gate(base)
         self.assertFalse(result["pass"])
         self.assertEqual(result["status"], ROUTER_MENU_ACCOUNTS_LOAD_FAILED)
+
+        not_loaded = {"debug": {"router": {"accountMenuInjected": True}}}
+        self.assertEqual(router_account_menu_gate(not_loaded)["status"], ROUTER_RENDERER_NOT_LOADED)
 
     def test_production_gate_reports_failed_predicates(self) -> None:
         gate = build_production_gate(
@@ -646,6 +713,16 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         raw = {
             "status": PATCHED_SHELL_BLOCKED,
             "reason": "router account-menu runtime gate failed",
+            "build_metadata_summary": {
+                "destination": "C:\\safe\\patched-shell",
+                "renderer_syntax_validation": {
+                    "status": "PASS",
+                    "parser": "node",
+                    "version": "v24.15.0",
+                    "validated_assets": ["webview/assets/app-initial-fixture.js"],
+                    "source_text": "must not be exported",
+                },
+            },
             "chatgpt_classification": {
                 "status": PASS,
                 "reason": "safe classification",
@@ -653,6 +730,7 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                 "log_tail": "user@example.com",
             },
             "router_account_menu": {
+                "renderer_loaded": True,
                 "injected": False,
                 "mounted": False,
                 "accounts_loaded": False,
@@ -698,6 +776,11 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         public = _public_probe(raw)
         encoded = json.dumps(public, sort_keys=True)
         self.assertIn("router_account_menu", public)
+        self.assertEqual(
+            public["build_metadata_summary"]["renderer_syntax_validation"]["status"],
+            "PASS",
+        )
+        self.assertNotIn("source_text", json.dumps(public, sort_keys=True))
         self.assertIn("production_gate", public)
         self.assertIn("chatgpt_classification", public)
         self.assertIn("native_button_diagnostics", public["ui_bridge"])
@@ -717,6 +800,7 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             encoding="utf-8"
         )
         for marker in (
+            "__codexMuxRendererPatchLoaded",
             "__codexMuxAccountMenuMounted",
             "accountsLoaded",
             "accountCount",
@@ -726,6 +810,8 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             self.assertIn(marker, bridge)
         self.assertIn("__codexMuxAccountMenuInjected", bridge)
         self.assertNotIn("text:element.textContent.trim().slice(0,80)", bridge)
+        self.assertNotIn("bodyText", bridge)
+        self.assertNotIn("rootHtml", bridge)
 
     def test_phase2a4_final_layout_root_uses_localappdata_and_is_disposable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1446,6 +1532,7 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                 str(values["usage_modal"]),
                 str(values["reset_query"]),
                 str(values["reset_mutation"]),
+                str(values["usage_slot"]),
                 str(values["open_change"][0]),
             ]
         )
@@ -1932,6 +2019,75 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             records = load_compatibility_records(path)
             self.assertEqual(records[0].package_name, "OpenAI.Codex")
             self.assertEqual(records[0].real_codex_version, "codex-cli test")
+
+    def test_renderer_syntax_gate_blocks_old_invalid_destructuring_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            asset = root / "app-initial-invalid.js"
+            asset.write_text(
+                "function ZCc(e){let {usageItems:(globalThis.__codexMuxAccountMenuInjected=true,"
+                "(0,l8.jsx)(CodexMuxAccountMenu,{}))}=e}",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                RuntimeError,
+                rf"{RENDERER_SYNTAX_BLOCKED}.*asset=app-initial-invalid\.js.*"
+                r"line=1.*column=.*Invalid destructuring assignment target",
+            ):
+                validate_patched_javascript_syntax([asset], root=root)
+
+    def test_windows_26_825_patch_preserves_destructuring_and_parses_fixture(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            values = write_exact_26_825_renderer_fixture(root)
+            audit = audit_renderer_anchors(root)
+            self.assertFalse(
+                any(item.status in {"MISSING", "SEMANTICALLY_CHANGED", "AMBIGUOUS"} for item in audit),
+                audit,
+            )
+            patch_renderer(
+                root,
+                "d" * 64,
+                package_name="OpenAI.Codex",
+                package_version="26.825.5331.0",
+                app_asar_sha256="178b65229452b17b0203ab41d5ceafedccd770c9bd42d239a6d048d27d80252b",
+            )
+            assets = root / "webview" / "assets"
+            patched = (assets / "app-initial-26-825.js").read_text(encoding="utf-8")
+            self.assertIn(str(values["component_anchor"]), patched)
+            self.assertEqual(patched.count("usageItems:h,workspaceSettingsRightIcon:g}=e"), 1)
+            self.assertIn(
+                "usageItems:(globalThis.__codexMuxAccountMenuInjected=true,"
+                "(0,l8.jsx)(CodexMuxAccountMenu,{}))",
+                patched,
+            )
+            summary = validate_patched_javascript_syntax(
+                [
+                    assets / "app-initial-26-825.js",
+                    assets / "profile-26-825.js",
+                    assets / "plugins-page-26-825.js",
+                    assets / "local-conversation-thread-26-825.js",
+                ],
+                root=root,
+            )
+            self.assertEqual(summary["status"], "PASS")
+            self.assertEqual(
+                set(summary["validated_assets"]),
+                {
+                    "webview/assets/app-initial-26-825.js",
+                    "webview/assets/profile-26-825.js",
+                    "webview/assets/plugins-page-26-825.js",
+                    "webview/assets/local-conversation-thread-26-825.js",
+                },
+            )
+
+    def test_full_build_places_renderer_syntax_gate_before_asar_pack(self) -> None:
+        source = inspect.getsource(build_windows_desktop)
+        renderer_patch = source.index("patch_renderer(")
+        syntax_gate = source.index("validate_patched_javascript_syntax(", renderer_patch)
+        asar_pack = source.index("listing = pack_asar(", syntax_gate)
+        self.assertLess(renderer_patch, syntax_gate)
+        self.assertLess(syntax_gate, asar_pack)
 
     def test_shared_renderer_patch_applies_exact_fixture_anchors(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

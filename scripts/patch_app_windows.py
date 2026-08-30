@@ -23,6 +23,7 @@ try:
         load_or_create_token,
         patch_renderer,
         select_renderer_variant,
+        validate_patched_javascript_syntax,
     )
     from .windows.bootstrap import BootstrapPatchReport, audit_bootstrap, patch_bootstrap
     from .windows.compatibility import (
@@ -104,6 +105,7 @@ except ImportError:
         load_or_create_token,
         patch_renderer,
         select_renderer_variant,
+        validate_patched_javascript_syntax,
     )
     from windows.bootstrap import BootstrapPatchReport, audit_bootstrap, patch_bootstrap
     from windows.compatibility import (
@@ -770,6 +772,10 @@ def _minimal_bootstrap_smoke(
             disable_updater=disable_updater,
             inject_ui_test_bridge=False,
         )
+        renderer_syntax_validation = validate_patched_javascript_syntax(
+            [bootstrap_report.bootstrap, bootstrap_report.main],
+            root=extracted,
+        )
         unpacked_source = mirror_root / "resources" / "app.asar.unpacked"
         unpack_directories = derive_unpack_directories(unpacked_source)
         unpack_files = derive_unpack_files(unpacked_source)
@@ -826,6 +832,7 @@ def _minimal_bootstrap_smoke(
                 "updater_disabled": bootstrap_report.updater_disabled,
                 "strategy": bootstrap_report.strategy,
             },
+            "renderer_syntax_validation": renderer_syntax_validation,
             "integrity": integrity_result,
             "fuse_carriers": fuse_scan,
             "mirror": mirror_report.to_dict(),
@@ -950,6 +957,7 @@ def _run_sandbox_acl_smoke(args: argparse.Namespace) -> int:
                         "destination": str(patched_destination),
                         "desktop_launch_executable": metadata.get("desktop_launch_executable"),
                         "payload_acl_strategy": metadata.get("payload_acl_strategy"),
+                        "renderer_syntax_validation": metadata.get("renderer_syntax_validation"),
                     }
             # Cleanup-dependent result fields are attached only after the
             # final-layout context has completed its __exit__/finally block.
@@ -1161,6 +1169,27 @@ def verify_asar_listing(
             raise RuntimeError(f"root ASAR unpacked file was not preserved: {file}")
 
 
+def _patched_javascript_assets(
+    extracted: Path,
+    bootstrap_report: BootstrapPatchReport,
+) -> list[Path]:
+    """Enumerate every JavaScript asset touched by the Router patch."""
+
+    assets = extracted / "webview" / "assets"
+    paths = [bootstrap_report.bootstrap, bootstrap_report.main]
+    if bootstrap_report.ui_test_bridge is not None:
+        paths.append(bootstrap_report.ui_test_bridge)
+    for pattern in (
+        "app-initial-*.js",
+        "profile-*.js",
+        "plugins-page-*.js",
+        "plugins-settings-*.js",
+        "local-conversation-thread-*.js",
+    ):
+        paths.extend(sorted(assets.glob(pattern)))
+    return paths
+
+
 def _metadata(
     source: DesktopSource,
     real: RealCodexCandidate,
@@ -1172,6 +1201,7 @@ def _metadata(
     fuse_scan: dict[str, object],
     mirror_report: object,
     payload_acl: dict[str, object],
+    renderer_syntax_validation: Mapping[str, object],
 ) -> dict[str, object]:
     return {
         "platform": "windows",
@@ -1242,6 +1272,7 @@ def _metadata(
         "payload_acl": payload_acl,
         "payload_acl_strategy": payload_acl.get("strategy", PAYLOAD_ACL_UNRESOLVED),
         "payload_acl_scope": "Router-owned app tree only; runtime, User Data, and control token excluded",
+        "renderer_syntax_validation": dict(renderer_syntax_validation),
         "fuse_carriers": fuse_scan,
         "actual_fuse_carrier_relative_paths": fuse_scan.get("carrier_relative_paths", []),
         "mirror": {
@@ -1559,6 +1590,10 @@ def build_windows_desktop(
             package_version=source.package.version,
             app_asar_sha256=source_hash,
         )
+        renderer_syntax_validation = validate_patched_javascript_syntax(
+            _patched_javascript_assets(extracted, bootstrap_report),
+            root=extracted,
+        )
         unpacked_source = staged_resources / "app.asar.unpacked"
         unpack_directories = derive_unpack_directories(unpacked_source)
         unpack_files = derive_unpack_files(unpacked_source)
@@ -1618,6 +1653,7 @@ def build_windows_desktop(
             fuse_scan,
             mirror_report,
             payload_acl,
+            renderer_syntax_validation,
         )
         metadata["reviewed_source"] = dict(reviewed_record) if reviewed_ok else None
         metadata["reviewed_source_gate"] = {

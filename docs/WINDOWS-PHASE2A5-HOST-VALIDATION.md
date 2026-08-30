@@ -65,6 +65,54 @@ The required `checks` and `windows-go-core` jobs both passed for that exact
 commit in GitHub Actions run `33304158356`.  Native compatibility promotion
 still requires the independent external-host rerun below.
 
+## Renderer syntax and value-site injection fix
+
+The latest native result identified `ROUTER_MENU_NOT_INJECTED`, so the exact
+reviewed Windows 26.825 renderer was checked before changing the patch.  The
+source identity was `OpenAI.Codex 26.825.5331.0` with app.asar SHA-256
+`178b65229452b17b0203ab41d5ceafedccd770c9bd42d239a6d048d27d80252b`.
+
+The complete bounded audit of `function ZCc` showed that its
+`usageItems:h` occurrence is the object-destructuring binding.  The later
+profile-menu call computes the native usage value in `wt` and passes it as the
+unique object-literal value `usageItems:wt`.  The 26.825 contract now patches
+that value site and leaves the destructuring binding unchanged.  The other
+reviewed contracts remain value-site hooks: `usageItems:Ct` (legacy 6662),
+`usageItems:Ge` (legacy current), and `usageItems:wt` (Windows 26.820).
+The patcher fails closed if a configured usage anchor is part of the native
+component binding.
+
+The old code was reproduced against the exact source in a disposable
+extraction.  The patched `app-initial-DWX_sBmZ.js` failed the syntax-only Node
+check at line 9667, column 259 with `Invalid destructuring assignment target`.
+The failure report contained only the asset, parser/version, location, and
+concise error; it did not print minified source.  A valid 26.825-style fixture
+now proves the old replacement fails, the new value-site replacement parses,
+and `usageItems:h` remains intact.
+
+Every Router-touched JavaScript asset is now parsed with Node before ASAR
+packing.  Renderer `.js` assets are checked through temporary `.mjs`
+representations; the CommonJS UI bridge is checked as `.cjs`; no bundle is
+executed.  A syntax failure stops the build with
+`PHASE 2A.5 RENDERER SYNTAX BLOCKED` and a bounded diagnostic.  The exact
+source disposable rebuild after the fix passed Node `v24.15.0` for the
+bootstrap/main bundles, UI bridge, initial renderer, profile, plugin, and
+conversation-thread assets.
+
+The injected helper now sets the independent
+`__codexMuxRendererPatchLoaded` marker at the start of renderer execution.
+The bridge reports that marker, the account-menu injection/mount/load state,
+and safe summaries for every non-destroyed BrowserWindow using only IDs,
+visibility, bounds, loading state, sanitized origin/path, and Router flags.
+Page body, conversation content, window titles, identities, tokens, and full
+query parameters are not exposed.  Runtime classification now distinguishes
+`ROUTER_RENDERER_NOT_LOADED` from `ROUTER_MENU_NOT_INJECTED` and the existing
+mount/load failures.  The build metadata records a safe
+`renderer_syntax_validation` summary.
+
+This is still a code-level fix only.  The independent native rerun below is
+required before claiming `FULL PHASE 2A.5 PASS`.
+
 ## Patched-shell staging layout fix
 
 The failed native run for commit `646fde9a4dc59de145e8a3faa9a0c0be0e1c5a19`
