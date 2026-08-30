@@ -808,11 +808,17 @@ def _resolve_validation_profile_root(
     """Resolve a persistent profile only inside the Router-owned local tree."""
 
     owner_root = (local_appdata.expanduser() / "Codex Subscription Router").resolve(strict=False)
-    root = (
-        override.expanduser().resolve(strict=False)
+    requested_root = (
+        override.expanduser()
         if override is not None
         else validation_profile_root(local_appdata)
     )
+    # Windows may expose the same directory through an 8.3 alias (for
+    # example ``RUNNER~1``) in one value and its long name in another. Resolve
+    # both the ownership boundary and the selected profile before comparing
+    # them, otherwise a valid profile can be rejected as being outside the
+    # Router-owned tree on hosted runners.
+    root = requested_root.resolve(strict=False)
     if "windowsapps" in str(root).casefold():
         raise RuntimeError("the persistent Router validation profile must be outside WindowsApps")
     try:

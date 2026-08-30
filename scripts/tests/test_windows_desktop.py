@@ -1300,6 +1300,7 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
     def test_persistent_external_shell_uses_auth_profile_without_disposable_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             profile = Path(temporary) / "Codex Subscription Router" / "_validation-profile"
+            resolved_profile = profile.resolve(strict=False)
             source = SimpleNamespace()
             selected = SimpleNamespace()
             with patch(
@@ -1330,7 +1331,7 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             build.assert_called_once()
             self.assertTrue(build.call_args.kwargs["force"])
             smoke.assert_called_once()
-            self.assertEqual(smoke.call_args.kwargs["user_data_override"], profile / "User Data")
+            self.assertEqual(smoke.call_args.kwargs["user_data_override"], resolved_profile / "User Data")
             self.assertTrue(smoke.call_args.kwargs["preserve_user_data"])
             self.assertTrue(smoke.call_args.kwargs["auth_required"])
             self.assertEqual(result["status"], ROUTER_DESKTOP_AUTH_REQUIRED)
@@ -1398,7 +1399,7 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                     repo_root=root,
                     timeout_seconds=900,
                 )
-            profile = local_appdata / "Codex Subscription Router" / "_validation-profile"
+            profile = (local_appdata / "Codex Subscription Router" / "_validation-profile").resolve(strict=False)
             self.assertEqual(result["status"], DESKTOP_AUTH_PREPARED)
             self.assertFalse(result["manual_operation_required"])
             self.assertEqual(result["validation_profile"]["root"], str(profile))
@@ -1476,7 +1477,9 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                 return_value={"stable": True, "changed_fields": []},
             ):
                 result = run_phase2a5_host_validation(repo_root=root)
-            expected_profile = local_appdata / "Codex Subscription Router" / "_validation-profile"
+            expected_profile = (local_appdata / "Codex Subscription Router" / "_validation-profile").resolve(
+                strict=False
+            )
             self.assertEqual(result["status"], PHASE2A5_DESKTOP_AUTH_REQUIRED)
             self.assertEqual(result["validation_profile"]["root"], str(expected_profile))
             external.assert_called_once()
