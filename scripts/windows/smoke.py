@@ -723,11 +723,113 @@ def native_evidence_is_usable(cleanup_status: dict[str, object]) -> bool:
     )
 
 
+def validation_profile_root(local_appdata: Path | None = None) -> Path:
+    """Return the Router-owned persistent Desktop validation profile root."""
+
+    if local_appdata is None:
+        local_appdata_value = os.environ.get("LOCALAPPDATA")
+        local_appdata = (
+            Path(local_appdata_value).expanduser()
+            if local_appdata_value
+            else Path.home() / "AppData" / "Local"
+        )
+    root = local_appdata.expanduser() / "Codex Subscription Router" / VALIDATION_PROFILE_DIRNAME
+    if is_windowsapps_path(root):
+        raise RuntimeError("the Router validation profile must be outside WindowsApps")
+    return root
+
+
 ROUTER_RENDERER_NOT_LOADED = "ROUTER_RENDERER_NOT_LOADED"
+ROUTER_RENDERER_RUNTIME_ERROR = "ROUTER_RENDERER_RUNTIME_ERROR"
+ROUTER_UI_NOT_READY = "ROUTER_UI_NOT_READY"
+ROUTER_DESKTOP_AUTH_REQUIRED = "ROUTER_DESKTOP_AUTH_REQUIRED"
+ROUTER_DESKTOP_AUTH_UNKNOWN = "ROUTER_DESKTOP_AUTH_UNKNOWN"
+ROUTER_PROFILE_CONTROLLER_NOT_READY = "ROUTER_PROFILE_CONTROLLER_NOT_READY"
+ROUTER_PROFILE_ACTIVATION_FAILED = "ROUTER_PROFILE_ACTIVATION_FAILED"
+ROUTER_MENU_NOT_INJECTED_AFTER_OPEN = "ROUTER_MENU_NOT_INJECTED_AFTER_OPEN"
 ROUTER_MENU_NOT_INJECTED = "ROUTER_MENU_NOT_INJECTED"
 ROUTER_MENU_NOT_MOUNTED = "ROUTER_MENU_NOT_MOUNTED"
 ROUTER_MENU_ACCOUNTS_LOADING = "ROUTER_MENU_ACCOUNTS_LOADING"
 ROUTER_MENU_ACCOUNTS_LOAD_FAILED = "ROUTER_MENU_ACCOUNTS_LOAD_FAILED"
+DESKTOP_AUTH_PREPARED = "DESKTOP_AUTH_PREPARED"
+VALIDATION_PROFILE_DIRNAME = "_validation-profile"
+
+_DESKTOP_AUTH_STATES = {"AUTHENTICATED", "AUTH_REQUIRED", "UNKNOWN"}
+
+
+def _desktop_auth_evidence(ui_body: object) -> dict[str, object]:
+    debug = ui_body.get("debug") if isinstance(ui_body, dict) else None
+    raw = debug.get("desktop_auth") if isinstance(debug, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+    state = raw.get("state")
+    return {"state": state if isinstance(state, str) and state in _DESKTOP_AUTH_STATES else "UNKNOWN"}
+
+
+def _renderer_runtime_evidence(ui_body: object) -> dict[str, object] | None:
+    debug = ui_body.get("debug") if isinstance(ui_body, dict) else None
+    raw = debug.get("renderer_runtime") if isinstance(debug, dict) else None
+    if not isinstance(raw, dict):
+        return None
+    output: dict[str, object] = {}
+    ready_state = raw.get("readyState")
+    if isinstance(ready_state, str) and ready_state in {"loading", "interactive", "complete", "unknown"}:
+        output["ready_state"] = ready_state
+    for source_key, target_key in (
+        ("rootPresent", "root_present"),
+        ("composerPresent", "composer_present"),
+        ("profileControllerReady", "profile_controller_ready"),
+    ):
+        value = raw.get(source_key)
+        if isinstance(value, bool):
+            output[target_key] = value
+    for source_key, target_key in (
+        ("rootChildCount", "root_child_count"),
+        ("bodyChildCount", "body_child_count"),
+        ("buttonCount", "button_count"),
+        ("visibleInteractiveCount", "visible_interactive_count"),
+        ("runtimeErrorCount", "runtime_error_count"),
+    ):
+        value = raw.get(source_key)
+        if type(value) is int and value >= 0:
+            output[target_key] = value
+    last_error = raw.get("lastSafeRuntimeError")
+    if isinstance(last_error, dict):
+        output["last_safe_runtime_error"] = {
+            key: last_error[key]
+            for key in ("kind", "name", "source_asset", "line", "column")
+            if isinstance(last_error.get(key), (str, int)) or last_error.get(key) is None
+        }
+    return output
+
+
+def _profile_controller_evidence(ui_body: object) -> dict[str, bool]:
+    debug = ui_body.get("debug") if isinstance(ui_body, dict) else None
+    raw = debug.get("profile_controller") if isinstance(debug, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+    return {
+        "ready": raw.get("ready") is True,
+        "activation_attempted": raw.get("activationAttempted") is True,
+        "activation_succeeded": raw.get("activationSucceeded") is True,
+    }
+
+
+def _runtime_error_evidence(ui_body: object) -> list[dict[str, object]]:
+    debug = ui_body.get("debug") if isinstance(ui_body, dict) else None
+    raw = debug.get("runtime_errors") if isinstance(debug, dict) else None
+    if not isinstance(raw, list):
+        return []
+    output: list[dict[str, object]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        output.append(
+            {
+                key: item[key]
+                for key in ("kind", "name", "source_asset", "line", "column", "reason", "exit_code")
+                if isinstance(item.get(key), (str, int)) or item.get(key) is None
+            }
+        )
+    return output[-20:]
 
 
 def _router_account_menu_evidence(ui_body: object) -> dict[str, object]:
@@ -739,6 +841,10 @@ def _router_account_menu_evidence(ui_body: object) -> dict[str, object]:
         account_count = 0
     return {
         "renderer_loaded": router.get("rendererPatchLoaded") is True,
+        "desktop_auth": _desktop_auth_evidence(ui_body),
+        "renderer_runtime": _renderer_runtime_evidence(ui_body),
+        "profile_controller": _profile_controller_evidence(ui_body),
+        "runtime_errors": _runtime_error_evidence(ui_body),
         "injected": router.get("accountMenuInjected") is True,
         "mounted": router.get("accountMenuMounted") is True,
         "accounts_loaded": router.get("accountsLoaded") is True,
@@ -751,6 +857,8 @@ def router_account_menu_gate(
     ui_body: object,
     *,
     mounting_expected: bool = True,
+    activation_attempted: bool = False,
+    activation_succeeded: bool = False,
 ) -> dict[str, object]:
     """Evaluate only Router-owned account-menu runtime evidence.
 
@@ -759,8 +867,50 @@ def router_account_menu_gate(
     component was injected, mounted, or able to load account state.
     """
     evidence = _router_account_menu_evidence(ui_body)
+    runtime = evidence["renderer_runtime"]
+    controller = evidence["profile_controller"]
+    auth = evidence["desktop_auth"]["state"]
+    if isinstance(runtime, dict):
+        runtime_error_count = runtime.get("runtime_error_count", len(evidence["runtime_errors"]))
+        if not evidence["renderer_loaded"]:
+            status = ROUTER_RENDERER_NOT_LOADED
+        elif (type(runtime_error_count) is int and runtime_error_count > 0) or evidence["runtime_errors"]:
+            status = ROUTER_RENDERER_RUNTIME_ERROR
+        elif runtime.get("ready_state") in {"loading", "interactive"} or runtime.get("root_present") is False:
+            status = ROUTER_UI_NOT_READY
+        elif auth == "AUTH_REQUIRED":
+            status = ROUTER_DESKTOP_AUTH_REQUIRED
+        elif auth == "UNKNOWN":
+            status = ROUTER_DESKTOP_AUTH_UNKNOWN
+        elif not controller["ready"]:
+            status = ROUTER_PROFILE_CONTROLLER_NOT_READY
+        elif activation_attempted and not activation_succeeded:
+            status = ROUTER_PROFILE_ACTIVATION_FAILED
+        elif activation_attempted and not evidence["injected"]:
+            status = ROUTER_MENU_NOT_INJECTED_AFTER_OPEN
+        elif not evidence["injected"]:
+            status = ROUTER_MENU_NOT_INJECTED
+        elif mounting_expected and not evidence["mounted"]:
+            status = ROUTER_MENU_NOT_MOUNTED
+        elif evidence["request_failed"]:
+            status = ROUTER_MENU_ACCOUNTS_LOAD_FAILED
+        elif mounting_expected and not evidence["accounts_loaded"]:
+            status = ROUTER_MENU_ACCOUNTS_LOADING
+        else:
+            status = PASS
+        return {**evidence, "activation_attempted": activation_attempted, "activation_succeeded": activation_succeeded, "status": status, "pass": status == PASS}
     if not evidence["renderer_loaded"]:
         status = ROUTER_RENDERER_NOT_LOADED
+    elif auth == "AUTH_REQUIRED":
+        status = ROUTER_DESKTOP_AUTH_REQUIRED
+    elif auth == "UNKNOWN":
+        status = ROUTER_DESKTOP_AUTH_UNKNOWN
+    elif not controller["ready"]:
+        status = ROUTER_PROFILE_CONTROLLER_NOT_READY
+    elif activation_attempted and not activation_succeeded:
+        status = ROUTER_PROFILE_ACTIVATION_FAILED
+    elif activation_attempted and not evidence["injected"]:
+        status = ROUTER_MENU_NOT_INJECTED_AFTER_OPEN
     elif not evidence["injected"]:
         status = ROUTER_MENU_NOT_INJECTED
     elif mounting_expected and not evidence["mounted"]:
@@ -771,7 +921,7 @@ def router_account_menu_gate(
         status = ROUTER_MENU_ACCOUNTS_LOADING
     else:
         status = PASS
-    return {**evidence, "status": status, "pass": status == PASS}
+    return {**evidence, "activation_attempted": activation_attempted, "activation_succeeded": activation_succeeded, "status": status, "pass": status == PASS}
 
 
 def _native_profile_trigger_diagnostic(ui_body: object) -> str:
@@ -825,6 +975,11 @@ def run_patched_shell_smoke(
     disposable_root: bool = False,
     diagnostic_arguments: Iterable[str] = (),
     development_only: bool = False,
+    user_data_override: Path | None = None,
+    preserve_user_data: bool = False,
+    auth_required: bool = False,
+    authentication_preparation: bool = False,
+    validation_profile_root_override: Path | None = None,
 ) -> dict[str, object]:
     """Launch a disposable built Router and verify the production path contract.
 
@@ -854,10 +1009,10 @@ def run_patched_shell_smoke(
             "manual_operation_required": True,
         }
     root = installation_root.expanduser().resolve(strict=False)
-    if not disposable_root:
+    if not disposable_root and user_data_override is None:
         return {
             "status": PATCHED_SHELL_BLOCKED,
-            "reason": "patched-shell smoke requires an explicitly disposable Router root",
+            "reason": "patched-shell smoke requires an explicitly disposable Router root or an explicit validation profile",
             "installation_root": str(root),
             "manual_operation_required": True,
         }
@@ -871,7 +1026,39 @@ def run_patched_shell_smoke(
 
     launcher = root / "Codex Subscription Router.exe"
     app_root = root / "app"
-    user_data = root / "User Data"
+    user_data = (
+        user_data_override.expanduser().resolve(strict=False)
+        if user_data_override is not None
+        else root / "User Data"
+    )
+    if user_data_override is not None:
+        validation_root = (
+            validation_profile_root_override.expanduser().resolve(strict=False)
+            if validation_profile_root_override is not None
+            else validation_profile_root()
+        )
+        if is_windowsapps_path(validation_root) or not path_is_within(user_data, validation_root) or is_windowsapps_path(user_data):
+            return {
+                "status": PATCHED_SHELL_BLOCKED,
+                "reason": "user-data override must remain inside the Router-owned validation profile",
+                "installation_root": str(root),
+                "manual_operation_required": True,
+            }
+        if not preserve_user_data:
+            return {
+                "status": PATCHED_SHELL_BLOCKED,
+                "reason": "persistent validation user data requires explicit preservation",
+                "installation_root": str(root),
+                "manual_operation_required": True,
+            }
+        user_data.mkdir(parents=True, exist_ok=True)
+    if auth_required and user_data_override is None:
+        return {
+            "status": PATCHED_SHELL_BLOCKED,
+            "reason": "authenticated Desktop validation requires the persistent Router validation profile",
+            "installation_root": str(root),
+            "manual_operation_required": True,
+        }
     codex_home = root / "codex-home"
     runtime = root / "runtime"
     mux = runtime / "codex-mux.exe"
@@ -883,7 +1070,7 @@ def run_patched_shell_smoke(
     if missing:
         return {
             "status": PATCHED_SHELL_BLOCKED,
-            "reason": f"disposable Router layout is incomplete: {', '.join(missing)}",
+            "reason": f"Router layout is incomplete: {', '.join(missing)}",
             "installation_root": str(root),
             "manual_operation_required": False,
         }
@@ -947,7 +1134,14 @@ def run_patched_shell_smoke(
     launch_error: str | None = None
     process: subprocess.Popen[bytes] | None = None
     started = time.monotonic()
-    log_path = root / "patched-shell-smoke.log"
+    temporary_log_path: Path | None = None
+    if user_data_override is not None:
+        log_handle_fd, temporary_log_name = tempfile.mkstemp(prefix="codex-router-patched-shell-", suffix=".log")
+        os.close(log_handle_fd)
+        log_path = Path(temporary_log_name)
+        temporary_log_path = log_path
+    else:
+        log_path = root / "patched-shell-smoke.log"
     with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:
         try:
             process = subprocess.Popen(
@@ -970,6 +1164,9 @@ def run_patched_shell_smoke(
         ui_error: str | None = None
         launcher_observed_running = False
         router_account_menu = router_account_menu_gate({})
+        activation_attempted = False
+        activation_succeeded = False
+        authentication_confirmed = False
         mux_process_observed = False
         real_codex_process_observed = False
         deadline = time.monotonic() + timeout_seconds
@@ -1004,7 +1201,38 @@ def run_patched_shell_smoke(
                     "http://127.0.0.1:48124/v1/test/app-state?debug=1",
                     headers={"x-codex-mux-token": token},
                 )
-            router_account_menu = router_account_menu_gate(ui_body)
+            router_account_menu = router_account_menu_gate(
+                ui_body,
+                activation_attempted=activation_attempted,
+                activation_succeeded=activation_succeeded,
+            )
+            if router_account_menu.get("desktop_auth", {}).get("state") == "AUTHENTICATED":
+                authentication_confirmed = True
+            if (
+                not authentication_preparation
+                and authentication_confirmed
+                and router_account_menu.get("profile_controller", {}).get("ready") is True
+                and not activation_attempted
+                and ui_status == 200
+            ):
+                action_url = "http://127.0.0.1:48124/v1/test/app-state?action=profile-router-open&debug=1&delayMs=400"
+                action_status, action_body, action_error = _http_json_get(
+                    action_url,
+                    headers={"x-codex-mux-token": token},
+                )
+                activation_attempted = True
+                activation_succeeded = action_status == 200 and isinstance(action_body, dict)
+                if isinstance(action_body, dict):
+                    ui_body = action_body
+                    ui_status = action_status
+                    ui_error = action_error
+                router_account_menu = router_account_menu_gate(
+                    ui_body,
+                    activation_attempted=activation_attempted,
+                    activation_succeeded=activation_succeeded,
+                )
+            if authentication_preparation and authentication_confirmed:
+                break
             mux_observed = any(
                 _process_path_matches(row, mux)
                 for row in snapshot
@@ -1045,6 +1273,9 @@ def run_patched_shell_smoke(
         final_processes = _snapshot_rows(attributed, final_snapshot)
         final_windows = enumerate_windows_for_processes(sorted(attributed))
         still_running = process is not None and return_code is None
+        timeout_reached = still_running and time.monotonic() >= deadline
+        process_still_running_at_timeout = timeout_reached
+        harness_requested_termination = False
         cleanup = terminate_attributed_processes(
             attributed,
             final_snapshot,
@@ -1053,6 +1284,7 @@ def run_patched_shell_smoke(
             allowed_executable_paths=(staged_real, mux),
         )
         if still_running and process is not None:
+            harness_requested_termination = True
             try:
                 process.terminate()
                 process.wait(timeout=5)
@@ -1061,6 +1293,11 @@ def run_patched_shell_smoke(
                 cleanup.setdefault("errors", []).append(f"root cleanup: {error}")
 
     log_text = _tail(log_path)
+    if temporary_log_path is not None:
+        try:
+            temporary_log_path.unlink()
+        except OSError:
+            pass
     classification = (
         classify_probe_output(
             log_text,
@@ -1072,7 +1309,11 @@ def run_patched_shell_smoke(
         else {"status": CRASHED, "reason": f"could not launch patched shell: {launch_error}", "relevant_log_lines": {}}
     )
     debug = ui_body.get("debug") if isinstance(ui_body, dict) else None
-    router_account_menu = router_account_menu_gate(ui_body)
+    router_account_menu = router_account_menu_gate(
+        ui_body,
+        activation_attempted=activation_attempted,
+        activation_succeeded=activation_succeeded,
+    )
     native_profile_trigger_observed = _native_profile_trigger_diagnostic(ui_body)
     mux_observed = any(
         _process_path_matches(row, mux)
@@ -1115,6 +1356,8 @@ def run_patched_shell_smoke(
         cleanup=not cleanup.get("errors"),
     )
     required_pass = bool(production_gate["pass"])
+    if authentication_preparation:
+        required_pass = authentication_confirmed and not cleanup.get("errors")
     if development_only and not required_pass:
         required_pass = all(
             value
@@ -1122,7 +1365,11 @@ def run_patched_shell_smoke(
             if key != "production_sandbox"
         )
     status = (
-        DEVELOPMENT_ONLY_SANDBOX_BYPASS
+        DESKTOP_AUTH_PREPARED
+        if authentication_preparation and required_pass
+        else ROUTER_DESKTOP_AUTH_REQUIRED
+        if auth_required and router_account_menu.get("status") == ROUTER_DESKTOP_AUTH_REQUIRED
+        else DEVELOPMENT_ONLY_SANDBOX_BYPASS
         if required_pass and development_only
         else PATCHED_SHELL_PASS
         if required_pass
@@ -1131,7 +1378,11 @@ def run_patched_shell_smoke(
     return {
         "status": status,
         "reason": (
-            "development-only sandbox bypass showed the patched Router launcher, UI bridge, mux health, account menu, and mux-to-real-codex chain"
+            "persistent Desktop validation profile reached authenticated renderer state"
+            if authentication_preparation and required_pass
+            else "the persistent Desktop validation profile requires normal interactive ChatGPT login"
+            if auth_required and router_account_menu.get("status") == ROUTER_DESKTOP_AUTH_REQUIRED
+            else "development-only sandbox bypass showed the patched Router launcher, UI bridge, mux health, account menu, and mux-to-real-codex chain"
             if required_pass and development_only
             else "patched Router launcher, ChatGPT UI bridge, mux health, account menu, and mux-to-real-codex chain passed"
             if required_pass
@@ -1145,6 +1396,21 @@ def run_patched_shell_smoke(
         "production_sandbox_flags_present": production_flags_present,
         "launcher_observed_running": launcher_observed_running,
         "launcher_return_code": return_code,
+        "desktop_auth": router_account_menu.get("desktop_auth"),
+        "renderer_runtime": router_account_menu.get("renderer_runtime"),
+        "profile_controller": {
+            **router_account_menu.get("profile_controller", {}),
+            "activation_attempted": activation_attempted,
+            "activation_succeeded": activation_succeeded,
+        },
+        "runtime_errors": router_account_menu.get("runtime_errors", []),
+        "termination": {
+            "harness_timeout_reached": timeout_reached,
+            "harness_requested_termination": harness_requested_termination,
+            "process_exited_before_cleanup": return_code is not None,
+            "process_return_code": return_code,
+            "process_still_running_at_timeout": process_still_running_at_timeout,
+        },
         "chatgpt_classification": classification,
         "native_profile_trigger_observed": native_profile_trigger_observed,
         "router_account_menu": router_account_menu,
@@ -1299,8 +1565,47 @@ def final_layout_smoke_root(
     *,
     parent_name: str = "_smoke",
     prefix: str = "phase2a4-",
+    persistent: bool = False,
+    persistent_root: Path | None = None,
 ) -> Iterator[Path]:
-    """Create and remove a Router-owned development root under LOCALAPPDATA."""
+    """Create a disposable root, or preserve the Router auth profile explicitly."""
+    if persistent:
+        if os.name != "nt":
+            raise RuntimeError("persistent Desktop authentication preparation is Windows-only")
+        root = (
+            persistent_root.expanduser()
+            if persistent_root is not None
+            else validation_profile_root()
+        ).resolve(strict=False)
+        if is_windowsapps_path(root):
+            raise RuntimeError("the persistent Router validation profile must be outside WindowsApps")
+        if root.is_symlink():
+            raise RuntimeError("refusing a symlinked persistent Router validation profile")
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "User Data").mkdir(parents=True, exist_ok=True)
+        (root / "codex-home").mkdir(parents=True, exist_ok=True)
+        if cleanup_status is not None:
+            cleanup_status.update(
+                {
+                    "requested_path": str(root),
+                    "resolved_path": str(root),
+                    "path_virtualized": False,
+                    "persistent": True,
+                    "preserved": True,
+                    "removed": False,
+                    "error": None,
+                }
+            )
+        try:
+            yield root
+        finally:
+            # The authentication profile is intentionally never removed by a
+            # smoke context.  Its Chromium session is acquired only by the
+            # user's normal interactive login.
+            if cleanup_status is not None:
+                cleanup_status.update({"preserved": True, "removed": False})
+        return
+
     if os.name != "nt":
         root = Path(tempfile.mkdtemp(prefix=prefix))
         if cleanup_status is not None:

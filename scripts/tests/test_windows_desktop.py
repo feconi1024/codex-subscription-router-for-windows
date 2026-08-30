@@ -94,6 +94,13 @@ from scripts.windows.smoke import (
     PHASE2A4_LOCAL_ACL_FIX_CONFIRMED,
     PASS,
     ROUTER_MENU_ACCOUNTS_LOAD_FAILED,
+    ROUTER_DESKTOP_AUTH_REQUIRED,
+    ROUTER_DESKTOP_AUTH_UNKNOWN,
+    ROUTER_MENU_NOT_INJECTED_AFTER_OPEN,
+    ROUTER_PROFILE_ACTIVATION_FAILED,
+    ROUTER_PROFILE_CONTROLLER_NOT_READY,
+    ROUTER_RENDERER_RUNTIME_ERROR,
+    ROUTER_UI_NOT_READY,
     ROUTER_MENU_NOT_INJECTED,
     ROUTER_MENU_NOT_MOUNTED,
     ROUTER_RENDERER_NOT_LOADED,
@@ -116,11 +123,16 @@ from scripts.windows.phase2a5_host_validation import (
     PHASE2A5_PATCHED_SHELL_TOOLCHAIN_BLOCKED,
     PHASE2A5_SOURCE_CHANGED_DURING_VALIDATION,
     PHASE2A5_SOURCE_REVIEW_REQUIRED,
+    PHASE2A5_DESKTOP_AUTH_REQUIRED,
+    PHASE2A5_DIRECT_HOST_PASS,
+    DESKTOP_AUTH_PREPARED,
     _go_toolchain_report,
     _public_probe,
     _run_external_patched_shell,
     _source_identity,
     _source_stability,
+    prepare_desktop_auth,
+    parse_args,
     run_phase2a5_host_validation,
 )
 from scripts.windows.reviewed_sources import (
@@ -635,6 +647,19 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                     "accountCount": 1,
                     "requestFailed": False,
                 },
+                "desktop_auth": {"state": "AUTHENTICATED"},
+                "renderer_runtime": {
+                    "readyState": "complete",
+                    "rootPresent": True,
+                    "rootChildCount": 1,
+                    "bodyChildCount": 2,
+                    "buttonCount": 2,
+                    "visibleInteractiveCount": 2,
+                    "composerPresent": True,
+                    "profileControllerReady": True,
+                    "runtimeErrorCount": 0,
+                },
+                "profile_controller": {"ready": True},
                 "buttons": [],
             }
         }
@@ -652,6 +677,19 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                     "accountCount": 0,
                     "requestFailed": False,
                 },
+                "desktop_auth": {"state": "AUTHENTICATED"},
+                "renderer_runtime": {
+                    "readyState": "complete",
+                    "rootPresent": True,
+                    "rootChildCount": 1,
+                    "bodyChildCount": 2,
+                    "buttonCount": 2,
+                    "visibleInteractiveCount": 2,
+                    "composerPresent": True,
+                    "profileControllerReady": True,
+                    "runtimeErrorCount": 0,
+                },
+                "profile_controller": {"ready": True},
                 "buttons": [
                     {
                         "ariaLabel": "Open profile menu",
@@ -676,6 +714,16 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                     "accountCount": 0,
                     "requestFailed": False,
                 }
+                ,
+                "desktop_auth": {"state": "AUTHENTICATED"},
+                "renderer_runtime": {
+                    "readyState": "complete",
+                    "rootPresent": True,
+                    "composerPresent": True,
+                    "profileControllerReady": True,
+                    "runtimeErrorCount": 0,
+                },
+                "profile_controller": {"ready": True},
             }
         }
         self.assertEqual(router_account_menu_gate(base)["status"], ROUTER_MENU_NOT_INJECTED)
@@ -692,6 +740,160 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
 
         not_loaded = {"debug": {"router": {"accountMenuInjected": True}}}
         self.assertEqual(router_account_menu_gate(not_loaded)["status"], ROUTER_RENDERER_NOT_LOADED)
+
+    def test_router_gate_requires_desktop_auth_before_classifying_injection(self) -> None:
+        login_ui = {
+            "debug": {
+                "router": {
+                    "rendererPatchLoaded": True,
+                    "accountMenuInjected": False,
+                    "accountMenuMounted": False,
+                    "accountsLoaded": False,
+                    "accountCount": 0,
+                    "requestFailed": False,
+                },
+                "desktop_auth": {"state": "AUTH_REQUIRED"},
+                "renderer_runtime": {
+                    "readyState": "complete",
+                    "rootPresent": True,
+                    "rootChildCount": 1,
+                    "bodyChildCount": 2,
+                    "buttonCount": 1,
+                    "visibleInteractiveCount": 1,
+                    "composerPresent": False,
+                    "profileControllerReady": False,
+                    "runtimeErrorCount": 0,
+                },
+                "profile_controller": {"ready": False},
+            }
+        }
+        result = router_account_menu_gate(login_ui)
+        self.assertFalse(result["pass"])
+        self.assertEqual(result["status"], ROUTER_DESKTOP_AUTH_REQUIRED)
+        self.assertNotEqual(result["status"], ROUTER_MENU_NOT_INJECTED)
+
+    def test_router_gate_authenticated_controller_activation_and_menu_pass(self) -> None:
+        authenticated_ui = {
+            "debug": {
+                "router": {
+                    "rendererPatchLoaded": True,
+                    "accountMenuInjected": True,
+                    "accountMenuMounted": True,
+                    "accountsLoaded": True,
+                    "accountCount": 1,
+                    "requestFailed": False,
+                },
+                "desktop_auth": {"state": "AUTHENTICATED"},
+                "renderer_runtime": {
+                    "readyState": "complete",
+                    "rootPresent": True,
+                    "rootChildCount": 1,
+                    "bodyChildCount": 2,
+                    "buttonCount": 4,
+                    "visibleInteractiveCount": 3,
+                    "composerPresent": True,
+                    "profileControllerReady": True,
+                    "runtimeErrorCount": 0,
+                },
+                "profile_controller": {
+                    "ready": True,
+                    "activationAttempted": True,
+                    "activationSucceeded": True,
+                },
+                "runtime_errors": [],
+            }
+        }
+        result = router_account_menu_gate(
+            authenticated_ui,
+            activation_attempted=True,
+            activation_succeeded=True,
+        )
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["status"], PASS)
+
+    def test_router_gate_reports_auth_controller_and_activation_failures(self) -> None:
+        base = {
+            "debug": {
+                "router": {
+                    "rendererPatchLoaded": True,
+                    "accountMenuInjected": False,
+                    "accountMenuMounted": False,
+                    "accountsLoaded": False,
+                    "accountCount": 0,
+                    "requestFailed": False,
+                },
+                "desktop_auth": {"state": "AUTHENTICATED"},
+                "renderer_runtime": {
+                    "readyState": "complete",
+                    "rootPresent": True,
+                    "composerPresent": True,
+                    "profileControllerReady": False,
+                    "runtimeErrorCount": 0,
+                },
+                "profile_controller": {"ready": False},
+            }
+        }
+        self.assertEqual(
+            router_account_menu_gate(base)["status"],
+            ROUTER_PROFILE_CONTROLLER_NOT_READY,
+        )
+        base["debug"]["renderer_runtime"]["profileControllerReady"] = True
+        base["debug"]["profile_controller"] = {"ready": True}
+        self.assertEqual(
+            router_account_menu_gate(
+                base,
+                activation_attempted=True,
+                activation_succeeded=False,
+            )["status"],
+            ROUTER_PROFILE_ACTIVATION_FAILED,
+        )
+        self.assertEqual(
+            router_account_menu_gate(
+                base,
+                activation_attempted=True,
+                activation_succeeded=True,
+            )["status"],
+            ROUTER_MENU_NOT_INJECTED_AFTER_OPEN,
+        )
+
+    def test_router_gate_prioritizes_runtime_health_and_bounded_auth_unknown(self) -> None:
+        runtime_error = {
+            "debug": {
+                "router": {"rendererPatchLoaded": True},
+                "desktop_auth": {"state": "AUTHENTICATED"},
+                "renderer_runtime": {
+                    "readyState": "complete",
+                    "rootPresent": True,
+                    "runtimeErrorCount": 1,
+                },
+                "profile_controller": {"ready": True},
+            }
+        }
+        self.assertEqual(router_account_menu_gate(runtime_error)["status"], ROUTER_RENDERER_RUNTIME_ERROR)
+        not_ready = {
+            "debug": {
+                "router": {"rendererPatchLoaded": True},
+                "desktop_auth": {"state": "UNKNOWN"},
+                "renderer_runtime": {
+                    "readyState": "interactive",
+                    "rootPresent": True,
+                    "runtimeErrorCount": 0,
+                },
+            }
+        }
+        self.assertEqual(router_account_menu_gate(not_ready)["status"], ROUTER_UI_NOT_READY)
+        unknown = {
+            "debug": {
+                "router": {"rendererPatchLoaded": True},
+                "desktop_auth": {"state": "UNKNOWN"},
+                "renderer_runtime": {
+                    "readyState": "complete",
+                    "rootPresent": True,
+                    "runtimeErrorCount": 0,
+                },
+            }
+        }
+        self.assertEqual(router_account_menu_gate(unknown)["status"], ROUTER_DESKTOP_AUTH_UNKNOWN)
 
     def test_production_gate_reports_failed_predicates(self) -> None:
         gate = build_production_gate(
@@ -792,6 +994,81 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             "Open profile menu",
         )
 
+    def test_public_probe_sanitizes_auth_runtime_window_and_termination_evidence(self) -> None:
+        raw = {
+            "status": ROUTER_DESKTOP_AUTH_REQUIRED,
+            "desktop_auth": {"state": "AUTH_REQUIRED", "email": "user@example.com"},
+            "renderer_runtime": {
+                "readyState": "complete",
+                "rootPresent": True,
+                "rootChildCount": 1,
+                "bodyChildCount": 2,
+                "buttonCount": 4,
+                "visibleInteractiveCount": 3,
+                "composerPresent": False,
+                "profileControllerReady": False,
+                "runtimeErrorCount": 1,
+                "lastSafeRuntimeError": {
+                    "kind": "error",
+                    "name": "ReferenceError",
+                    "source_asset": "C:\\Users\\test\\app-initial.js",
+                    "line": 12,
+                    "column": 8,
+                    "message": "token-secret",
+                },
+            },
+            "profile_controller": {"ready": False, "secret": "cookie-value"},
+            "runtime_errors": [
+                {
+                    "kind": "error",
+                    "name": "ReferenceError",
+                    "source_asset": "C:\\Users\\test\\app-initial.js",
+                    "line": 12,
+                    "column": 8,
+                    "stack": "conversation content",
+                }
+            ],
+            "windows": [
+                {
+                    "webContentsId": 4,
+                    "visible": True,
+                    "bounds": {"x": 1, "y": 2, "width": 900, "height": 700},
+                    "isLoading": False,
+                    "url": {"origin": "https://chatgpt.com", "pathname": "/login?token=secret"},
+                    "title": "user@example.com",
+                    "desktopAuth": "AUTH_REQUIRED",
+                }
+            ],
+            "termination": {
+                "harness_timeout_reached": True,
+                "harness_requested_termination": True,
+                "process_exited_before_cleanup": False,
+                "process_return_code": None,
+                "arbitrary": "conversation content",
+            },
+            "router_account_menu": {
+                "renderer_loaded": True,
+                "desktop_auth": {"state": "AUTH_REQUIRED", "token": "secret"},
+                "renderer_runtime": {"readyState": "complete", "runtimeErrorCount": 1},
+                "profile_controller": {"ready": False},
+                "runtime_errors": [{"kind": "error", "message": "cookie-value"}],
+                "status": ROUTER_DESKTOP_AUTH_REQUIRED,
+                "pass": False,
+            },
+        }
+        public = _public_probe(raw)
+        encoded = json.dumps(public, sort_keys=True)
+        self.assertEqual(public["desktop_auth"]["state"], "AUTH_REQUIRED")
+        self.assertEqual(public["renderer_runtime"]["root_child_count"], 1)
+        self.assertEqual(public["runtime_errors"][0]["source_asset"], "app-initial.js")
+        self.assertEqual(public["windows"][0]["url"]["pathname"], "/login")
+        self.assertTrue(public["termination"]["harness_requested_termination"])
+        self.assertNotIn("user@example.com", encoded)
+        self.assertNotIn("cookie-value", encoded)
+        self.assertNotIn("conversation content", encoded)
+        self.assertNotIn("stack", encoded)
+        self.assertNotIn("token=secret", encoded)
+
     def test_router_runtime_markers_are_exposed_by_bridge_and_account_menu(self) -> None:
         account_menu = (Path(__file__).resolve().parents[2] / "ui" / "account-menu.js").read_text(
             encoding="utf-8"
@@ -801,6 +1078,13 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         )
         for marker in (
             "__codexMuxRendererPatchLoaded",
+            "__codexMuxDesktopAuth",
+            "AUTHENTICATED",
+            "AUTH_REQUIRED",
+            "__codexMuxRendererRuntime",
+            "__codexMuxRuntimeErrors",
+            "__codexMuxProfileMenuControllerReady",
+            "__codexMuxOpenProfileMenuForTest",
             "__codexMuxAccountMenuMounted",
             "accountsLoaded",
             "accountCount",
@@ -809,6 +1093,9 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             self.assertIn(marker, account_menu)
             self.assertIn(marker, bridge)
         self.assertIn("__codexMuxAccountMenuInjected", bridge)
+        self.assertIn("profile-router-open", bridge)
+        self.assertIn("render-process-gone", bridge)
+        self.assertIn("unhandledrejection", account_menu)
         self.assertNotIn("text:element.textContent.trim().slice(0,80)", bridge)
         self.assertNotIn("bodyText", bridge)
         self.assertNotIn("rootHtml", bridge)
@@ -959,6 +1246,244 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             runner,
         )
         self.assertIn("$pythonArguments += $RunnerArguments", runner)
+
+    def test_phase2a5_desktop_auth_preparation_script_is_present_and_wired(self) -> None:
+        script_path = (
+            Path(__file__).resolve().parents[2]
+            / "scripts"
+            / "windows"
+            / "prepare_phase2a5_desktop_auth.ps1"
+        )
+        script = script_path.read_text(encoding="utf-8")
+        self.assertIn("[CmdletBinding(PositionalBinding = $false)]", script)
+        self.assertIn("[Parameter(ValueFromRemainingArguments = $true)]", script)
+        self.assertIn("--prepare-desktop-auth", script)
+        self.assertIn("--timeout-seconds", script)
+        self.assertIn("$pythonArguments += $RunnerArguments", script)
+        self.assertIn("Do not enter credentials in this terminal", script)
+        self.assertNotIn("cookies", script.casefold())
+        self.assertNotIn("password", script.casefold())
+        self.assertNotIn("localstorage", script.casefold())
+
+        source = inspect.getsource(prepare_desktop_auth)
+        self.assertIn("authentication_preparation=True", source)
+        self.assertIn("preserve_user_data=True", source)
+        self.assertIn("auth_required=True", source)
+        self.assertIn("run_patched_shell_smoke", source)
+
+        with patch(
+            "sys.argv",
+            ["phase2a5_host_validation", "--prepare-desktop-auth", "--timeout-seconds", "900"],
+        ):
+            parsed = parse_args()
+        self.assertTrue(parsed.prepare_desktop_auth)
+        self.assertEqual(parsed.timeout_seconds, 900.0)
+
+    def test_persistent_validation_profile_is_preserved_after_smoke_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cleanup: dict[str, object] = {}
+            with patch("scripts.windows.smoke.os.name", "nt"), patch(
+                "scripts.windows.smoke.os.environ",
+                {"LOCALAPPDATA": temporary},
+            ):
+                with final_layout_smoke_root(cleanup, persistent=True) as root:
+                    user_data = root / "User Data"
+                    (user_data / "Default").mkdir(parents=True)
+                    (user_data / "Default" / "marker").write_text("session stays local", encoding="utf-8")
+                    self.assertTrue(root.name == "_validation-profile")
+                    self.assertTrue(cleanup["persistent"])
+                    self.assertTrue(cleanup["preserved"])
+            self.assertTrue((root / "User Data" / "Default" / "marker").is_file())
+            self.assertFalse(cleanup["removed"])
+            self.assertTrue(cleanup["preserved"])
+
+    def test_persistent_external_shell_uses_auth_profile_without_disposable_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            profile = Path(temporary) / "Codex Subscription Router" / "_validation-profile"
+            source = SimpleNamespace()
+            selected = SimpleNamespace()
+            with patch(
+                "scripts.windows.phase2a5_host_validation.build_windows_desktop",
+                return_value={
+                    "desktop_launch_executable": "app\\ChatGPT.exe",
+                    "payload_acl_strategy": PAYLOAD_ACL_NONE,
+                    "source_app_asar_sha256": "a" * 64,
+                },
+            ) as build, patch(
+                "scripts.windows.phase2a5_host_validation.run_patched_shell_smoke",
+                return_value={
+                    "status": "ROUTER_DESKTOP_AUTH_REQUIRED",
+                    "manual_operation_required": True,
+                    "desktop_auth": {"state": "AUTH_REQUIRED"},
+                    "smoke_root_cleanup": {"persistent": True, "preserved": True},
+                },
+            ) as smoke:
+                result = _run_external_patched_shell(
+                    source,
+                    selected,
+                    acl_strategy=PAYLOAD_ACL_NONE,
+                    timeout_seconds=1.0,
+                    validation_profile_root=profile,
+                )
+            self.assertTrue(profile.is_dir())
+            self.assertTrue((profile / "User Data").is_dir())
+            build.assert_called_once()
+            self.assertTrue(build.call_args.kwargs["force"])
+            smoke.assert_called_once()
+            self.assertEqual(smoke.call_args.kwargs["user_data_override"], profile / "User Data")
+            self.assertTrue(smoke.call_args.kwargs["preserve_user_data"])
+            self.assertTrue(smoke.call_args.kwargs["auth_required"])
+            self.assertEqual(result["status"], ROUTER_DESKTOP_AUTH_REQUIRED)
+            self.assertTrue(result["validation_profile"]["preserved"])
+
+    def test_prepare_desktop_auth_builds_and_launches_the_persistent_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            local_appdata = root / "local"
+            source = SimpleNamespace(executable=root / "WindowsApps" / "app" / "ChatGPT.exe")
+            selected = SimpleNamespace(
+                path=root / "codex.exe",
+                version="codex-cli test",
+                sha256="b" * 64,
+                authenticode=SimpleNamespace(status="Valid", signer="CN=OpenAI"),
+            )
+            with patch(
+                "scripts.windows.phase2a5_host_validation.collect_startup_runtime",
+                return_value={"go_toolchain": {"selected": "go.exe", "usable": True, "probes": []}},
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.detect_windows_host_context",
+                return_value={"has_package_identity": False, "LOCALAPPDATA": str(local_appdata)},
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.run_localappdata_canary",
+                return_value={"filesystem_virtualized": False},
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.discover_desktop_source",
+                return_value=(source, SourceDiagnostics()),
+            ), patch(
+                "scripts.windows.phase2a5_host_validation._source_identity",
+                return_value={
+                    "package_name": "OpenAI.Codex",
+                    "package_version": "26.825.5331.0",
+                    "architecture": "X64",
+                    "app_file_version": "151.0.7922.174",
+                    "app_asar_sha256": "c" * 64,
+                    "app_asar_header_sha256": "d" * 64,
+                },
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.find_reviewed_source",
+                return_value={"renderer_variant": "windows-26.825"},
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.reviewed_source_is_patchable",
+                return_value=(True, "exact reviewed source"),
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.discover_real_codex",
+                return_value=(selected, [selected]),
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.build_windows_desktop",
+                return_value={
+                    "desktop_launch_executable": "app\\ChatGPT.exe",
+                    "payload_acl_strategy": PAYLOAD_ACL_NONE,
+                    "source_app_asar_sha256": "c" * 64,
+                    "renderer_syntax_validation": {"status": "PASS", "parser": "node"},
+                },
+            ) as build, patch(
+                "scripts.windows.phase2a5_host_validation.run_patched_shell_smoke",
+                return_value={
+                    "status": DESKTOP_AUTH_PREPARED,
+                    "desktop_auth": {"state": "AUTHENTICATED"},
+                    "manual_operation_required": False,
+                },
+            ) as smoke:
+                result = prepare_desktop_auth(
+                    repo_root=root,
+                    timeout_seconds=900,
+                )
+            profile = local_appdata / "Codex Subscription Router" / "_validation-profile"
+            self.assertEqual(result["status"], DESKTOP_AUTH_PREPARED)
+            self.assertFalse(result["manual_operation_required"])
+            self.assertEqual(result["validation_profile"]["root"], str(profile))
+            build.assert_called_once()
+            self.assertTrue(build.call_args.kwargs["force"])
+            self.assertEqual(build.call_args.kwargs["payload_acl_strategy"], PAYLOAD_ACL_NONE)
+            smoke.assert_called_once()
+            self.assertEqual(smoke.call_args.kwargs["user_data_override"], profile / "User Data")
+            self.assertTrue(smoke.call_args.kwargs["authentication_preparation"])
+
+    def test_phase2a5_host_flow_routes_ui_acceptance_through_persistent_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            local_appdata = root / "local"
+            source = SimpleNamespace(executable=root / "WindowsApps" / "app" / "ChatGPT.exe")
+            selected = SimpleNamespace(
+                path=root / "codex.exe",
+                version="codex-cli test",
+                sha256="b" * 64,
+                authenticode=SimpleNamespace(status="Valid", signer="CN=OpenAI"),
+            )
+            with patch(
+                "scripts.windows.phase2a5_host_validation.collect_startup_runtime",
+                return_value={"go_toolchain": {"selected": "go.exe", "usable": True, "probes": []}},
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.detect_windows_host_context",
+                return_value={"has_package_identity": False, "LOCALAPPDATA": str(local_appdata)},
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.run_localappdata_canary",
+                return_value={"filesystem_virtualized": False},
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.discover_desktop_source",
+                return_value=(source, SourceDiagnostics()),
+            ), patch(
+                "scripts.windows.phase2a5_host_validation._source_identity",
+                return_value={
+                    "package_name": "OpenAI.Codex",
+                    "package_version": "26.825.5331.0",
+                    "architecture": "X64",
+                    "app_file_version": "151.0.7922.174",
+                    "app_asar_sha256": "c" * 64,
+                    "app_asar_header_sha256": "d" * 64,
+                },
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.find_reviewed_source",
+                return_value={"renderer_variant": "windows-26.825"},
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.reviewed_source_is_patchable",
+                return_value=(True, "exact reviewed source"),
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.discover_real_codex",
+                return_value=(selected, [selected]),
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.inventory_desktop_executables",
+                return_value=[],
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.run_phase2a5_sandbox_validation",
+                return_value={
+                    "status": PHASE2A5_DIRECT_HOST_PASS,
+                    "native_evidence_usable": True,
+                    "production_acl_strategy": PAYLOAD_ACL_NONE,
+                    "official_package_unchanged": True,
+                    "manual_operation_required": False,
+                },
+            ), patch(
+                "scripts.windows.phase2a5_host_validation._run_external_patched_shell",
+                return_value={
+                    "status": ROUTER_DESKTOP_AUTH_REQUIRED,
+                    "router_account_menu": {"status": ROUTER_DESKTOP_AUTH_REQUIRED, "pass": False},
+                    "smoke_root_cleanup": {"persistent": True, "preserved": True},
+                    "manual_operation_required": True,
+                },
+            ) as external, patch(
+                "scripts.windows.phase2a5_host_validation._source_stability",
+                return_value={"stable": True, "changed_fields": []},
+            ):
+                result = run_phase2a5_host_validation(repo_root=root)
+            expected_profile = local_appdata / "Codex Subscription Router" / "_validation-profile"
+            self.assertEqual(result["status"], PHASE2A5_DESKTOP_AUTH_REQUIRED)
+            self.assertEqual(result["validation_profile"]["root"], str(expected_profile))
+            external.assert_called_once()
+            self.assertEqual(
+                external.call_args.kwargs["validation_profile_root"],
+                expected_profile,
+            )
 
     def test_payload_acl_strategy_is_explicit_and_default_is_non_mutating(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

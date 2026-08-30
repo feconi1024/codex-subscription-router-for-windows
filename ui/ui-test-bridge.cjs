@@ -10,8 +10,30 @@ const HOST = "127.0.0.1";
 const PORT = 48124;
 const diagnostics = [];
 
-function recordDiagnostic(kind, details) {
-  diagnostics.push({ kind, ...details });
+function safeInteger(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function safeSourceAsset(value) {
+  if (typeof value !== "string") return null;
+  const source = value.split(/[?#]/, 1)[0];
+  const pieces = source.split(/[\\/]/);
+  const basename = pieces[pieces.length - 1] || "";
+  return basename.length > 0 && basename.length <= 200 ? basename : null;
+}
+
+function recordDiagnostic(kind, details = {}) {
+  const safe = { kind };
+  if (kind === "console") {
+    if (Number.isSafeInteger(details.level) && details.level >= 0) safe.level = details.level;
+    safe.line = safeInteger(details.line);
+    safe.source_asset = safeSourceAsset(details.sourceId);
+  } else if (kind === "render-process-gone") {
+    const reasons = new Set(["clean-exit", "abnormal-exit", "crashed", "killed", "oom", "launch-failed"]);
+    safe.reason = reasons.has(details.reason) ? details.reason : "unknown";
+    safe.exit_code = safeInteger(details.exitCode ?? details.exit_code);
+  }
+  diagnostics.push(safe);
   if (diagnostics.length > 100) diagnostics.shift();
 }
 
@@ -133,6 +155,149 @@ async function readRouterFlags(window) {
   }
 }
 
+function safeAuthState(value) {
+  return value === "AUTHENTICATED" || value === "AUTH_REQUIRED" || value === "UNKNOWN"
+    ? value
+    : "UNKNOWN";
+}
+
+async function readDesktopAuth(window) {
+  if (!window) return { state: "UNKNOWN" };
+  try {
+    const state = await window.webContents.executeJavaScript(`(() => {
+      const valid=value=>value==='AUTHENTICATED'||value==='AUTH_REQUIRED'||value==='UNKNOWN';
+      const runtime=globalThis.__codexMuxRendererRuntime??{};
+      const pathname=typeof globalThis.location?.pathname==='string'?globalThis.location.pathname.toLowerCase():'';
+      const authRoute=/(^|\\/)(auth|login|signin|sign-in)(\\/|$)/.test(pathname);
+      const body=document.body;
+      const root=document.querySelector('#root')||body?.firstElementChild||null;
+      const composer=document.querySelector('textarea[placeholder],[contenteditable="true"]');
+      const controller=globalThis.__codexMuxProfileMenuControllerReady===true||runtime.profileControllerReady===true;
+      let detected='UNKNOWN';
+      if(authRoute) detected='AUTH_REQUIRED';
+      else if(globalThis.__codexMuxAuthenticatedShellReady===true||(composer&&controller)) detected='AUTHENTICATED';
+      else if(document.readyState==='complete'&&root&&!composer&&!controller) detected='AUTH_REQUIRED';
+      const saved=valid(globalThis.__codexMuxDesktopAuth)?globalThis.__codexMuxDesktopAuth:'UNKNOWN';
+      return {state:detected!=='UNKNOWN'?detected:saved};
+    })()`);
+    return { state: safeAuthState(state?.state) };
+  } catch {
+    return { state: "UNKNOWN" };
+  }
+}
+
+function safeRuntimeDiagnostic(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const kinds = new Set(["error", "unhandledrejection", "render-process-gone"]);
+  const names = new Set(["Error", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError"]);
+  const item = { kind: kinds.has(raw.kind) ? raw.kind : "error" };
+  item.name = names.has(raw.name) ? raw.name : "Error";
+  item.source_asset = safeSourceAsset(raw.source_asset);
+  item.line = safeInteger(raw.line);
+  item.column = safeInteger(raw.column);
+  if (item.kind === "render-process-gone") {
+    const reasons = new Set(["clean-exit", "abnormal-exit", "crashed", "killed", "oom", "launch-failed"]);
+    item.reason = reasons.has(raw.reason) ? raw.reason : "unknown";
+    item.exit_code = safeInteger(raw.exit_code);
+  }
+  return item;
+}
+
+async function readRendererRuntime(window) {
+  const fallback = {
+    readyState: "unknown",
+    rootPresent: false,
+    rootChildCount: 0,
+    bodyChildCount: 0,
+    buttonCount: 0,
+    visibleInteractiveCount: 0,
+    composerPresent: false,
+    profileControllerReady: false,
+    runtimeErrorCount: 0,
+    lastSafeRuntimeError: null,
+  };
+  if (!window) return fallback;
+  try {
+    const runtime = await window.webContents.executeJavaScript(`(() => {
+      const saved=globalThis.__codexMuxRendererRuntime??{};
+      const body=document.body;
+      const root=document.querySelector('#root')||body?.firstElementChild||null;
+      const composer=document.querySelector('textarea[placeholder],[contenteditable="true"]');
+      let visible=0;
+      for(const element of document.querySelectorAll('button,a,input,textarea,[role="button"],[contenteditable="true"]')){
+        const rect=element.getBoundingClientRect();
+        if(rect.width>0&&rect.height>0) visible++;
+      }
+      const errors=Array.isArray(globalThis.__codexMuxRuntimeErrors)?globalThis.__codexMuxRuntimeErrors:[];
+      const readyState=['loading','interactive','complete'].includes(document.readyState)?document.readyState:'unknown';
+      return {
+        readyState,
+        rootPresent:root!==null,
+        rootChildCount:Number.isSafeInteger(saved.rootChildCount)?saved.rootChildCount:(root?.children?.length??0),
+        bodyChildCount:Number.isSafeInteger(saved.bodyChildCount)?saved.bodyChildCount:(body?.children?.length??0),
+        buttonCount:Number.isSafeInteger(saved.buttonCount)?saved.buttonCount:document.querySelectorAll('button').length,
+        visibleInteractiveCount:Number.isSafeInteger(saved.visibleInteractiveCount)?saved.visibleInteractiveCount:visible,
+        composerPresent:composer!==null,
+        profileControllerReady:globalThis.__codexMuxProfileMenuControllerReady===true||saved.profileControllerReady===true,
+        runtimeErrorCount:errors.length,
+        lastSafeRuntimeError:errors.at(-1)??null,
+      };
+    })()`);
+    const output = { ...fallback };
+    if (["loading", "interactive", "complete", "unknown"].includes(runtime?.readyState)) output.readyState = runtime.readyState;
+    for (const key of ["rootChildCount", "bodyChildCount", "buttonCount", "visibleInteractiveCount", "runtimeErrorCount"]) {
+      if (Number.isSafeInteger(runtime?.[key]) && runtime[key] >= 0) output[key] = runtime[key];
+    }
+    for (const key of ["rootPresent", "composerPresent", "profileControllerReady"]) {
+      if (typeof runtime?.[key] === "boolean") output[key] = runtime[key];
+    }
+    output.lastSafeRuntimeError = safeRuntimeDiagnostic(runtime?.lastSafeRuntimeError);
+    return output;
+  } catch {
+    return fallback;
+  }
+}
+
+async function readProfileController(window) {
+  const fallback = { ready: false, activationAttempted: false, activationSucceeded: false };
+  if (!window) return fallback;
+  try {
+    const controller = await window.webContents.executeJavaScript(`(() => ({
+      ready:globalThis.__codexMuxProfileMenuControllerReady===true,
+      activationAttempted:globalThis.__codexMuxProfileMenuActivationAttempted===true,
+      activationSucceeded:globalThis.__codexMuxProfileMenuActivationSucceeded===true,
+    }))()`);
+    return {
+      ready: controller?.ready === true,
+      activationAttempted: controller?.activationAttempted === true,
+      activationSucceeded: controller?.activationSucceeded === true,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+async function readRuntimeDiagnostics(window) {
+  const output = [];
+  if (window) {
+    try {
+      const errors = await window.webContents.executeJavaScript(
+        `Array.isArray(globalThis.__codexMuxRuntimeErrors)?globalThis.__codexMuxRuntimeErrors:[]`,
+      );
+      for (const error of Array.isArray(errors) ? errors : []) {
+        const safe = safeRuntimeDiagnostic(error);
+        if (safe) output.push(safe);
+      }
+    } catch {}
+  }
+  for (const diagnostic of diagnostics) {
+    if (diagnostic.kind !== "render-process-gone") continue;
+    const safe = safeRuntimeDiagnostic(diagnostic);
+    if (safe) output.push(safe);
+  }
+  return output.slice(-20);
+}
+
 async function observationWindow() {
   for (const window of allWindows()) {
     const flags = await readRouterFlags(window);
@@ -145,6 +310,7 @@ async function windowDiagnostics() {
   const summaries = [];
   for (const window of allWindows()) {
     const flags = await readRouterFlags(window);
+    const auth = await readDesktopAuth(window);
     summaries.push({
       webContentsId: safeWebContentsId(window),
       visible: safeVisible(window),
@@ -153,6 +319,7 @@ async function windowDiagnostics() {
       url: safeUrl(window),
       rendererPatchLoaded: flags.rendererPatchLoaded,
       accountMenuInjected: flags.accountMenuInjected,
+      desktopAuth: auth.state,
     });
   }
   return summaries;
@@ -161,6 +328,26 @@ async function windowDiagnostics() {
 async function runAction(window, action, delayMs) {
   window.show();
   window.focus();
+  if (action === "profile-router-open") {
+    const auth = await readDesktopAuth(window);
+    if (auth.state !== "AUTHENTICATED") {
+      throw new Error("Desktop authentication is required before opening the Router profile menu");
+    }
+    const activated = await window.webContents.executeJavaScript(`(() => {
+      globalThis.__codexMuxProfileMenuActivationAttempted = true;
+      const open = globalThis.__codexMuxOpenProfileMenuForTest;
+      if (typeof open !== 'function') {
+        globalThis.__codexMuxProfileMenuActivationSucceeded = false;
+        return false;
+      }
+      const succeeded = open() === true;
+      globalThis.__codexMuxProfileMenuActivationSucceeded = succeeded;
+      return succeeded;
+    })()`);
+    if (activated !== true) throw new Error("The native Router profile-menu controller was not ready");
+    await new Promise((resolve) => setTimeout(resolve, Math.max(delayMs, 400)));
+    return;
+  }
   if (action === "profile-toggle") {
     const toggled = await window.webContents.executeJavaScript(`(() => { const target=[...document.querySelectorAll('button[aria-label]')].find(element=>{const label=element.getAttribute('aria-label')||'';return label==='Show combined profile stats'||(label.startsWith('Show ')&&label.endsWith(' profile stats'))}); if(!target)return false; target.click(); return true; })()`);
     if (!toggled) throw new Error("Could not toggle a subscription profile");
@@ -468,6 +655,10 @@ async function capture(action, delayMs, includeDebug) {
   };
   if (includeDebug) {
     const routerFlags = await readRouterFlags(window);
+    const desktopAuth = await readDesktopAuth(window);
+    const rendererRuntime = await readRendererRuntime(window);
+    const profileController = await readProfileController(window);
+    const runtimeErrors = await readRuntimeDiagnostics(window);
     result.debug = await window.webContents.executeJavaScript(`(() => {
       const composer=document.querySelector('textarea[placeholder]')??document.querySelector('[contenteditable="true"]');
       const describe=element=>{const rect=element.getBoundingClientRect(); const label=element.getAttribute('aria-label'); return {ariaLabel:label==='Open profile menu'||/^Show (combined )?profile stats$/.test(label||'')?label:null,disabled:element.disabled,type:element.type,rect:{x:rect.x,y:rect.y,width:rect.width,height:rect.height}}};
@@ -479,6 +670,11 @@ async function capture(action, delayMs, includeDebug) {
     })()`);
     result.debug.url = safeUrl(window);
     result.debug.router = routerFlags;
+    result.debug.desktop_auth = desktopAuth;
+    result.debug.renderer_runtime = rendererRuntime;
+    result.debug.profile_controller = profileController;
+    result.debug.runtime_errors = runtimeErrors;
+    result.debug.termination = null;
     result.debug.windows = await windowDiagnostics();
     result.diagnostics = diagnostics.slice(-50);
   }
@@ -489,10 +685,13 @@ function start() {
   if (process.env.CODEX_MUX_UI_TESTS !== "1") return;
   app.on("web-contents-created", (_event, contents) => {
     contents.on("console-message", (_consoleEvent, level, message, line, sourceId) => {
-      recordDiagnostic("console", { level, message, line, sourceId });
+      recordDiagnostic("console", { level, line, sourceId });
     });
     contents.on("render-process-gone", (_goneEvent, details) => {
-      recordDiagnostic("render-process-gone", details);
+      recordDiagnostic("render-process-gone", {
+        reason: details?.reason,
+        exitCode: details?.exitCode,
+      });
     });
   });
   const muxHome = process.env.CODEX_MUX_HOME ?? path.join(os.homedir(), ".codex-mux");
@@ -513,6 +712,7 @@ function start() {
     if (
       action !== null &&
       action !== "profile" &&
+	  action !== "profile-router-open" &&
 	  action !== "profile-toggle" &&
 	  action !== "settings-profile" &&
 	  action !== "settings-plugins" &&

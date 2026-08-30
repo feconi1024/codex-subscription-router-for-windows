@@ -19,6 +19,8 @@ This round adds:
 - cleanup-finalized native evidence and patched-shell results;
 - selected `RealCodexCandidate` propagation without candidate-index fallback;
 - the user-started `scripts/windows/run_phase2a5_host_validation.ps1` runner;
+- the user-started `scripts/windows/prepare_phase2a5_desktop_auth.ps1` persistent
+  Desktop-authentication preparation runner;
 - an ignored `docs/generated/WINDOWS-PHASE2A5-HOST-RESULT.json` artifact path.
 
 Phase 2A.6 adds a second fail-closed gate before the native probes: the
@@ -207,6 +209,42 @@ aggregate `FULL PHASE 2A.5 PASS` verdict.
 Packaged-host and external-host results must not be combined.  The current
 compatibility record remains unchanged until the external normal-sandbox
 patched shell passes and the result is reviewed.
+
+## Desktop authentication preparation
+
+The disposable infrastructure smoke uses a fresh `User Data` directory and
+does not ask the operator to log in.  The authenticated Router UI gate uses a
+separate persistent profile at:
+
+```text
+%LOCALAPPDATA%\Codex Subscription Router\_validation-profile\User Data
+```
+
+From an independently opened ordinary PowerShell, start the one-time
+preparation workflow:
+
+```powershell
+Set-Location -LiteralPath 'E:\Projects\codex-subscription-router-for-windows'
+.\scripts\windows\prepare_phase2a5_desktop_auth.ps1
+```
+
+The workflow builds the exact reviewed patched shell, keeps the normal
+Chromium sandbox and `NONE` ACL strategy, and waits up to 15 minutes for the
+user to complete normal ChatGPT login in the visible Router window.  It does
+not read, copy, print, or automate credentials, cookies, local storage, or
+official Desktop profile files.  The profile is preserved after the window is
+closed or authentication is detected.
+
+After authentication is detected, rerun the external validator with its
+explicit CI gate:
+
+```powershell
+.\scripts\windows\run_phase2a5_host_validation.ps1 --ci-verified
+```
+
+If the preparation window is closed before login completes, the result remains
+`ROUTER_DESKTOP_AUTH_REQUIRED`; this is a prerequisite result, not a Router
+injection failure or a Phase 2B signal.
 
 ## Verdict policy
 

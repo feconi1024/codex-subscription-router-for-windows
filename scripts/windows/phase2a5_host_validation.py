@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -33,11 +34,14 @@ try:
         PHASE2A5_GPU_SANDBOX_REGRESSION,
         PHASE2A5_HOST_CONTEXT_BLOCKED,
         PHASE2A5_PATCHED_SHELL_BLOCKED,
+        ROUTER_DESKTOP_AUTH_REQUIRED,
+        DESKTOP_AUTH_PREPARED,
         PHASE2A5_FAIL,
         PATCHED_SHELL_PASS,
         final_layout_smoke_root,
         run_patched_shell_smoke,
         run_phase2a5_sandbox_validation,
+        validation_profile_root,
     )
     from .integrity import asar_header_digest
     from .reviewed_sources import (
@@ -66,11 +70,14 @@ except ImportError:
         PHASE2A5_GPU_SANDBOX_REGRESSION,
         PHASE2A5_HOST_CONTEXT_BLOCKED,
         PHASE2A5_PATCHED_SHELL_BLOCKED,
+        ROUTER_DESKTOP_AUTH_REQUIRED,
+        DESKTOP_AUTH_PREPARED,
         PHASE2A5_FAIL,
         PATCHED_SHELL_PASS,
         final_layout_smoke_root,
         run_patched_shell_smoke,
         run_phase2a5_sandbox_validation,
+        validation_profile_root,
     )
     from windows.integrity import asar_header_digest
     from windows.reviewed_sources import (
@@ -84,6 +91,7 @@ DEFAULT_ARTIFACT = Path("docs") / "generated" / "WINDOWS-PHASE2A5-HOST-RESULT.js
 PHASE2A5_SOURCE_REVIEW_REQUIRED = "PHASE 2A.5 SOURCE REVIEW REQUIRED"
 PHASE2A5_SOURCE_CHANGED_DURING_VALIDATION = "PHASE 2A.5 SOURCE CHANGED DURING VALIDATION"
 PHASE2A5_PATCHED_SHELL_TOOLCHAIN_BLOCKED = "PATCHED SHELL TOOLCHAIN BLOCKED"
+PHASE2A5_DESKTOP_AUTH_REQUIRED = "PHASE 2A.5 DESKTOP AUTH REQUIRED"
 
 
 def _safe_error(error: BaseException | str) -> str:
@@ -363,6 +371,195 @@ def _public_build_metadata_summary(value: object) -> dict[str, object]:
     return output
 
 
+_PUBLIC_RUNTIME_ERROR_KINDS = {"error", "unhandledrejection", "render-process-gone"}
+_PUBLIC_RUNTIME_ERROR_NAMES = {
+    "Error",
+    "EvalError",
+    "RangeError",
+    "ReferenceError",
+    "SyntaxError",
+    "TypeError",
+    "URIError",
+}
+_PUBLIC_RENDER_PROCESS_REASONS = {
+    "clean-exit",
+    "abnormal-exit",
+    "crashed",
+    "killed",
+    "oom",
+    "launch-failed",
+    "unknown",
+}
+
+
+def _public_runtime_error(value: object) -> dict[str, object] | None:
+    if not isinstance(value, dict):
+        return None
+    kind = value.get("kind")
+    name = value.get("name")
+    output: dict[str, object] = {
+        "kind": kind if isinstance(kind, str) and kind in _PUBLIC_RUNTIME_ERROR_KINDS else "error",
+        "name": name if isinstance(name, str) and name in _PUBLIC_RUNTIME_ERROR_NAMES else "Error",
+    }
+    source_asset = value.get("source_asset")
+    if isinstance(source_asset, str):
+        source_asset = source_asset.split("?", 1)[0].split("#", 1)[0]
+        source_asset = re.split(r"[\\/]", source_asset)[-1]
+        if 0 < len(source_asset) <= 200:
+            output["source_asset"] = source_asset
+    for key in ("line", "column", "exit_code"):
+        item = value.get(key)
+        if type(item) is int and item >= 0:
+            output[key] = item
+    reason = value.get("reason")
+    if isinstance(reason, str) and reason in _PUBLIC_RENDER_PROCESS_REASONS:
+        output["reason"] = reason
+    return output
+
+
+def _public_desktop_auth(value: object) -> dict[str, str]:
+    state = value.get("state") if isinstance(value, dict) else None
+    return {"state": state if state in {"AUTHENTICATED", "AUTH_REQUIRED", "UNKNOWN"} else "UNKNOWN"}
+
+
+def _public_renderer_runtime(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, object] = {}
+    for key in ("ready_state", "readyState"):
+        item = value.get(key)
+        if isinstance(item, str) and item in {"loading", "interactive", "complete", "unknown"}:
+            output["ready_state"] = item
+            break
+    for key in (
+        "root_present",
+        "rootPresent",
+        "composer_present",
+        "composerPresent",
+        "profile_controller_ready",
+        "profileControllerReady",
+    ):
+        item = value.get(key)
+        if isinstance(item, bool):
+            output[
+                {
+                    "rootPresent": "root_present",
+                    "composerPresent": "composer_present",
+                    "profileControllerReady": "profile_controller_ready",
+                }.get(key, key)
+            ] = item
+    for key in (
+        "root_child_count",
+        "rootChildCount",
+        "body_child_count",
+        "bodyChildCount",
+        "button_count",
+        "buttonCount",
+        "visible_interactive_count",
+        "visibleInteractiveCount",
+        "runtime_error_count",
+        "runtimeErrorCount",
+    ):
+        item = value.get(key)
+        if type(item) is int and item >= 0:
+            output[
+                {
+                    "rootChildCount": "root_child_count",
+                    "bodyChildCount": "body_child_count",
+                    "buttonCount": "button_count",
+                    "visibleInteractiveCount": "visible_interactive_count",
+                    "runtimeErrorCount": "runtime_error_count",
+                }.get(key, key)
+            ] = item
+    last_error = _public_runtime_error(value.get("last_safe_runtime_error", value.get("lastSafeRuntimeError")))
+    if last_error is not None:
+        output["last_safe_runtime_error"] = last_error
+    return output
+
+
+def _public_profile_controller(value: object) -> dict[str, bool]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        "ready": value.get("ready") is True,
+        "activation_attempted": value.get("activation_attempted", value.get("activationAttempted")) is True,
+        "activation_succeeded": value.get("activation_succeeded", value.get("activationSucceeded")) is True,
+    }
+
+
+def _public_windows(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    output: list[dict[str, object]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        safe: dict[str, object] = {}
+        web_contents_id = item.get("webContentsId", item.get("web_contents_id"))
+        if type(web_contents_id) is int and web_contents_id >= 0:
+            safe["webContentsId"] = web_contents_id
+        for key in ("visible", "isLoading", "rendererPatchLoaded", "accountMenuInjected"):
+            if isinstance(item.get(key), bool):
+                safe[key] = item[key]
+        bounds = item.get("bounds")
+        if isinstance(bounds, dict):
+            safe_bounds = {
+                key: bounds[key]
+                for key in ("x", "y", "width", "height")
+                if isinstance(bounds.get(key), (int, float)) and not isinstance(bounds.get(key), bool)
+            }
+            if safe_bounds:
+                safe["bounds"] = safe_bounds
+        url = item.get("url")
+        if isinstance(url, dict):
+            safe_url: dict[str, str] = {}
+            origin = url.get("origin")
+            if isinstance(origin, str) and len(origin) <= 500:
+                safe_url["origin"] = origin
+            pathname = url.get("pathname")
+            if isinstance(pathname, str) and len(pathname) <= 500:
+                safe_url["pathname"] = pathname.split("?", 1)[0].split("#", 1)[0]
+            if safe_url:
+                safe["url"] = safe_url
+        auth = item.get("desktopAuth", item.get("desktop_auth"))
+        if isinstance(auth, str) and auth in {"AUTHENTICATED", "AUTH_REQUIRED", "UNKNOWN"}:
+            safe["desktopAuth"] = auth
+        output.append(safe)
+    return output[:50]
+
+
+def _public_termination(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, object] = {}
+    for key in (
+        "harness_timeout_reached",
+        "harness_requested_termination",
+        "process_exited_before_cleanup",
+        "process_still_running_at_timeout",
+    ):
+        if isinstance(value.get(key), bool):
+            output[key] = value[key]
+    return_code = value.get("process_return_code")
+    if type(return_code) is int:
+        output["process_return_code"] = return_code
+    return output
+
+
+def _public_validation_profile(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, object] = {}
+    for key in ("root", "user_data"):
+        item = value.get(key)
+        if isinstance(item, str) and len(item) <= 1000:
+            output[key] = item
+    for key in ("persistent", "preserved", "authenticated", "exists"):
+        if isinstance(value.get(key), bool):
+            output[key] = value[key]
+    return output
+
+
 def _public_probe(result: object) -> object:
     if not isinstance(result, dict):
         return result
@@ -399,6 +596,25 @@ def _public_probe(result: object) -> object:
         output["build_metadata_summary"] = _public_build_metadata_summary(
             result.get("build_metadata_summary")
         )
+    if "desktop_auth" in result:
+        output["desktop_auth"] = _public_desktop_auth(result.get("desktop_auth"))
+    if "renderer_runtime" in result:
+        output["renderer_runtime"] = _public_renderer_runtime(result.get("renderer_runtime"))
+    if "profile_controller" in result:
+        output["profile_controller"] = _public_profile_controller(result.get("profile_controller"))
+    if "runtime_errors" in result:
+        raw_errors = result.get("runtime_errors")
+        output["runtime_errors"] = [
+            safe
+            for safe in (_public_runtime_error(item) for item in (raw_errors if isinstance(raw_errors, list) else []))
+            if safe is not None
+        ][-20:]
+    if "termination" in result:
+        output["termination"] = _public_termination(result.get("termination"))
+    if "windows" in result:
+        output["windows"] = _public_windows(result.get("windows"))
+    if "validation_profile" in result:
+        output["validation_profile"] = _public_validation_profile(result.get("validation_profile"))
     profile = result.get("profile_isolation")
     if isinstance(profile, dict):
         output["profile_isolation"] = {
@@ -442,6 +658,8 @@ def _public_probe(result: object) -> object:
         safe_router_menu: dict[str, object] = {}
         for key in (
             "renderer_loaded",
+            "activation_attempted",
+            "activation_succeeded",
             "injected",
             "mounted",
             "accounts_loaded",
@@ -457,6 +675,13 @@ def _public_probe(result: object) -> object:
         status = router_account_menu.get("status")
         if isinstance(status, str) and status in {
             "PASS",
+            "ROUTER_RENDERER_RUNTIME_ERROR",
+            "ROUTER_UI_NOT_READY",
+            "ROUTER_DESKTOP_AUTH_REQUIRED",
+            "ROUTER_DESKTOP_AUTH_UNKNOWN",
+            "ROUTER_PROFILE_CONTROLLER_NOT_READY",
+            "ROUTER_PROFILE_ACTIVATION_FAILED",
+            "ROUTER_MENU_NOT_INJECTED_AFTER_OPEN",
             "ROUTER_MENU_NOT_INJECTED",
             "ROUTER_MENU_NOT_MOUNTED",
             "ROUTER_MENU_ACCOUNTS_LOADING",
@@ -464,6 +689,19 @@ def _public_probe(result: object) -> object:
             "ROUTER_RENDERER_NOT_LOADED",
         }:
             safe_router_menu["status"] = status
+        if "desktop_auth" in router_account_menu:
+            safe_router_menu["desktop_auth"] = _public_desktop_auth(router_account_menu.get("desktop_auth"))
+        if "renderer_runtime" in router_account_menu:
+            safe_router_menu["renderer_runtime"] = _public_renderer_runtime(router_account_menu.get("renderer_runtime"))
+        if "profile_controller" in router_account_menu:
+            safe_router_menu["profile_controller"] = _public_profile_controller(router_account_menu.get("profile_controller"))
+        if "runtime_errors" in router_account_menu:
+            raw_errors = router_account_menu.get("runtime_errors")
+            safe_router_menu["runtime_errors"] = [
+                safe
+                for safe in (_public_runtime_error(item) for item in (raw_errors if isinstance(raw_errors, list) else []))
+                if safe is not None
+            ][-20:]
         output["router_account_menu"] = safe_router_menu
     production_gate = result.get("production_gate")
     if isinstance(production_gate, dict):
@@ -563,6 +801,40 @@ def _public_sandbox(result: dict[str, object]) -> dict[str, object]:
     return output
 
 
+def _resolve_validation_profile_root(
+    local_appdata: Path,
+    override: Path | None = None,
+) -> Path:
+    """Resolve a persistent profile only inside the Router-owned local tree."""
+
+    owner_root = (local_appdata.expanduser() / "Codex Subscription Router").resolve(strict=False)
+    root = (
+        override.expanduser().resolve(strict=False)
+        if override is not None
+        else validation_profile_root(local_appdata)
+    )
+    if "windowsapps" in str(root).casefold():
+        raise RuntimeError("the persistent Router validation profile must be outside WindowsApps")
+    try:
+        root.relative_to(owner_root)
+    except ValueError as error:
+        raise RuntimeError(
+            "the persistent Router validation profile must remain under the Router-owned local app tree"
+        ) from error
+    return root
+
+
+def _validation_profile_summary(root: Path) -> dict[str, object]:
+    user_data = root / "User Data"
+    return {
+        "root": str(root),
+        "user_data": str(user_data),
+        "persistent": True,
+        "preserved": True,
+        "exists": user_data.is_dir(),
+    }
+
+
 def _run_external_patched_shell(
     source: Any,
     selected_real: RealCodexCandidate,
@@ -571,8 +843,9 @@ def _run_external_patched_shell(
     timeout_seconds: float,
     reviewed_source: Mapping[str, object] | None = None,
     go_toolchain: Mapping[str, object] | None = None,
+    validation_profile_root: Path | None = None,
 ) -> dict[str, object]:
-    """Build and smoke one disposable Router shell, finalizing cleanup afterward."""
+    """Build and smoke either a disposable shell or the persistent auth shell."""
 
     if go_toolchain is not None and go_toolchain.get("usable") is not True:
         return {
@@ -583,6 +856,7 @@ def _run_external_patched_shell(
             "manual_operation_required": False,
         }
 
+    persistent = validation_profile_root is not None
     cleanup: dict[str, object] = {}
     result: dict[str, object]
     try:
@@ -590,6 +864,8 @@ def _run_external_patched_shell(
             cleanup,
             parent_name="_host-validation",
             prefix="phase2a5-patched-",
+            persistent=persistent,
+            persistent_root=validation_profile_root,
         ) as root:
             if cleanup.get("path_virtualized") is True:
                 result = {
@@ -603,7 +879,7 @@ def _run_external_patched_shell(
                     source,
                     selected_real,
                     destination,
-                    force=False,
+                    force=persistent,
                     allow_untested_source=False,
                     reviewed_source=reviewed_source,
                     payload_acl_strategy=acl_strategy,
@@ -612,7 +888,11 @@ def _run_external_patched_shell(
                     destination,
                     selected_real,
                     timeout_seconds=timeout_seconds,
-                    disposable_root=True,
+                    disposable_root=not persistent,
+                    user_data_override=(root / "User Data") if persistent else None,
+                    preserve_user_data=persistent,
+                    auth_required=persistent,
+                    validation_profile_root_override=root if persistent else None,
                 )
                 result["build_metadata_summary"] = {
                     "destination": str(destination),
@@ -630,11 +910,202 @@ def _run_external_patched_shell(
 
     # Do not return a cleanup-dependent result from inside the context manager.
     result["smoke_root_cleanup"] = dict(cleanup)
-    if cleanup.get("removed") is not True:
+    if not persistent and cleanup.get("removed") is not True:
         result["status"] = PHASE2A5_PATCHED_SHELL_BLOCKED
         result["reason"] = "the disposable patched-shell root was not cleaned up successfully"
         result["manual_operation_required"] = True
+    if persistent:
+        result["validation_profile"] = {
+            "root": str(validation_profile_root),
+            "user_data": str(validation_profile_root / "User Data"),
+            "persistent": True,
+            "preserved": cleanup.get("preserved") is True,
+            "exists": (validation_profile_root / "User Data").is_dir(),
+            "authenticated": (
+                isinstance(result.get("desktop_auth"), dict)
+                and result["desktop_auth"].get("state") == "AUTHENTICATED"
+            ),
+        }
     return result
+
+
+def prepare_desktop_auth(
+    *,
+    repo_root: Path,
+    source_override: Path | None = None,
+    real_override: Path | None = None,
+    timeout_seconds: float = 900.0,
+    artifact_path: Path | None = None,
+    validation_profile: Path | None = None,
+) -> dict[str, object]:
+    """Build and foreground-launch the persistent profile for manual login."""
+
+    repo_root = repo_root.expanduser().resolve(strict=False)
+    runtime = collect_startup_runtime(repo_root)
+    host_context = detect_windows_host_context()
+    _print_startup(runtime, host_context)
+    result: dict[str, object] = {
+        "schema_version": 1,
+        "status": PHASE2A5_FAIL,
+        "reason": None,
+        "runtime": runtime,
+        "host_context": host_context,
+        "physical_localappdata": None,
+        "source_identity": None,
+        "source_review": None,
+        "source_diagnostics": None,
+        "go_toolchain": runtime.get("go_toolchain"),
+        "real_codex": None,
+        "patched_shell": None,
+        "validation_profile": None,
+        "manual_operation_required": True,
+    }
+
+    def finish() -> dict[str, object]:
+        if artifact_path is not None:
+            write_artifact(artifact_path, result)
+        return result
+
+    if host_context.get("has_package_identity") is not False:
+        result.update(
+            {
+                "status": PHASE2A5_HOST_CONTEXT_BLOCKED,
+                "reason": "Desktop authentication preparation must be started independently from an unpackaged Windows process",
+            }
+        )
+        return finish()
+
+    raw_local_appdata = host_context.get("LOCALAPPDATA")
+    canary = run_localappdata_canary(
+        Path(raw_local_appdata) if isinstance(raw_local_appdata, str) and raw_local_appdata else None
+    )
+    result["physical_localappdata"] = canary
+    print(f"Physical LOCALAPPDATA: {json.dumps(canary, sort_keys=True)}")
+    if canary.get("filesystem_virtualized") is not False:
+        result.update(
+            {
+                "status": (
+                    PHASE2A5_FILESYSTEM_VIRTUALIZED
+                    if canary.get("filesystem_virtualized") is True
+                    else PHASE2A5_HOST_CONTEXT_BLOCKED
+                ),
+                "reason": (
+                    "LOCALAPPDATA canary resolved into a package-cache location"
+                    if canary.get("filesystem_virtualized") is True
+                    else "physical LOCALAPPDATA behavior could not be proven"
+                ),
+            }
+        )
+        return finish()
+
+    try:
+        source, diagnostics = discover_desktop_source(source_override)
+        result["source_diagnostics"] = diagnostics.to_dict()
+        if source is None:
+            result.update({"status": PHASE2A5_FAIL, "reason": format_source_diagnostics(diagnostics)})
+            return finish()
+
+        identity = _source_identity(source)
+        result["source_identity"] = identity
+        reviewed_source = find_reviewed_source(identity)
+        reviewed_ok, reviewed_reason = reviewed_source_is_patchable(identity, reviewed_source)
+        shell_path = str(source.executable).replace("/", "\\").casefold()
+        if not shell_path.endswith("\\app\\chatgpt.exe"):
+            reviewed_ok = False
+            reviewed_reason = "discovered source does not end in app\\ChatGPT.exe"
+        result["source_review"] = {
+            "registry": str(REVIEWED_SOURCES_DOCUMENT),
+            "status": "PATCHABLE" if reviewed_ok else "SOURCE REVIEW REQUIRED",
+            "reason": reviewed_reason,
+            "record": reviewed_source,
+        }
+        if not reviewed_ok:
+            result.update(
+                {
+                    "status": PHASE2A5_SOURCE_REVIEW_REQUIRED,
+                    "reason": f"{PHASE2A5_SOURCE_REVIEW_REQUIRED}: {reviewed_reason}",
+                    "manual_operation_required": False,
+                }
+            )
+            return finish()
+
+        selected_real, real_candidates = discover_real_codex(real_override)
+        result["real_codex"] = {
+            "selected": {
+                "path": str(selected_real.path),
+                "version": selected_real.version,
+                "sha256": selected_real.sha256,
+                "authenticode": {
+                    "status": selected_real.authenticode.status,
+                    "signer": selected_real.authenticode.signer,
+                },
+            },
+            "candidates": [str(candidate.path) for candidate in real_candidates],
+        }
+        local_appdata = Path(raw_local_appdata) if isinstance(raw_local_appdata, str) and raw_local_appdata else Path.home() / "AppData" / "Local"
+        profile_root = _resolve_validation_profile_root(local_appdata, validation_profile)
+        profile_root.mkdir(parents=True, exist_ok=True)
+        (profile_root / "User Data").mkdir(parents=True, exist_ok=True)
+        result["validation_profile"] = _validation_profile_summary(profile_root)
+
+        destination = profile_root / "patched-shell"
+        metadata = build_windows_desktop(
+            source,
+            selected_real,
+            destination,
+            force=True,
+            allow_untested_source=False,
+            reviewed_source=reviewed_source,
+            payload_acl_strategy=PAYLOAD_ACL_NONE,
+        )
+        prepared = run_patched_shell_smoke(
+            destination,
+            selected_real,
+            timeout_seconds=max(float(timeout_seconds), 60.0),
+            disposable_root=False,
+            user_data_override=profile_root / "User Data",
+            preserve_user_data=True,
+            auth_required=True,
+            authentication_preparation=True,
+            validation_profile_root_override=profile_root,
+        )
+        prepared["build_metadata_summary"] = _public_build_metadata_summary(
+            {
+                "destination": str(destination),
+                "desktop_launch_executable": metadata.get("desktop_launch_executable"),
+                "payload_acl_strategy": metadata.get("payload_acl_strategy"),
+                "source_app_asar_sha256": metadata.get("source_app_asar_sha256"),
+                "renderer_syntax_validation": metadata.get("renderer_syntax_validation"),
+            }
+        )
+        result["patched_shell"] = prepared
+        if prepared.get("status") == DESKTOP_AUTH_PREPARED:
+            result.update(
+                {
+                    "status": DESKTOP_AUTH_PREPARED,
+                    "reason": "manual Desktop login was detected and the Router validation profile was preserved",
+                    "manual_operation_required": False,
+                }
+            )
+        elif prepared.get("status") == ROUTER_DESKTOP_AUTH_REQUIRED:
+            result.update(
+                {
+                    "status": ROUTER_DESKTOP_AUTH_REQUIRED,
+                    "reason": "complete normal ChatGPT login in the persistent Router validation window",
+                    "manual_operation_required": True,
+                }
+            )
+        else:
+            result.update(
+                {
+                    "status": PHASE2A5_PATCHED_SHELL_BLOCKED,
+                    "reason": prepared.get("reason", "Desktop authentication preparation did not complete"),
+                    "manual_operation_required": True,
+                }
+            )
+    except (PackagingBlockedError, OSError, RuntimeError, subprocess.SubprocessError) as error:
+        result.update({"status": PHASE2A5_FAIL, "reason": _safe_error(error), "manual_operation_required": True})
+    return finish()
 
 
 def _artifact_result(result: dict[str, object]) -> dict[str, object]:
@@ -657,6 +1128,7 @@ def _artifact_result(result: dict[str, object]) -> dict[str, object]:
         "sandbox_validation",
         "acl_strategy_verdict",
         "patched_shell",
+        "validation_profile",
         "mux_chain",
         "ci",
         "phase2b_ready",
@@ -668,6 +1140,8 @@ def _artifact_result(result: dict[str, object]) -> dict[str, object]:
             output[key] = _public_sandbox(result[key])
         elif key == "patched_shell":
             output[key] = _public_probe(result[key])
+        elif key == "validation_profile":
+            output[key] = _public_validation_profile(result[key])
         else:
             output[key] = result[key]
     return output
@@ -690,6 +1164,7 @@ def run_phase2a5_host_validation(
     timeout_seconds: float = 20.0,
     artifact_path: Path | None = None,
     ci_verified: bool = False,
+    validation_profile: Path | None = None,
 ) -> dict[str, object]:
     """Run Phase 2A.5, stopping before mutation when the host is not valid."""
 
@@ -704,6 +1179,7 @@ def run_phase2a5_host_validation(
         "runtime": runtime,
         "host_context": host_context,
         "physical_localappdata": None,
+        "validation_profile": None,
         "source_identity": None,
         "source_review": None,
         "source_stability": None,
@@ -764,6 +1240,27 @@ def run_phase2a5_host_validation(
         if artifact_path is not None:
             write_artifact(artifact_path, result)
         return result
+
+    raw_local_appdata = host_context.get("LOCALAPPDATA")
+    local_appdata = (
+        Path(raw_local_appdata)
+        if isinstance(raw_local_appdata, str) and raw_local_appdata
+        else Path.home() / "AppData" / "Local"
+    )
+    try:
+        profile_root = _resolve_validation_profile_root(local_appdata, validation_profile)
+    except (OSError, RuntimeError, ValueError) as error:
+        result.update(
+            {
+                "status": PHASE2A5_FAIL,
+                "reason": _safe_error(error),
+                "manual_operation_required": True,
+            }
+        )
+        if artifact_path is not None:
+            write_artifact(artifact_path, result)
+        return result
+    result["validation_profile"] = _validation_profile_summary(profile_root)
 
     try:
         source, diagnostics = discover_desktop_source(source_override)
@@ -843,6 +1340,7 @@ def run_phase2a5_host_validation(
                             if isinstance(runtime.get("go_toolchain"), Mapping)
                             else None
                         ),
+                        validation_profile_root=profile_root,
                     )
                     result["patched_shell"] = patched
                     result["mux_chain"] = {
@@ -854,10 +1352,18 @@ def run_phase2a5_host_validation(
                         "observed_mux": patched.get("mux_process_observed"),
                         "observed_real_codex": patched.get("real_codex_process_observed"),
                     }
+                    patched_cleanup = patched.get("smoke_root_cleanup")
+                    patched_cleanup_ok = (
+                        isinstance(patched_cleanup, dict)
+                        and (
+                            patched_cleanup.get("removed") is True
+                            or patched_cleanup.get("persistent") is True
+                            and patched_cleanup.get("preserved") is True
+                        )
+                    )
                     if (
                         patched.get("status") == PATCHED_SHELL_PASS
-                        and isinstance(patched.get("smoke_root_cleanup"), dict)
-                        and patched["smoke_root_cleanup"].get("removed") is True
+                        and patched_cleanup_ok
                         and sandbox.get("official_package_unchanged") is True
                     ):
                         if ci_verified:
@@ -881,6 +1387,11 @@ def run_phase2a5_host_validation(
                                 "GitHub checks remain to be confirmed before aggregate PASS"
                             )
                             result["phase2b_ready"] = False
+                    elif patched.get("status") == ROUTER_DESKTOP_AUTH_REQUIRED:
+                        result["status"] = PHASE2A5_DESKTOP_AUTH_REQUIRED
+                        result["reason"] = (
+                            "the persistent Router Desktop validation profile requires normal interactive ChatGPT login"
+                        )
                     elif patched.get("status") == PHASE2A5_PATCHED_SHELL_TOOLCHAIN_BLOCKED:
                         result["status"] = PHASE2A5_PATCHED_SHELL_TOOLCHAIN_BLOCKED
                         result["reason"] = patched.get("reason")
@@ -942,6 +1453,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--real-codex", type=Path, help="explicit validated native per-user codex.exe")
     parser.add_argument("--timeout-seconds", type=float, default=20.0)
     parser.add_argument(
+        "--prepare-desktop-auth",
+        action="store_true",
+        help="build and foreground-launch the persistent Router validation profile for manual Desktop login",
+    )
+    parser.add_argument(
+        "--validation-profile",
+        type=Path,
+        help="Router-owned persistent validation-profile override; never use the official Desktop profile",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=DEFAULT_ARTIFACT,
@@ -957,6 +1478,23 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.prepare_desktop_auth:
+        result = prepare_desktop_auth(
+            repo_root=args.repo_root,
+            source_override=args.source,
+            real_override=args.real_codex,
+            timeout_seconds=max(args.timeout_seconds, 60.0),
+            artifact_path=args.output,
+            validation_profile=args.validation_profile,
+        )
+        if result.get("manual_operation_required"):
+            print(
+                "Manual operation required: complete normal ChatGPT login in the opened "
+                "Router validation window; credentials are never read by this workflow."
+            )
+        print(f"Phase 2A.5 Desktop authentication preparation: {result.get('status')}")
+        print(json.dumps(_artifact_result(result), indent=2, ensure_ascii=False))
+        return 0 if result.get("status") == DESKTOP_AUTH_PREPARED else 1
     result = run_phase2a5_host_validation(
         repo_root=args.repo_root,
         source_override=args.source,
@@ -964,6 +1502,7 @@ def main() -> int:
         timeout_seconds=args.timeout_seconds,
         artifact_path=args.output,
         ci_verified=args.ci_verified,
+        validation_profile=args.validation_profile,
     )
     if result.get("manual_operation_required"):
         print(
@@ -980,6 +1519,7 @@ def main() -> int:
         PHASE2A5_ACL_FIX_CONFIRMED,
         PHASE2A5_GPU_SANDBOX_REGRESSION,
         PHASE2A5_SOURCE_REVIEW_REQUIRED,
+        PHASE2A5_DESKTOP_AUTH_REQUIRED,
     }:
         return 0
     return 1

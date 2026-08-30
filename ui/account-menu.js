@@ -4,7 +4,176 @@ const CODEX_MUX_API = "http://127.0.0.1:__CODEX_MUX_CONTROL_PORT__/v1";
 const CODEX_MUX_TOKEN = "__CODEX_MUX_CONTROL_TOKEN__";
 let codexMuxLoginActive = false;
 
+globalThis.__codexMuxDesktopAuth = "UNKNOWN";
+globalThis.__codexMuxProfileMenuControllerReady = false;
+
+function codexMuxSafeRuntimeName(value, fallback) {
+  const name = typeof value === "string" ? value.trim() : "";
+  return /^[A-Za-z_$][\w$.-]{0,79}$/.test(name) ? name : fallback;
+}
+
+function codexMuxSafeSourceAsset(value) {
+  if (typeof value !== "string") return null;
+  const source = value.split(/[?#]/, 1)[0];
+  const pieces = source.split(/[\\/]/);
+  const basename = pieces[pieces.length - 1] || "";
+  return basename.length > 0 && basename.length <= 200 ? basename : null;
+}
+
+function codexMuxSafeRuntimeError(kind, errorLike) {
+  const metadata = {
+    kind: codexMuxSafeRuntimeName(kind, "error"),
+    name: "Error",
+    source_asset: null,
+    line: null,
+    column: null,
+  };
+  const candidate = errorLike && typeof errorLike === "object" ? errorLike : {};
+  metadata.name = codexMuxSafeRuntimeName(candidate.name, "Error");
+  metadata.source_asset = codexMuxSafeSourceAsset(
+    candidate.filename || candidate.sourceURL || candidate.fileName,
+  );
+  const line = candidate.lineno ?? candidate.lineNumber ?? candidate.line;
+  const column = candidate.colno ?? candidate.columnNumber ?? candidate.column;
+  if (Number.isSafeInteger(line) && line >= 0) metadata.line = line;
+  if (Number.isSafeInteger(column) && column >= 0) metadata.column = column;
+  return metadata;
+}
+
+function codexMuxRendererRuntimeSnapshot() {
+  const body = typeof document === "object" ? document.body : null;
+  const root = document.querySelector("#root") || body?.firstElementChild || null;
+  const composer = document.querySelector(
+    'textarea[placeholder],[contenteditable="true"]',
+  );
+  let visibleInteractiveCount = 0;
+  for (const element of document.querySelectorAll(
+    'button,a,input,textarea,[role="button"],[contenteditable="true"]',
+  )) {
+    const rect = element.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) visibleInteractiveCount += 1;
+  }
+  return {
+    readyState:
+      document.readyState === "loading" ||
+      document.readyState === "interactive" ||
+      document.readyState === "complete"
+        ? document.readyState
+        : "unknown",
+    rootPresent: root != null,
+    rootChildCount: root?.children?.length ?? 0,
+    bodyChildCount: body?.children?.length ?? 0,
+    buttonCount: document.querySelectorAll("button").length,
+    visibleInteractiveCount,
+    composerPresent: composer != null,
+    profileControllerReady:
+      globalThis.__codexMuxProfileMenuControllerReady === true,
+    runtimeErrorCount: Array.isArray(globalThis.__codexMuxRuntimeErrors)
+      ? globalThis.__codexMuxRuntimeErrors.length
+      : 0,
+    lastSafeRuntimeError:
+      Array.isArray(globalThis.__codexMuxRuntimeErrors) &&
+      globalThis.__codexMuxRuntimeErrors.length > 0
+        ? globalThis.__codexMuxRuntimeErrors.at(-1)
+        : null,
+  };
+}
+
+function codexMuxSetRendererRuntime(snapshot = codexMuxRendererRuntimeSnapshot()) {
+  globalThis.__codexMuxRendererRuntime = snapshot;
+  return snapshot;
+}
+
+function codexMuxSetDesktopAuth(state) {
+  globalThis.__codexMuxDesktopAuth =
+    state === "AUTHENTICATED" || state === "AUTH_REQUIRED" || state === "UNKNOWN"
+      ? state
+      : "UNKNOWN";
+  return globalThis.__codexMuxDesktopAuth;
+}
+
+function codexMuxDetectDesktopAuth() {
+  const runtime = codexMuxRendererRuntimeSnapshot();
+  const pathname =
+    typeof globalThis.location?.pathname === "string"
+      ? globalThis.location.pathname.toLowerCase()
+      : "";
+  if (/(^|\/)(auth|login|signin|sign-in)(\/|$)/.test(pathname)) {
+    return codexMuxSetDesktopAuth("AUTH_REQUIRED");
+  }
+  if (
+    globalThis.__codexMuxAuthenticatedShellReady === true ||
+    (runtime.composerPresent && runtime.profileControllerReady)
+  ) {
+    return codexMuxSetDesktopAuth("AUTHENTICATED");
+  }
+  if (
+    runtime.readyState === "complete" &&
+    runtime.rootPresent &&
+    !runtime.composerPresent &&
+    !runtime.profileControllerReady
+  ) {
+    return codexMuxSetDesktopAuth("AUTH_REQUIRED");
+  }
+  return codexMuxSetDesktopAuth("UNKNOWN");
+}
+
+function codexMuxRecordRuntimeError(kind, errorLike) {
+  if (!Array.isArray(globalThis.__codexMuxRuntimeErrors)) {
+    globalThis.__codexMuxRuntimeErrors = [];
+  }
+  globalThis.__codexMuxRuntimeErrors.push(
+    codexMuxSafeRuntimeError(kind, errorLike),
+  );
+  if (globalThis.__codexMuxRuntimeErrors.length > 20) {
+    globalThis.__codexMuxRuntimeErrors.splice(
+      0,
+      globalThis.__codexMuxRuntimeErrors.length - 20,
+    );
+  }
+  codexMuxSetRendererRuntime();
+}
+
+function codexMuxInstallRuntimeDiagnostics() {
+  if (globalThis.__codexMuxRuntimeDiagnosticsInstalled === true) return;
+  globalThis.__codexMuxRuntimeDiagnosticsInstalled = true;
+  globalThis.__codexMuxRuntimeErrors = [];
+  globalThis.addEventListener?.("error", (event) =>
+    codexMuxRecordRuntimeError("error", {
+      name: event?.error?.name || event?.name,
+      filename: event?.filename,
+      lineno: event?.lineno,
+      colno: event?.colno,
+    }),
+  );
+  globalThis.addEventListener?.("unhandledrejection", (event) =>
+    codexMuxRecordRuntimeError("unhandledrejection", {
+      name: event?.reason?.name,
+      sourceURL: null,
+    }),
+  );
+  codexMuxSetRendererRuntime();
+}
+
+codexMuxInstallRuntimeDiagnostics();
+codexMuxSetDesktopAuth(codexMuxDetectDesktopAuth());
+
 function CodexMuxProfileMenuOpenChange(setOpen) {
+  const controllerReady = typeof setOpen === "function";
+  globalThis.__codexMuxProfileMenuControllerReady = controllerReady;
+  if (controllerReady) {
+    globalThis.__codexMuxOpenProfileMenuForTest = () => {
+      try {
+        setOpen(true);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+  } else {
+    globalThis.__codexMuxOpenProfileMenuForTest = undefined;
+  }
+  codexMuxSetRendererRuntime();
   return (nextOpen) => {
     if (!nextOpen && codexMuxLoginActive) return;
     setOpen(nextOpen);
@@ -259,6 +428,10 @@ function CodexMuxAccountMenu() {
   const loginAccountId = login?.accountId || null;
 
   kXc.useEffect(() => {
+    codexMuxInstallRuntimeDiagnostics();
+    globalThis.__codexMuxAuthenticatedShellReady = true;
+    codexMuxSetDesktopAuth(codexMuxDetectDesktopAuth());
+    codexMuxSetRendererRuntime();
     globalThis.__codexMuxAccountMenuMounted = true;
     codexMuxSetAccountMenuState({
       mounted: true,
@@ -268,6 +441,9 @@ function CodexMuxAccountMenu() {
     });
     return () => {
       globalThis.__codexMuxAccountMenuMounted = false;
+      globalThis.__codexMuxAuthenticatedShellReady = false;
+      codexMuxSetDesktopAuth(codexMuxDetectDesktopAuth());
+      codexMuxSetRendererRuntime();
       codexMuxSetAccountMenuState({
         mounted: false,
         accountsLoaded: false,
