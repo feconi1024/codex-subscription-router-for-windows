@@ -1675,8 +1675,14 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             ), patch("scripts.windows.smoke.time.sleep", return_value=None):
                 run_patched_shell_smoke(root, real, timeout_seconds=1.0, disposable_root=True)
             environment = captured["env"]
-            self.assertEqual(environment["CODEX_HOME"], str(root / "codex-home"))
-            self.assertEqual(environment["CODEX_MUX_HOME"], str(runtime / ".codex-mux"))
+            self.assertEqual(
+                Path(environment["CODEX_HOME"]).resolve(strict=False),
+                (root / "codex-home").resolve(strict=False),
+            )
+            self.assertEqual(
+                Path(environment["CODEX_MUX_HOME"]).resolve(strict=False),
+                (runtime / ".codex-mux").resolve(strict=False),
+            )
             self.assertNotIn("CODEX_MUX_PERSISTENT_PROFILE_ROOT", environment)
 
     def test_force_rebuild_uses_recoverable_backup_without_touching_persistent_roots(self) -> None:
