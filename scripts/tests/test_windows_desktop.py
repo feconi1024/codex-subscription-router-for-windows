@@ -15,6 +15,7 @@ from unittest.mock import patch
 from scripts.patch_common import (
     _plugin_mapping_anchors,
     audit_renderer_anchors,
+    compare_renderer_contract,
     ensure_asar_tool,
     patch_renderer,
     renderer_variant_template,
@@ -25,6 +26,7 @@ from scripts.patch_app_windows import (
     audit_windows_source,
     build_windows_desktop,
     pack_asar,
+    probe_go_toolchain,
     verify_asar_listing,
 )
 from scripts.windows.compatibility import (
@@ -100,8 +102,18 @@ from scripts.windows.host_context import (
     run_localappdata_canary,
 )
 from scripts.windows.phase2a5_host_validation import (
+    PHASE2A5_PATCHED_SHELL_TOOLCHAIN_BLOCKED,
+    PHASE2A5_SOURCE_CHANGED_DURING_VALIDATION,
+    PHASE2A5_SOURCE_REVIEW_REQUIRED,
+    _go_toolchain_report,
     _run_external_patched_shell,
+    _source_identity,
+    _source_stability,
     run_phase2a5_host_validation,
+)
+from scripts.windows.reviewed_sources import (
+    find_reviewed_source,
+    load_reviewed_sources,
 )
 from scripts.windows.acl import (
     ALL_APPLICATION_PACKAGES_SID,
@@ -1194,6 +1206,236 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                 package_version="26.820.7780.0",
                 app_asar_sha256="5df8bf5a9d30742919390ab11fa419e83aab0891152569a42c6ea4abf15386c2",
             )
+
+    def test_exact_26_825_variant_requires_multiple_fingerprints(self) -> None:
+        values = renderer_variant_template("windows-26.825")
+        bundle = "\n".join(
+            [
+                str(values["component_anchor"]),
+                str(values["app_server_anchor"]),
+                str(values["profile_query"]),
+                str(values["usage_modal"]),
+                str(values["reset_query"]),
+                str(values["reset_mutation"]),
+                str(values["open_change"][0]),
+            ]
+        )
+        selected = select_renderer_variant(
+            bundle,
+            package_name="OpenAI.Codex",
+            package_version="26.825.5331.0",
+            app_asar_sha256="178b65229452b17b0203ab41d5ceafedccd770c9bd42d239a6d048d27d80252b",
+        )
+        self.assertEqual(selected.variant_id, "windows-26.825")
+        with self.assertRaises(RuntimeError):
+            select_renderer_variant(
+                bundle.replace(str(values["reset_query"]), "reset-query-drift"),
+                package_name="OpenAI.Codex",
+                package_version="26.825.5331.0",
+                app_asar_sha256="178b65229452b17b0203ab41d5ceafedccd770c9bd42d239a6d048d27d80252b",
+            )
+
+    def test_reviewed_source_registry_matches_old_and_new_and_rejects_hash_drift(self) -> None:
+        records = load_reviewed_sources()
+        self.assertEqual({record["renderer_variant"] for record in records}, {"windows-26.820", "windows-26.825"})
+        for record in records:
+            identity = {
+                "package_name": record["package_name"],
+                "package_version": record["package_version"],
+                "architecture": record["architecture"],
+                "app_file_version": record["app_file_version"],
+                "app_asar_sha256": record["app_asar_sha256"],
+                "app_asar_header_sha256": record["app_asar_header_sha256"],
+            }
+            self.assertEqual(find_reviewed_source(identity, records), record)
+            wrong_hash = dict(identity, app_asar_sha256="0" * 64)
+            self.assertIsNone(find_reviewed_source(wrong_hash, records))
+        old = next(record for record in records if record["renderer_variant"] == "windows-26.820")
+        changed_same_version = dict(
+            old,
+            app_asar_sha256="1" * 64,
+            app_asar_header_sha256="2" * 64,
+        )
+        identity = {
+            "package_name": old["package_name"],
+            "package_version": old["package_version"],
+            "architecture": old["architecture"],
+            "app_file_version": old["app_file_version"],
+            "app_asar_sha256": changed_same_version["app_asar_sha256"],
+            "app_asar_header_sha256": changed_same_version["app_asar_header_sha256"],
+        }
+        self.assertIsNone(find_reviewed_source(identity, records))
+
+    def test_renderer_contract_comparison_is_read_only_and_never_patch_permission(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            extracted = Path(temporary)
+            write_exact_26_820_renderer_fixture(extracted)
+            before = {path: path.read_bytes() for path in extracted.rglob("*") if path.is_file()}
+            comparison = compare_renderer_contract(extracted)
+            after = {path: path.read_bytes() for path in extracted.rglob("*") if path.is_file()}
+        self.assertTrue(comparison["read_only"])
+        self.assertFalse(comparison["patch_permission_granted"])
+        self.assertFalse(comparison["patchable"])
+        self.assertEqual(comparison["reference_fingerprint_count"], 8)
+        self.assertTrue(comparison["host_scoped_rpc"]["read_only"])
+        self.assertEqual(before, after)
+        self.assertTrue(all(item["status"] == "UNCHANGED" for item in comparison["surface_status"]), comparison)
+
+    def test_source_stability_detects_asar_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable = root / "app" / "ChatGPT.exe"
+            asar = root / "app" / "resources" / "app.asar"
+            executable.parent.mkdir(parents=True)
+            asar.parent.mkdir(parents=True)
+            executable.write_bytes(b"chatgpt")
+            asar.write_bytes(b"asar-before")
+            source = SimpleNamespace(
+                source_root=root,
+                app_dir=root / "app",
+                executable=executable,
+                app_asar=asar,
+                package=SimpleNamespace(
+                    name="OpenAI.Codex",
+                    package_full_name="OpenAI.Codex_26.825.5331.0_x64__publisher",
+                    version="26.825.5331.0",
+                    architecture="X64",
+                    publisher="CN=OpenAI",
+                ),
+                file_version="151.0.7922.174",
+                source_kind="fixture",
+            )
+            with patch(
+                "scripts.windows.phase2a5_host_validation.asar_header_digest",
+                return_value=AsarHeaderDigest("sha256", "a" * 64, 1, 1),
+            ):
+                initial = _source_identity(source)
+                asar.write_bytes(b"asar-after")
+                stability = _source_stability(source, initial)
+        self.assertFalse(stability["stable"])
+        self.assertIn("app_asar_sha256", stability["changed_fields"])
+
+    def test_unknown_source_stops_before_real_probe_and_keeps_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / "app"
+            resources = app / "resources"
+            resources.mkdir(parents=True)
+            executable = app / "ChatGPT.exe"
+            asar = resources / "app.asar"
+            executable.write_bytes(b"chatgpt")
+            asar.write_bytes(b"unreviewed-source")
+            source = DesktopSource(
+                source_root=root,
+                app_dir=app,
+                executable=executable,
+                resources_dir=resources,
+                app_asar=asar,
+                package=PackageMetadata(
+                    name="OpenAI.Codex",
+                    package_full_name="OpenAI.Codex_99.0.0.0_x64__publisher",
+                    version="99.0.0.0",
+                    architecture="X64",
+                    publisher="CN=OpenAI",
+                ),
+                source_kind="fixture",
+                file_version="199.0.0.0",
+            )
+            with patch(
+                "scripts.windows.phase2a5_host_validation.collect_startup_runtime",
+                return_value={"go_toolchain": {"selected": None, "usable": False, "probes": []}},
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.detect_windows_host_context",
+                return_value={"has_package_identity": False, "LOCALAPPDATA": str(root / "local")},
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.run_localappdata_canary",
+                return_value={"filesystem_virtualized": False},
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.discover_desktop_source",
+                return_value=(source, SourceDiagnostics()),
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.asar_header_digest",
+                return_value=AsarHeaderDigest("sha256", "b" * 64, 1, 1),
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.discover_real_codex",
+                side_effect=AssertionError("unreviewed source must stop before real probe"),
+            ):
+                result = run_phase2a5_host_validation(repo_root=root)
+        self.assertEqual(result["status"], PHASE2A5_SOURCE_REVIEW_REQUIRED)
+        self.assertIn("99.0.0.0", result["source_identity"]["package_version"])
+        self.assertEqual(result["source_identity"]["app_asar"], str(asar))
+        self.assertEqual(result["source_identity"]["app_asar_sha256"], hashlib.sha256(b"unreviewed-source").hexdigest())
+        self.assertEqual(result["source_review"]["status"], "SOURCE REVIEW REQUIRED")
+
+    def test_source_changed_verdict_is_exact_and_discards_downstream_results(self) -> None:
+        initial = {
+            "source_root": r"C:\\WindowsApps\\OpenAI.Codex_26.825",
+            "package_name": "OpenAI.Codex",
+            "package_version": "26.825.5331.0",
+            "architecture": "X64",
+            "app_file_version": "151.0.7922.174",
+            "executable": r"C:\\WindowsApps\\OpenAI.Codex_26.825\\app\\ChatGPT.exe",
+            "chatgpt_exe_sha256": "a" * 64,
+            "app_asar": r"C:\\WindowsApps\\OpenAI.Codex_26.825\\app\\resources\\app.asar",
+            "app_asar_sha256": "b" * 64,
+            "app_asar_header_sha256": "c" * 64,
+        }
+        source = SimpleNamespace()
+        with patch(
+            "scripts.windows.phase2a5_host_validation._source_identity",
+            return_value=dict(initial, app_asar_sha256="d" * 64),
+        ):
+            stability = _source_stability(source, initial)
+        self.assertFalse(stability["stable"])
+        self.assertEqual(stability["changed_fields"], ["app_asar_sha256"])
+        self.assertEqual(PHASE2A5_SOURCE_CHANGED_DURING_VALIDATION, "PHASE 2A.5 SOURCE CHANGED DURING VALIDATION")
+
+    def test_no_go_toolchain_blocks_patched_shell_before_build(self) -> None:
+        with patch(
+            "scripts.windows.phase2a5_host_validation.build_windows_desktop",
+            side_effect=AssertionError("build must not run without Go"),
+        ):
+            result = _run_external_patched_shell(
+                SimpleNamespace(),
+                object(),
+                acl_strategy=PAYLOAD_ACL_NONE,
+                timeout_seconds=1.0,
+                go_toolchain={"selected": None, "usable": False, "probes": []},
+            )
+        self.assertEqual(result["status"], PHASE2A5_PATCHED_SHELL_TOOLCHAIN_BLOCKED)
+        self.assertFalse(result["manual_operation_required"])
+
+    def test_go_toolchain_report_exposes_known_and_missing_paths(self) -> None:
+        with patch(
+            "scripts.windows.phase2a5_host_validation.probe_go_toolchain",
+            return_value={"selected": r"C:\\Go\\bin\\go.exe", "probes": []},
+        ), patch(
+            "scripts.windows.phase2a5_host_validation.subprocess.run",
+            return_value=SimpleNamespace(returncode=0, stdout="go version go1.24 windows/amd64", stderr=""),
+        ):
+            known = _go_toolchain_report()
+        self.assertEqual(known["selected"], r"C:\\Go\\bin\\go.exe")
+        self.assertTrue(known["usable"])
+        with patch(
+            "scripts.windows.phase2a5_host_validation.probe_go_toolchain",
+            return_value={"selected": None, "probes": []},
+        ):
+            missing = _go_toolchain_report()
+        self.assertIsNone(missing["selected"])
+        self.assertFalse(missing["usable"])
+
+    def test_go_probe_finds_known_path_when_path_lookup_is_missing(self) -> None:
+        with patch(
+            "scripts.patch_app_windows.shutil.which",
+            return_value=None,
+        ), patch(
+            "scripts.patch_app_windows.Path.is_file",
+            return_value=True,
+        ):
+            report = probe_go_toolchain()
+        self.assertTrue(report["selected"].replace("/", "\\").casefold().endswith(r"go\bin\go.exe"))
+        self.assertEqual(report["probes"][0]["status"], "FAIL")
+        self.assertEqual(report["probes"][2]["status"], "PASS")
 
     def test_exact_26_820_renderer_patches_host_scoped_plugin_requests(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

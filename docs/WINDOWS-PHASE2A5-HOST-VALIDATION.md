@@ -21,6 +21,14 @@ This round adds:
 - the user-started `scripts/windows/run_phase2a5_host_validation.ps1` runner;
 - an ignored `docs/generated/WINDOWS-PHASE2A5-HOST-RESULT.json` artifact path.
 
+Phase 2A.6 adds a second fail-closed gate before the native probes: the
+discovered source must match an exact record in
+`scripts/windows/reviewed_sources.json`.  A clean version, architecture,
+executable-version, ASAR-hash, or ASAR-header-hash mismatch stops with
+`PHASE 2A.5 SOURCE REVIEW REQUIRED`; the identity and source diagnostics are
+still retained in the artifact.  The old compatibility markdown remains a
+release list and is not widened by this registry refresh.
+
 The existing Phase 2A.4 CI baseline was green before this round.  The current
 round must still pass both `checks` and `windows-go-core` before compatibility
 promotion.
@@ -48,7 +56,8 @@ Set-Location -LiteralPath 'E:\Projects\codex-subscription-router-for-windows'
 ```
 
 The runner prints the process, package identity, physical LOCALAPPDATA,
-repository commit, Python, Node, and Go at startup.  It writes only a
+repository commit, Python, Node, Go, and the structured Go toolchain probes at
+startup.  It writes only a
 credential-free diagnostic artifact under `docs/generated/`, which is ignored
 by Git.  It never logs in, adds an account, sends a chat, consumes reset
 credits, or modifies the official WindowsApps installation.
@@ -62,7 +71,12 @@ The artifact must be reviewed for, in order:
 5. the selected ACL strategy;
 6. normal-sandbox patched-shell, account-menu, health, and mux-chain evidence;
 7. exact-root cleanup and unchanged official source hashes;
-8. green `checks` and `windows-go-core` CI for the recorded commit.
+8. source stability at the end of validation;
+9. green `checks` and `windows-go-core` CI for the recorded commit.
+
+The native runner may execute direct Probe A when Go is unavailable, but it
+must stop before creating the patched shell with the exact status
+`PATCHED SHELL TOOLCHAIN BLOCKED`.  It never installs Go or changes PATH.
 
 Only after reviewing those two CI jobs may the operator rerun the same manual
 runner with `--ci-verified`; that switch is the explicit gate for the
@@ -84,6 +98,9 @@ PHASE 2A.5 DIRECT HOST PASS
 PHASE 2A.5 ACL FIX CONFIRMED
 PHASE 2A.5 GPU SANDBOX REGRESSION
 PHASE 2A.5 PATCHED SHELL BLOCKED
+PHASE 2A.5 SOURCE REVIEW REQUIRED
+PHASE 2A.5 SOURCE CHANGED DURING VALIDATION
+PATCHED SHELL TOOLCHAIN BLOCKED
 PHASE 2A.5 FAIL
 ```
 

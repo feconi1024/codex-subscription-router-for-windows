@@ -12,11 +12,13 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Mapping
 
 try:
     from .patch_common import (
         PROJECT_ROOT,
         audit_renderer_anchors,
+        compare_renderer_contract,
         ensure_asar_tool,
         load_or_create_token,
         patch_renderer,
@@ -92,10 +94,12 @@ try:
         mirror_desktop_source,
         verify_desktop_mirror,
     )
+    from .windows.reviewed_sources import find_reviewed_source, reviewed_source_is_patchable
 except ImportError:
     from patch_common import (
         PROJECT_ROOT,
         audit_renderer_anchors,
+        compare_renderer_contract,
         ensure_asar_tool,
         load_or_create_token,
         patch_renderer,
@@ -171,6 +175,7 @@ except ImportError:
         mirror_desktop_source,
         verify_desktop_mirror,
     )
+    from windows.reviewed_sources import find_reviewed_source, reviewed_source_is_patchable
 
 
 PROJECT_VERSION = (PROJECT_ROOT / "VERSION").read_text(encoding="utf-8").strip()
@@ -178,6 +183,11 @@ DEFAULT_DESTINATION = Path(
     os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")
 ) / "Codex Subscription Router"
 COMPATIBILITY_DOCUMENT = PROJECT_ROOT / "docs" / "WINDOWS-COMPATIBILITY.md"
+PHASE2A6_SOURCE_REVIEW_PASS = "FULL PHASE 2A.6 SOURCE REVIEW PASS"
+PHASE2A6_RENDERER_ADAPTATION_REQUIRED = "PHASE 2A.6 RENDERER ADAPTATION REQUIRED"
+PHASE2A6_BOOTSTRAP_BLOCKED = "PHASE 2A.6 BOOTSTRAP BLOCKED"
+PHASE2A6_INTEGRITY_BLOCKED = "PHASE 2A.6 INTEGRITY BLOCKED"
+PHASE2A6_FAIL = "PHASE 2A.6 FAIL"
 
 
 def parse_args() -> argparse.Namespace:
@@ -446,6 +456,26 @@ def _audit_has_failure(audit: list[object]) -> bool:
     return any(item.status in {"MISSING", "SEMANTICALLY_CHANGED", "AMBIGUOUS"} for item in audit)
 
 
+def _phase2a6_verdict(
+    *,
+    renderer_variant: str,
+    renderer_audit_pass: bool,
+    bootstrap_pass: bool,
+    integrity_resolved: bool,
+    reviewed_source_pass: bool,
+    authoritative_shell_proven: bool,
+) -> str:
+    if not renderer_audit_pass or renderer_variant == "UNRESOLVED":
+        return PHASE2A6_RENDERER_ADAPTATION_REQUIRED
+    if not bootstrap_pass:
+        return PHASE2A6_BOOTSTRAP_BLOCKED
+    if not integrity_resolved:
+        return PHASE2A6_INTEGRITY_BLOCKED
+    if not reviewed_source_pass or not authoritative_shell_proven:
+        return PHASE2A6_FAIL
+    return PHASE2A6_SOURCE_REVIEW_PASS
+
+
 def _carrier_paths_from_scan(mirrored_root: Path, fuse_scan: dict[str, object]) -> tuple[Path, ...]:
     values = fuse_scan.get("carriers")
     if not isinstance(values, list):
@@ -506,8 +536,41 @@ def audit_windows_source(source: DesktopSource) -> dict[str, object]:
             package_version=source.package.version,
             app_asar_sha256=source_hash,
         )
+        renderer_comparison = compare_renderer_contract(extracted, reference_variant="windows-26.820")
         bootstrap_audit = audit_bootstrap(extracted, PROJECT_ROOT)
     fuse_summary = _fuse_summary(integrity_plan.fuse, integrity_plan.fuse_error)
+    audited_file_version = versions.get("FileVersion") or source.file_version
+    source_identity = {
+        "package_name": source.package.name,
+        "package_version": source.package.version,
+        "architecture": source.package.architecture,
+        "app_file_version": audited_file_version,
+        "app_asar_sha256": source_hash,
+        "app_asar_header_sha256": source_header.hash,
+    }
+    reviewed_source = find_reviewed_source(source_identity)
+    reviewed_source_pass, reviewed_source_reason = reviewed_source_is_patchable(
+        source_identity,
+        reviewed_source,
+    )
+    authoritative_shell_proven = any(
+        candidate.relative_path.replace("/", "\\").casefold() == "app\\chatgpt.exe"
+        and candidate.present is True
+        and candidate.appx_manifest_declared is True
+        for candidate in executable_inventory
+    )
+    if not authoritative_shell_proven:
+        reviewed_source_pass = False
+        reviewed_source_reason = "app\\ChatGPT.exe was not proven as the present AppX-declared shell"
+    renderer_variant_pass = renderer_variant_id != "UNRESOLVED" and not _audit_has_failure(renderer_audit)
+    phase2a6_verdict = _phase2a6_verdict(
+        renderer_variant=renderer_variant_id,
+        renderer_audit_pass=renderer_variant_pass,
+        bootstrap_pass=bool(bootstrap_audit.get("audit_pass")),
+        integrity_resolved=integrity_plan.resolved,
+        reviewed_source_pass=reviewed_source_pass,
+        authoritative_shell_proven=authoritative_shell_proven,
+    )
     return {
         "source": {
             "package": package_to_dict(source.package),
@@ -515,7 +578,7 @@ def audit_windows_source(source: DesktopSource) -> dict[str, object]:
             "source_root": str(source.source_root),
             "app_dir": str(source.app_dir),
             "executable": str(source.executable),
-            "file_version": versions.get("FileVersion") or source.file_version,
+            "file_version": audited_file_version,
             "product_version": versions.get("ProductVersion") or "unknown",
             "authenticode": {"status": signature.status, "signer": signature.signer},
             "app_asar": str(source.app_asar),
@@ -544,14 +607,19 @@ def audit_windows_source(source: DesktopSource) -> dict[str, object]:
             for item in renderer_audit
         ],
         "renderer_variant": renderer_variant_id,
+        "renderer_contract_comparison": renderer_comparison,
         "electron_fuses": fuse_summary,
-        "renderer_audit_pass": not _audit_has_failure(renderer_audit),
+        "renderer_audit_pass": renderer_variant_pass,
         "fuse_audit_pass": True,
+        "reviewed_source": {
+            "status": "PATCHABLE" if reviewed_source_pass else "SOURCE REVIEW REQUIRED",
+            "reason": reviewed_source_reason,
+            "record": reviewed_source,
+        },
+        "authoritative_shell_proven": authoritative_shell_proven,
+        "phase2a6_verdict": phase2a6_verdict,
         "audit_pass": (
-            renderer_variant_id != "UNRESOLVED"
-            and not _audit_has_failure(renderer_audit)
-            and bool(bootstrap_audit.get("audit_pass"))
-            and integrity_plan.resolved
+            phase2a6_verdict == PHASE2A6_SOURCE_REVIEW_PASS
         ),
     }
 
@@ -609,6 +677,7 @@ def _run_source_audit(args: argparse.Namespace) -> int:
     print(f"Authenticode: {audit['source']['authenticode']}")
     print(f"ASAR header SHA-256: {audit['source']['app_asar_header_sha256']}")
     print(f"Renderer variant: {audit['renderer_variant']}")
+    print(f"Phase 2A.6 verdict: {audit['phase2a6_verdict']}")
     print(f"AppxBlockMap files: {audit['appx_block_map']['file_count']}")
     print(f"Electron fuses: {json.dumps(audit['electron_fuses'], sort_keys=True)}")
     print(f"Windows ASAR integrity: {json.dumps(audit['windows_asar_integrity'], sort_keys=True)}")
@@ -1119,9 +1188,8 @@ def _metadata(
         "desktop_launch_executable": launch_executable,
         "launch_metadata": "launch.json",
         "launch_selection_basis": (
-            "exact OpenAI.Codex 26.820.7780.0 AppxManifest executable"
+            f"exact {source.package.name} {source.package.version} AppxManifest executable"
             if source.package.name.casefold() == "openai.codex"
-            and source.package.version == "26.820.7780.0"
             else "compatibility-specific AppxManifest executable or validated legacy shell"
         ),
         "profile_isolation_strategy": "CODEX_ELECTRON_USER_DATA_PATH plus --user-data-dir",
@@ -1290,6 +1358,7 @@ def build_windows_desktop(
     *,
     force: bool,
     allow_untested_source: bool,
+    reviewed_source: Mapping[str, object] | None = None,
     launch_executable: str | None = None,
     bootstrap_user_data_patch: bool | None = None,
     bootstrap_disable_updater: bool | None = None,
@@ -1320,6 +1389,21 @@ def build_windows_desktop(
         )
     records = load_compatibility_records(COMPATIBILITY_DOCUMENT)
     source_hash = sha256_file(source.app_asar)
+    source_header_hash = asar_header_digest(source.app_asar).hash
+    source_identity = {
+        "package_name": source.package.name,
+        "package_version": source.package.version,
+        "architecture": source.package.architecture,
+        "app_file_version": source.file_version,
+        "app_asar_sha256": source_hash,
+        "app_asar_header_sha256": source_header_hash,
+    }
+    reviewed_record = (
+        reviewed_source
+        if reviewed_source is not None
+        else find_reviewed_source(source_identity)
+    )
+    reviewed_ok, reviewed_reason = reviewed_source_is_patchable(source_identity, reviewed_record)
     matching = find_matching_record(
         records,
         package_name=source.package.name,
@@ -1327,10 +1411,16 @@ def build_windows_desktop(
         app_file_version=source.file_version,
         app_asar_sha256=source_hash,
     )
-    if matching is None and not allow_untested_source:
+    if not reviewed_ok and not allow_untested_source:
+        compatibility_note = (
+            "no legacy compatibility record matched either"
+            if matching is None
+            else "a legacy compatibility record is insufficient without an exact reviewed-source record"
+        )
         raise RuntimeError(
-            "unknown Windows ChatGPT source: package/version/app.asar is not in "
-            f"{COMPATIBILITY_DOCUMENT}; pass --allow-untested-source only after reviewing the anchor audit"
+            "unknown Windows ChatGPT source: reviewed-source gate failed: "
+            f"{reviewed_reason}; {compatibility_note}; "
+            "pass --allow-untested-source only for a deliberate generic test build"
         )
     go_executable = go_executable_or_raise()
     asar = ensure_asar_tool()
@@ -1392,6 +1482,21 @@ def build_windows_desktop(
         ]
         if failed:
             raise RuntimeError("Windows renderer anchor audit failed; no loose replacement was attempted")
+        if reviewed_ok:
+            renderer_bundles = list((extracted / "webview" / "assets").glob("app-initial-*.js"))
+            if len(renderer_bundles) != 1:
+                raise RuntimeError("reviewed-source renderer variant could not be resolved uniquely")
+            selected_renderer_variant = select_renderer_variant(
+                renderer_bundles[0].read_text(encoding="utf-8"),
+                package_name=source.package.name,
+                package_version=source.package.version,
+                app_asar_sha256=source_hash,
+            )
+            if reviewed_record.get("renderer_variant") != selected_renderer_variant.variant_id:
+                raise RuntimeError(
+                    "reviewed-source renderer variant does not match the exact extracted renderer: "
+                    f"{reviewed_record.get('renderer_variant')} != {selected_renderer_variant.variant_id}"
+                )
         bootstrap_report = patch_bootstrap(
             extracted,
             PROJECT_ROOT,
@@ -1466,6 +1571,11 @@ def build_windows_desktop(
             mirror_report,
             payload_acl,
         )
+        metadata["reviewed_source"] = dict(reviewed_record) if reviewed_ok else None
+        metadata["reviewed_source_gate"] = {
+            "status": "PATCHABLE" if reviewed_ok else "GENERIC_TEST_ESCAPE_HATCH",
+            "reason": reviewed_reason,
+        }
         (staged / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
         # The launcher owns the environment contract; this static check keeps the
         # generated layout honest without starting the official UI in Round 1.

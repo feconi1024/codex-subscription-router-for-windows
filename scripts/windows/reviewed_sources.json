@@ -1,0 +1,30 @@
+[
+  {
+    "package_name": "OpenAI.Codex",
+    "package_version": "26.820.7780.0",
+    "architecture": "X64",
+    "app_file_version": "151.0.7922.170",
+    "app_asar_sha256": "5df8bf5a9d30742919390ab11fa419e83aab0891152569a42c6ea4abf15386c2",
+    "app_asar_header_sha256": "f00563ffa0028f929484acd0a5545fa866e33f0778f72f1c514d919f8abbc501",
+    "renderer_variant": "windows-26.820",
+    "authoritative_shell": "app\\ChatGPT.exe",
+    "bootstrap_strategy": "environment-only",
+    "integrity_state": "RESOURCE_ABSENT_NO_VALIDATION_METADATA",
+    "payload_acl_strategy": "UNRESOLVED",
+    "review_status": "PATCHABLE"
+  },
+  {
+    "package_name": "OpenAI.Codex",
+    "package_version": "26.825.5331.0",
+    "architecture": "X64",
+    "app_file_version": "151.0.7922.174",
+    "app_asar_sha256": "178b65229452b17b0203ab41d5ceafedccd770c9bd42d239a6d048d27d80252b",
+    "app_asar_header_sha256": "65349bb4cd49494d04898f0463f9d548fb77a86ba3c815231eebadad175427b6",
+    "renderer_variant": "windows-26.825",
+    "authoritative_shell": "app\\ChatGPT.exe",
+    "bootstrap_strategy": "environment-only",
+    "integrity_state": "FUSE_PRESENT_ASAR_VALIDATION_DISABLED",
+    "payload_acl_strategy": "UNRESOLVED",
+    "review_status": "PATCHABLE"
+  }
+]

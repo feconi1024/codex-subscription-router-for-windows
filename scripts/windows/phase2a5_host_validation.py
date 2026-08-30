@@ -10,14 +10,12 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 try:
-    from ..patch_app_windows import build_windows_desktop
+    from ..patch_app_windows import build_windows_desktop, probe_go_toolchain
     from .compatibility import PAYLOAD_ACL_NONE
     from .discovery import (
-        EXACT_26_820_PACKAGE_NAME,
-        EXACT_26_820_PACKAGE_VERSION,
         RealCodexCandidate,
         discover_desktop_source,
         discover_real_codex,
@@ -41,12 +39,16 @@ try:
         run_patched_shell_smoke,
         run_phase2a5_sandbox_validation,
     )
+    from .integrity import asar_header_digest
+    from .reviewed_sources import (
+        REVIEWED_SOURCES_DOCUMENT,
+        find_reviewed_source,
+        reviewed_source_is_patchable,
+    )
 except ImportError:
-    from patch_app_windows import build_windows_desktop
+    from patch_app_windows import build_windows_desktop, probe_go_toolchain
     from windows.compatibility import PAYLOAD_ACL_NONE
     from windows.discovery import (
-        EXACT_26_820_PACKAGE_NAME,
-        EXACT_26_820_PACKAGE_VERSION,
         RealCodexCandidate,
         discover_desktop_source,
         discover_real_codex,
@@ -70,10 +72,18 @@ except ImportError:
         run_patched_shell_smoke,
         run_phase2a5_sandbox_validation,
     )
+    from windows.integrity import asar_header_digest
+    from windows.reviewed_sources import (
+        REVIEWED_SOURCES_DOCUMENT,
+        find_reviewed_source,
+        reviewed_source_is_patchable,
+    )
 
 
-EXPECTED_APP_ASAR_SHA256 = "5df8bf5a9d30742919390ab11fa419e83aab0891152569a42c6ea4abf15386c2"
 DEFAULT_ARTIFACT = Path("docs") / "generated" / "WINDOWS-PHASE2A5-HOST-RESULT.json"
+PHASE2A5_SOURCE_REVIEW_REQUIRED = "PHASE 2A.5 SOURCE REVIEW REQUIRED"
+PHASE2A5_SOURCE_CHANGED_DURING_VALIDATION = "PHASE 2A.5 SOURCE CHANGED DURING VALIDATION"
+PHASE2A5_PATCHED_SHELL_TOOLCHAIN_BLOCKED = "PATCHED SHELL TOOLCHAIN BLOCKED"
 
 
 def _safe_error(error: BaseException | str) -> str:
@@ -101,6 +111,59 @@ def _command_version(command: str, arguments: tuple[str, ...]) -> str:
         return f"unavailable: {_safe_error(error)}"
     output = (result.stdout or "").strip().splitlines()
     return output[0].strip() if output else f"exit code {result.returncode}"
+
+
+def _go_toolchain_report() -> dict[str, object]:
+    """Expose the existing Go probes and verify the selected compiler once."""
+
+    probed = probe_go_toolchain()
+    selected = probed.get("selected")
+    probes = list(probed.get("probes", [])) if isinstance(probed.get("probes"), list) else []
+    usable = False
+    if isinstance(selected, str) and selected:
+        try:
+            version = subprocess.run(
+                [selected, "version"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+            )
+            usable = version.returncode == 0
+            probes.append(
+                {
+                    "probe": "selected go version",
+                    "status": "PASS" if usable else "FAIL",
+                    "candidate": selected,
+                    "error": None if usable else _safe_error(version.stderr or f"exit code {version.returncode}"),
+                }
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            probes.append(
+                {
+                    "probe": "selected go version",
+                    "status": "FAIL",
+                    "candidate": selected,
+                    "error": _safe_error(error),
+                }
+            )
+    else:
+        probes.append(
+            {
+                "probe": "selected go version",
+                "status": "FAIL",
+                "candidate": None,
+                "error": "no Go executable selected",
+            }
+        )
+    return {
+        "selected": selected if isinstance(selected, str) else None,
+        "usable": usable,
+        "probes": probes,
+    }
 
 
 def collect_startup_runtime(repo_root: Path) -> dict[str, object]:
@@ -142,6 +205,7 @@ def collect_startup_runtime(repo_root: Path) -> dict[str, object]:
             )
         except AttributeError:
             pass
+    go_toolchain = _go_toolchain_report()
     return {
         "current_process": {
             "pid": os.getpid(),
@@ -153,6 +217,7 @@ def collect_startup_runtime(repo_root: Path) -> dict[str, object]:
         "python": sys.version.splitlines()[0],
         "node": _command_version("node", ("--version",)),
         "go": _command_version("go", ("version",)),
+        "go_toolchain": go_toolchain,
     }
 
 
@@ -165,40 +230,74 @@ def _print_startup(runtime: dict[str, object], host_context: dict[str, object]) 
     print(f"Python: {runtime.get('python')}")
     print(f"Node: {runtime.get('node')}")
     print(f"Go: {runtime.get('go')}")
+    print(f"Go toolchain: {json.dumps(runtime.get('go_toolchain'), sort_keys=True)}")
 
 
 def _source_identity(source: Any) -> dict[str, object]:
+    asar_path = Path(source.app_asar)
+    executable_path = Path(source.executable)
+    try:
+        app_asar_header_sha256: str | None = asar_header_digest(asar_path).hash
+    except (OSError, RuntimeError, ValueError):
+        app_asar_header_sha256 = None
     return {
         "package_name": source.package.name,
+        "package": source.package.name,
         "package_full_name": source.package.package_full_name,
         "package_version": source.package.version,
         "architecture": source.package.architecture,
+        "package_publisher": source.package.publisher,
         "source_root": str(source.source_root),
         "app_dir": str(source.app_dir),
         "executable": str(source.executable),
         "file_version": source.file_version,
+        "app_file_version": source.file_version,
+        "chatgpt_exe_sha256": sha256_file(executable_path),
+        "executable_sha256": sha256_file(executable_path),
         "app_asar": str(source.app_asar),
-        "app_asar_sha256": sha256_file(source.app_asar),
+        "app_asar_sha256": sha256_file(asar_path),
+        "app_asar_header_sha256": app_asar_header_sha256,
         "source_kind": source.source_kind,
     }
 
 
-def _validate_reviewed_source(source: Any) -> dict[str, object]:
-    identity = _source_identity(source)
-    if (
-        identity["package_name"] != EXACT_26_820_PACKAGE_NAME
-        or identity["package_version"] != EXACT_26_820_PACKAGE_VERSION
-    ):
-        raise RuntimeError(
-            "Phase 2A.5 requires the reviewed OpenAI.Codex 26.820.7780.0 source"
-        )
-    if identity["app_asar_sha256"] != EXPECTED_APP_ASAR_SHA256:
-        raise RuntimeError(
-            "Phase 2A.5 source app.asar hash does not match the reviewed 26.820 source"
-        )
-    if str(identity["executable"]).replace("/", "\\").casefold().split("\\")[-2:] != ["app", "chatgpt.exe"]:
-        raise RuntimeError("Phase 2A.5 requires app\\ChatGPT.exe as the authoritative shell")
-    return identity
+def _source_stability(source: Any, initial_identity: Mapping[str, object]) -> dict[str, object]:
+    """Re-read source identity and reject replacement/disappearance during validation."""
+
+    try:
+        final_identity = _source_identity(source)
+    except (OSError, RuntimeError, ValueError) as error:
+        return {
+            "stable": False,
+            "changed_fields": ["source_disappeared_or_unreadable"],
+            "initial": dict(initial_identity),
+            "final": None,
+            "error": _safe_error(error),
+        }
+    fields = (
+        "source_root",
+        "package_name",
+        "package_version",
+        "architecture",
+        "app_file_version",
+        "executable",
+        "chatgpt_exe_sha256",
+        "app_asar",
+        "app_asar_sha256",
+        "app_asar_header_sha256",
+    )
+    changed_fields = [
+        field
+        for field in fields
+        if initial_identity.get(field) != final_identity.get(field)
+    ]
+    return {
+        "stable": not changed_fields,
+        "changed_fields": changed_fields,
+        "initial": dict(initial_identity),
+        "final": final_identity,
+        "error": None,
+    }
 
 
 def _public_probe(result: object) -> object:
@@ -230,6 +329,7 @@ def _public_probe(result: object) -> object:
         "development_only",
         "build_metadata_summary",
         "smoke_root_cleanup",
+        "go_toolchain",
     )
     output = {key: result[key] for key in allowed if key in result}
     profile = result.get("profile_isolation")
@@ -321,8 +421,19 @@ def _run_external_patched_shell(
     *,
     acl_strategy: str,
     timeout_seconds: float,
+    reviewed_source: Mapping[str, object] | None = None,
+    go_toolchain: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Build and smoke one disposable Router shell, finalizing cleanup afterward."""
+
+    if go_toolchain is not None and go_toolchain.get("usable") is not True:
+        return {
+            "status": PHASE2A5_PATCHED_SHELL_TOOLCHAIN_BLOCKED,
+            "reason": "Go toolchain is unavailable after all configured probes",
+            "go_toolchain": dict(go_toolchain),
+            "smoke_root_cleanup": {"not_started": True},
+            "manual_operation_required": False,
+        }
 
     cleanup: dict[str, object] = {}
     result: dict[str, object]
@@ -345,7 +456,8 @@ def _run_external_patched_shell(
                     selected_real,
                     destination,
                     force=False,
-                    allow_untested_source=True,
+                    allow_untested_source=False,
+                    reviewed_source=reviewed_source,
                     payload_acl_strategy=acl_strategy,
                 )
                 result = run_patched_shell_smoke(
@@ -388,7 +500,10 @@ def _artifact_result(result: dict[str, object]) -> dict[str, object]:
         "host_context",
         "physical_localappdata",
         "source_identity",
+        "source_review",
+        "source_stability",
         "source_diagnostics",
+        "go_toolchain",
         "real_codex",
         "sandbox_validation",
         "acl_strategy_verdict",
@@ -441,7 +556,10 @@ def run_phase2a5_host_validation(
         "host_context": host_context,
         "physical_localappdata": None,
         "source_identity": None,
+        "source_review": None,
+        "source_stability": None,
         "source_diagnostics": None,
+        "go_toolchain": runtime.get("go_toolchain"),
         "real_codex": None,
         "sandbox_validation": None,
         "acl_strategy_verdict": "UNRESOLVED",
@@ -454,6 +572,9 @@ def run_phase2a5_host_validation(
         "phase2b_ready": False,
         "manual_operation_required": False,
     }
+    source_for_stability: Any | None = None
+    initial_source_identity: dict[str, object] | None = None
+    reviewed_source: dict[str, object] | None = None
 
     if host_context.get("has_package_identity") is not False:
         result.update(
@@ -508,93 +629,126 @@ def run_phase2a5_host_validation(
             )
         else:
             result["source_diagnostics"] = diagnostics.to_dict()
-            result["source_identity"] = _validate_reviewed_source(source)
-            selected_real, real_candidates = discover_real_codex(real_override)
-            # Keep the selected candidate object intact.  Candidate ordering is
-            # evidence, not a substitute for the selected result.
-            result["real_codex"] = {
-                "selected": {
-                    "path": str(selected_real.path),
-                    "version": selected_real.version,
-                    "sha256": selected_real.sha256,
-                    "authenticode": {
-                        "status": selected_real.authenticode.status,
-                        "signer": selected_real.authenticode.signer,
-                    },
-                },
-                "candidates": [str(candidate.path) for candidate in real_candidates],
+            identity = _source_identity(source)
+            source_for_stability = source
+            initial_source_identity = identity
+            result["source_identity"] = identity
+            reviewed_source = find_reviewed_source(identity)
+            reviewed_ok, reviewed_reason = reviewed_source_is_patchable(identity, reviewed_source)
+            shell_path = str(source.executable).replace("/", "\\").casefold()
+            if not shell_path.endswith("\\app\\chatgpt.exe"):
+                reviewed_ok = False
+                reviewed_reason = "discovered source does not end in app\\ChatGPT.exe"
+            result["source_review"] = {
+                "registry": str(REVIEWED_SOURCES_DOCUMENT),
+                "status": "PATCHABLE" if reviewed_ok else "SOURCE REVIEW REQUIRED",
+                "reason": reviewed_reason,
+                "record": reviewed_source,
             }
-            desktop_candidates = inventory_desktop_executables(source)
-            sandbox = run_phase2a5_sandbox_validation(
-                source,
-                selected_real,
-                desktop_candidates,
-                timeout_seconds=timeout_seconds,
-            )
-            result["sandbox_validation"] = sandbox
-            result["acl_strategy_verdict"] = sandbox.get("production_acl_strategy", "UNRESOLVED")
-            if (
-                sandbox.get("status") == PHASE2A5_DIRECT_HOST_PASS
-                and sandbox.get("native_evidence_usable") is True
-                and sandbox.get("production_acl_strategy") == PAYLOAD_ACL_NONE
-            ):
-                patched = _run_external_patched_shell(
+            if not reviewed_ok:
+                result.update(
+                    {
+                        "status": PHASE2A5_SOURCE_REVIEW_REQUIRED,
+                        "reason": f"{PHASE2A5_SOURCE_REVIEW_REQUIRED}: {reviewed_reason}",
+                        "manual_operation_required": False,
+                    }
+                )
+            else:
+                selected_real, real_candidates = discover_real_codex(real_override)
+                # Keep the selected candidate object intact.  Candidate ordering is
+                # evidence, not a substitute for the selected result.
+                result["real_codex"] = {
+                    "selected": {
+                        "path": str(selected_real.path),
+                        "version": selected_real.version,
+                        "sha256": selected_real.sha256,
+                        "authenticode": {
+                            "status": selected_real.authenticode.status,
+                            "signer": selected_real.authenticode.signer,
+                        },
+                    },
+                    "candidates": [str(candidate.path) for candidate in real_candidates],
+                }
+                desktop_candidates = inventory_desktop_executables(source)
+                sandbox = run_phase2a5_sandbox_validation(
                     source,
                     selected_real,
-                    acl_strategy=PAYLOAD_ACL_NONE,
+                    desktop_candidates,
                     timeout_seconds=timeout_seconds,
                 )
-                result["patched_shell"] = patched
-                result["mux_chain"] = {
-                    "launcher": "Codex Subscription Router.exe",
-                    "desktop": "app\\ChatGPT.exe",
-                    "code_cli_path": "runtime\\codex-mux.exe",
-                    "mux": "runtime\\codex-mux.exe",
-                    "real_codex": "runtime\\codex.real.exe",
-                    "observed_mux": patched.get("mux_process_observed"),
-                    "observed_real_codex": patched.get("real_codex_process_observed"),
-                }
+                result["sandbox_validation"] = sandbox
+                result["acl_strategy_verdict"] = sandbox.get("production_acl_strategy", "UNRESOLVED")
                 if (
-                    patched.get("status") == PATCHED_SHELL_PASS
-                    and isinstance(patched.get("smoke_root_cleanup"), dict)
-                    and patched["smoke_root_cleanup"].get("removed") is True
-                    and sandbox.get("official_package_unchanged") is True
+                    sandbox.get("status") == PHASE2A5_DIRECT_HOST_PASS
+                    and sandbox.get("native_evidence_usable") is True
+                    and sandbox.get("production_acl_strategy") == PAYLOAD_ACL_NONE
                 ):
-                    if ci_verified:
-                        result["status"] = PHASE2A5_FULL_PASS
-                        result["reason"] = (
-                            "external normal-sandbox, patched-shell, cleanup, official-source, "
-                            "and reviewed CI gates passed"
-                        )
-                        result["ci"] = {
-                            "status": "VERIFIED_BY_OPERATOR",
-                            "required_jobs": ["checks", "windows-go-core"],
-                        }
-                        result["phase2b_ready"] = True
+                    patched = _run_external_patched_shell(
+                        source,
+                        selected_real,
+                        acl_strategy=PAYLOAD_ACL_NONE,
+                        timeout_seconds=timeout_seconds,
+                        reviewed_source=reviewed_source,
+                        go_toolchain=(
+                            runtime.get("go_toolchain")
+                            if isinstance(runtime.get("go_toolchain"), Mapping)
+                            else None
+                        ),
+                    )
+                    result["patched_shell"] = patched
+                    result["mux_chain"] = {
+                        "launcher": "Codex Subscription Router.exe",
+                        "desktop": "app\\ChatGPT.exe",
+                        "code_cli_path": "runtime\\codex-mux.exe",
+                        "mux": "runtime\\codex-mux.exe",
+                        "real_codex": "runtime\\codex.real.exe",
+                        "observed_mux": patched.get("mux_process_observed"),
+                        "observed_real_codex": patched.get("real_codex_process_observed"),
+                    }
+                    if (
+                        patched.get("status") == PATCHED_SHELL_PASS
+                        and isinstance(patched.get("smoke_root_cleanup"), dict)
+                        and patched["smoke_root_cleanup"].get("removed") is True
+                        and sandbox.get("official_package_unchanged") is True
+                    ):
+                        if ci_verified:
+                            result["status"] = PHASE2A5_FULL_PASS
+                            result["reason"] = (
+                                "external normal-sandbox, patched-shell, cleanup, official-source, "
+                                "and reviewed CI gates passed"
+                            )
+                            result["ci"] = {
+                                "status": "VERIFIED_BY_OPERATOR",
+                                "required_jobs": ["checks", "windows-go-core"],
+                            }
+                            result["phase2b_ready"] = True
+                        else:
+                            # CI is checked separately on the commit recorded in
+                            # the artifact.  Do not claim the aggregate PASS before
+                            # that review is complete.
+                            result["status"] = PHASE2A5_DIRECT_HOST_PASS
+                            result["reason"] = (
+                                "external normal-sandbox and patched-shell probes passed; "
+                                "GitHub checks remain to be confirmed before aggregate PASS"
+                            )
+                            result["phase2b_ready"] = False
+                    elif patched.get("status") == PHASE2A5_PATCHED_SHELL_TOOLCHAIN_BLOCKED:
+                        result["status"] = PHASE2A5_PATCHED_SHELL_TOOLCHAIN_BLOCKED
+                        result["reason"] = patched.get("reason")
                     else:
-                        # CI is checked separately on the commit recorded in
-                        # the artifact.  Do not claim the aggregate PASS before
-                        # that review is complete.
-                        result["status"] = PHASE2A5_DIRECT_HOST_PASS
-                        result["reason"] = (
-                            "external normal-sandbox and patched-shell probes passed; "
-                            "GitHub checks remain to be confirmed before aggregate PASS"
-                        )
-                        result["phase2b_ready"] = False
+                        result["status"] = PHASE2A5_PATCHED_SHELL_BLOCKED
+                        result["reason"] = "the external normal-sandbox probe passed but the patched shell was blocked"
                 else:
-                    result["status"] = PHASE2A5_PATCHED_SHELL_BLOCKED
-                    result["reason"] = "the external normal-sandbox probe passed but the patched shell was blocked"
-            else:
-                result["status"] = sandbox.get("status", PHASE2A5_FAIL)
-                result["reason"] = sandbox.get("reason")
-            result["manual_operation_required"] = bool(
-                result.get("manual_operation_required")
-                or sandbox.get("manual_operation_required")
-                or (
-                    isinstance(result.get("patched_shell"), dict)
-                    and result["patched_shell"].get("manual_operation_required")
+                    result["status"] = sandbox.get("status", PHASE2A5_FAIL)
+                    result["reason"] = sandbox.get("reason")
+                result["manual_operation_required"] = bool(
+                    result.get("manual_operation_required")
+                    or sandbox.get("manual_operation_required")
+                    or (
+                        isinstance(result.get("patched_shell"), dict)
+                        and result["patched_shell"].get("manual_operation_required")
+                    )
                 )
-            )
     except (PackagingBlockedError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         result.update(
             {
@@ -603,6 +757,29 @@ def run_phase2a5_host_validation(
                 "manual_operation_required": False,
             }
         )
+
+    if source_for_stability is not None and initial_source_identity is not None:
+        source_review = result.get("source_review")
+        if isinstance(source_review, dict) and source_review.get("status") == "PATCHABLE":
+            stability = _source_stability(source_for_stability, initial_source_identity)
+            result["source_stability"] = stability
+            if stability.get("stable") is not True:
+                result.update(
+                    {
+                        "status": PHASE2A5_SOURCE_CHANGED_DURING_VALIDATION,
+                        "reason": (
+                            f"{PHASE2A5_SOURCE_CHANGED_DURING_VALIDATION}: "
+                            f"{stability.get('changed_fields') or stability.get('error')}"
+                        ),
+                        "real_codex": None,
+                        "sandbox_validation": None,
+                        "acl_strategy_verdict": "UNRESOLVED",
+                        "patched_shell": None,
+                        "mux_chain": None,
+                        "phase2b_ready": False,
+                        "manual_operation_required": False,
+                    }
+                )
 
     if artifact_path is not None:
         write_artifact(artifact_path, result)
@@ -653,6 +830,7 @@ def main() -> int:
         PHASE2A5_DIRECT_HOST_PASS,
         PHASE2A5_ACL_FIX_CONFIRMED,
         PHASE2A5_GPU_SANDBOX_REGRESSION,
+        PHASE2A5_SOURCE_REVIEW_REQUIRED,
     }:
         return 0
     return 1
