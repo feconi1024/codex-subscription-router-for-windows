@@ -90,12 +90,17 @@ from scripts.windows.smoke import (
     PATCHED_SHELL_BLOCKED,
     PHASE2A4_LOCAL_ACL_FIX_CONFIRMED,
     PASS,
+    ROUTER_MENU_ACCOUNTS_LOAD_FAILED,
+    ROUTER_MENU_NOT_INJECTED,
+    ROUTER_MENU_NOT_MOUNTED,
+    build_production_gate,
     _probe_candidate,
     classify_probe_output,
     final_layout_smoke_root,
     _phase2a4_display_verdict,
     _phase2a4_verdict,
     native_evidence_is_usable,
+    router_account_menu_gate,
     run_patched_shell_smoke,
 )
 from scripts.windows.host_context import (
@@ -108,6 +113,7 @@ from scripts.windows.phase2a5_host_validation import (
     PHASE2A5_SOURCE_CHANGED_DURING_VALIDATION,
     PHASE2A5_SOURCE_REVIEW_REQUIRED,
     _go_toolchain_report,
+    _public_probe,
     _run_external_patched_shell,
     _source_identity,
     _source_stability,
@@ -556,6 +562,170 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], PASS)
         self.assertTrue(result["chromium_sandbox"]["cleanup_artifact_only"])
+
+    def test_router_account_menu_gate_uses_router_marker_not_upstream_button(self) -> None:
+        router_ui = {
+            "debug": {
+                "router": {
+                    "accountMenuInjected": True,
+                    "accountMenuMounted": True,
+                    "accountsLoaded": True,
+                    "accountCount": 1,
+                    "requestFailed": False,
+                },
+                "buttons": [],
+            }
+        }
+        result = router_account_menu_gate(router_ui)
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["status"], PASS)
+
+        upstream_only = {
+            "debug": {
+                "router": {
+                    "accountMenuInjected": False,
+                    "accountMenuMounted": False,
+                    "accountsLoaded": False,
+                    "accountCount": 0,
+                    "requestFailed": False,
+                },
+                "buttons": [
+                    {
+                        "ariaLabel": "Open profile menu",
+                        "type": "button",
+                        "rect": {"x": 1, "y": 2, "width": 20, "height": 20},
+                    }
+                ],
+            }
+        }
+        result = router_account_menu_gate(upstream_only)
+        self.assertFalse(result["pass"])
+        self.assertEqual(result["status"], ROUTER_MENU_NOT_INJECTED)
+
+    def test_router_account_menu_gate_reports_specific_runtime_failures(self) -> None:
+        base = {
+            "debug": {
+                "router": {
+                    "accountMenuInjected": False,
+                    "accountMenuMounted": False,
+                    "accountsLoaded": False,
+                    "accountCount": 0,
+                    "requestFailed": False,
+                }
+            }
+        }
+        self.assertEqual(router_account_menu_gate(base)["status"], ROUTER_MENU_NOT_INJECTED)
+
+        base["debug"]["router"].update({"accountMenuInjected": True})
+        self.assertEqual(router_account_menu_gate(base)["status"], ROUTER_MENU_NOT_MOUNTED)
+
+        base["debug"]["router"].update(
+            {"accountMenuMounted": True, "accountsLoaded": False, "requestFailed": True}
+        )
+        result = router_account_menu_gate(base)
+        self.assertFalse(result["pass"])
+        self.assertEqual(result["status"], ROUTER_MENU_ACCOUNTS_LOAD_FAILED)
+
+    def test_production_gate_reports_failed_predicates(self) -> None:
+        gate = build_production_gate(
+            launcher_running=True,
+            chatgpt_classification=True,
+            mux_health=True,
+            ui_bridge=True,
+            router_account_menu=False,
+            mux_process=True,
+            real_codex_process=True,
+            production_sandbox=True,
+            cleanup=True,
+        )
+        self.assertFalse(gate["pass"])
+        self.assertEqual(gate["failed"], ["router_account_menu"])
+        self.assertFalse(gate["checks"]["router_account_menu"])
+
+    def test_public_probe_exposes_safe_gate_evidence_without_identity_or_tokens(self) -> None:
+        raw = {
+            "status": PATCHED_SHELL_BLOCKED,
+            "reason": "router account-menu runtime gate failed",
+            "chatgpt_classification": {
+                "status": PASS,
+                "reason": "safe classification",
+                "relevant_log_lines": {"secret": "token-secret"},
+                "log_tail": "user@example.com",
+            },
+            "router_account_menu": {
+                "injected": False,
+                "mounted": False,
+                "accounts_loaded": False,
+                "account_count": 0,
+                "request_failed": False,
+                "status": ROUTER_MENU_NOT_INJECTED,
+                "pass": False,
+            },
+            "production_gate": {
+                "pass": False,
+                "failed": ["router_account_menu"],
+                "checks": {
+                    "launcher_running": True,
+                    "chatgpt_classification": True,
+                    "mux_health": True,
+                    "ui_bridge": True,
+                    "router_account_menu": False,
+                    "mux_process": True,
+                    "real_codex_process": True,
+                    "production_sandbox": True,
+                    "cleanup": True,
+                },
+            },
+            "native_profile_trigger_observed": "UNKNOWN / NOT OBSERVED",
+            "ui_bridge": {
+                "pass": True,
+                "status_code": 200,
+                "debug": {
+                    "buttons": [
+                        {
+                            "ariaLabel": "Open profile menu",
+                            "type": "button",
+                            "disabled": False,
+                            "rect": {"x": 1, "y": 2, "width": 20, "height": 20},
+                            "text": "user@example.com",
+                        }
+                    ],
+                    "bodyText": "user@example.com",
+                    "rootHtml": "control-token-secret",
+                },
+            },
+        }
+        public = _public_probe(raw)
+        encoded = json.dumps(public, sort_keys=True)
+        self.assertIn("router_account_menu", public)
+        self.assertIn("production_gate", public)
+        self.assertIn("chatgpt_classification", public)
+        self.assertIn("native_button_diagnostics", public["ui_bridge"])
+        self.assertNotIn("user@example.com", encoded)
+        self.assertNotIn("control-token-secret", encoded)
+        self.assertNotIn("token-secret", encoded)
+        self.assertEqual(
+            public["ui_bridge"]["native_button_diagnostics"][0]["ariaLabel"],
+            "Open profile menu",
+        )
+
+    def test_router_runtime_markers_are_exposed_by_bridge_and_account_menu(self) -> None:
+        account_menu = (Path(__file__).resolve().parents[2] / "ui" / "account-menu.js").read_text(
+            encoding="utf-8"
+        )
+        bridge = (Path(__file__).resolve().parents[2] / "ui" / "ui-test-bridge.cjs").read_text(
+            encoding="utf-8"
+        )
+        for marker in (
+            "__codexMuxAccountMenuMounted",
+            "accountsLoaded",
+            "accountCount",
+            "requestFailed",
+        ):
+            self.assertIn(marker, account_menu)
+            self.assertIn(marker, bridge)
+        self.assertIn("__codexMuxAccountMenuInjected", bridge)
+        self.assertNotIn("text:element.textContent.trim().slice(0,80)", bridge)
 
     def test_phase2a4_final_layout_root_uses_localappdata_and_is_disposable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1507,6 +1677,7 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                 encoding="utf-8"
             )
             self.assertIn("function CodexMuxAccountMenu(", bundle)
+            self.assertIn("__codexMuxAccountMenuInjected=true", bundle)
             self.assertIn("function qg(e,t){let n=e.get(Jg)", bundle)
             self.assertIn('codexMuxScopePluginRequest("list-apps"', bundle)
             self.assertIn('codexMuxScopePluginRequest("list-installed-apps"', bundle)
@@ -1804,6 +1975,7 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             patch_renderer(extracted, "a" * 64)
             patched = (assets / "app-initial-fixture.js").read_text(encoding="utf-8")
             self.assertIn("function CodexMuxAccountMenu(", patched)
+            self.assertIn("__codexMuxAccountMenuInjected=true", patched)
             self.assertIn("All connected subscriptions are depleted", patched)
             self.assertIn("http://127.0.0.1:48123", (webview / "index.html").read_text(encoding="utf-8"))
             self.assertIn("a" * 64, patched)
@@ -1869,6 +2041,7 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             patch_renderer(extracted, "b" * 64)
             patched = (assets / "app-initial-6662.js").read_text(encoding="utf-8")
             self.assertIn("function CodexMuxAccountMenu(", patched)
+            self.assertIn("__codexMuxAccountMenuInjected=true", patched)
             self.assertIn("b" * 64, patched)
 
 

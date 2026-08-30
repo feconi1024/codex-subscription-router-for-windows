@@ -723,6 +723,96 @@ def native_evidence_is_usable(cleanup_status: dict[str, object]) -> bool:
     )
 
 
+ROUTER_MENU_NOT_INJECTED = "ROUTER_MENU_NOT_INJECTED"
+ROUTER_MENU_NOT_MOUNTED = "ROUTER_MENU_NOT_MOUNTED"
+ROUTER_MENU_ACCOUNTS_LOADING = "ROUTER_MENU_ACCOUNTS_LOADING"
+ROUTER_MENU_ACCOUNTS_LOAD_FAILED = "ROUTER_MENU_ACCOUNTS_LOAD_FAILED"
+
+
+def _router_account_menu_evidence(ui_body: object) -> dict[str, object]:
+    debug = ui_body.get("debug") if isinstance(ui_body, dict) else None
+    router = debug.get("router") if isinstance(debug, dict) else None
+    router = router if isinstance(router, dict) else {}
+    account_count = router.get("accountCount")
+    if type(account_count) is not int or account_count < 0:
+        account_count = 0
+    return {
+        "injected": router.get("accountMenuInjected") is True,
+        "mounted": router.get("accountMenuMounted") is True,
+        "accounts_loaded": router.get("accountsLoaded") is True,
+        "account_count": account_count,
+        "request_failed": router.get("requestFailed") is True,
+    }
+
+
+def router_account_menu_gate(
+    ui_body: object,
+    *,
+    mounting_expected: bool = True,
+) -> dict[str, object]:
+    """Evaluate only Router-owned account-menu runtime evidence.
+
+    The native profile trigger is deliberately excluded. It is an upstream
+    implementation detail and is not a stable indication that the Router
+    component was injected, mounted, or able to load account state.
+    """
+    evidence = _router_account_menu_evidence(ui_body)
+    if not evidence["injected"]:
+        status = ROUTER_MENU_NOT_INJECTED
+    elif mounting_expected and not evidence["mounted"]:
+        status = ROUTER_MENU_NOT_MOUNTED
+    elif evidence["request_failed"]:
+        status = ROUTER_MENU_ACCOUNTS_LOAD_FAILED
+    elif mounting_expected and not evidence["accounts_loaded"]:
+        status = ROUTER_MENU_ACCOUNTS_LOADING
+    else:
+        status = PASS
+    return {**evidence, "status": status, "pass": status == PASS}
+
+
+def _native_profile_trigger_diagnostic(ui_body: object) -> str:
+    """Report the upstream profile trigger without using it as a gate."""
+    debug = ui_body.get("debug") if isinstance(ui_body, dict) else None
+    buttons = debug.get("buttons") if isinstance(debug, dict) else None
+    if isinstance(buttons, list) and any(
+        isinstance(button, dict)
+        and button.get("ariaLabel") == "Open profile menu"
+        for button in buttons
+    ):
+        return "OBSERVED"
+    return "UNKNOWN / NOT OBSERVED"
+
+
+def build_production_gate(
+    *,
+    launcher_running: bool,
+    chatgpt_classification: bool,
+    mux_health: bool,
+    ui_bridge: bool,
+    router_account_menu: bool,
+    mux_process: bool,
+    real_codex_process: bool,
+    production_sandbox: bool,
+    cleanup: bool,
+) -> dict[str, object]:
+    checks = {
+        "launcher_running": bool(launcher_running),
+        "chatgpt_classification": bool(chatgpt_classification),
+        "mux_health": bool(mux_health),
+        "ui_bridge": bool(ui_bridge),
+        "router_account_menu": bool(router_account_menu),
+        "mux_process": bool(mux_process),
+        "real_codex_process": bool(real_codex_process),
+        "production_sandbox": bool(production_sandbox),
+        "cleanup": bool(cleanup),
+    }
+    return {
+        "pass": all(checks.values()),
+        "failed": [key for key, value in checks.items() if not value],
+        "checks": checks,
+    }
+
+
 def run_patched_shell_smoke(
     installation_root: Path,
     real: RealCodexCandidate,
@@ -875,7 +965,7 @@ def run_patched_shell_smoke(
         ui_body: object | None = None
         ui_error: str | None = None
         launcher_observed_running = False
-        account_menu_observed = False
+        router_account_menu = router_account_menu_gate({})
         mux_process_observed = False
         real_codex_process_observed = False
         deadline = time.monotonic() + timeout_seconds
@@ -905,19 +995,12 @@ def run_patched_shell_smoke(
                 health_status, health_body, health_error = _http_json_get(
                     "http://127.0.0.1:48123/v1/health"
                 )
-            if ui_status != 200:
+            if ui_status != 200 or not router_account_menu["pass"]:
                 ui_status, ui_body, ui_error = _http_json_get(
                     "http://127.0.0.1:48124/v1/test/app-state?debug=1",
                     headers={"x-codex-mux-token": token},
                 )
-            debug = ui_body.get("debug") if isinstance(ui_body, dict) else None
-            buttons = debug.get("buttons") if isinstance(debug, dict) else None
-            account_menu_rendered = isinstance(buttons, list) and any(
-                isinstance(button, dict)
-                and button.get("ariaLabel") == "Open profile menu"
-                for button in buttons
-            )
-            account_menu_observed = account_menu_observed or account_menu_rendered
+            router_account_menu = router_account_menu_gate(ui_body)
             mux_observed = any(
                 _process_path_matches(row, mux)
                 for row in snapshot
@@ -933,7 +1016,7 @@ def run_patched_shell_smoke(
             if (
                 health_status == 200
                 and ui_status == 200
-                and account_menu_observed
+                and router_account_menu["pass"]
                 and mux_process_observed
                 and real_codex_process_observed
             ):
@@ -985,13 +1068,8 @@ def run_patched_shell_smoke(
         else {"status": CRASHED, "reason": f"could not launch patched shell: {launch_error}", "relevant_log_lines": {}}
     )
     debug = ui_body.get("debug") if isinstance(ui_body, dict) else None
-    buttons = debug.get("buttons") if isinstance(debug, dict) else None
-    account_menu_rendered = isinstance(buttons, list) and any(
-        isinstance(button, dict)
-        and button.get("ariaLabel") == "Open profile menu"
-        for button in buttons
-    )
-    account_menu_observed = account_menu_observed or account_menu_rendered
+    router_account_menu = router_account_menu_gate(ui_body)
+    native_profile_trigger_observed = _native_profile_trigger_diagnostic(ui_body)
     mux_observed = any(
         _process_path_matches(row, mux)
         for row in final_snapshot
@@ -1021,18 +1099,24 @@ def run_patched_shell_smoke(
         or argument.casefold().startswith("--disable-gpu-sandbox=")
         for argument in command
     )
-    required_pass = (
-        launch_error is None
-        and launcher_observed_running
-        and classification.get("status") == PASS
-        and health_pass
-        and ui_bridge_pass
-        and account_menu_observed
-        and mux_process_observed
-        and real_codex_process_observed
-        and (not production_flags_present or development_only)
-        and not cleanup.get("errors")
+    production_gate = build_production_gate(
+        launcher_running=launch_error is None and launcher_observed_running,
+        chatgpt_classification=classification.get("status") == PASS,
+        mux_health=health_pass,
+        ui_bridge=ui_bridge_pass,
+        router_account_menu=router_account_menu["pass"],
+        mux_process=mux_process_observed,
+        real_codex_process=real_codex_process_observed,
+        production_sandbox=not production_flags_present,
+        cleanup=not cleanup.get("errors"),
     )
+    required_pass = bool(production_gate["pass"])
+    if development_only and not required_pass:
+        required_pass = all(
+            value
+            for key, value in production_gate["checks"].items()
+            if key != "production_sandbox"
+        )
     status = (
         DEVELOPMENT_ONLY_SANDBOX_BYPASS
         if required_pass and development_only
@@ -1058,6 +1142,9 @@ def run_patched_shell_smoke(
         "launcher_observed_running": launcher_observed_running,
         "launcher_return_code": return_code,
         "chatgpt_classification": classification,
+        "native_profile_trigger_observed": native_profile_trigger_observed,
+        "router_account_menu": router_account_menu,
+        "production_gate": production_gate,
         "health": {
             "pass": health_pass,
             "status_code": health_status,
@@ -1067,7 +1154,6 @@ def run_patched_shell_smoke(
         "ui_bridge": {
             "pass": ui_bridge_pass,
             "status_code": ui_status,
-            "account_menu_rendered": account_menu_observed,
             "error": ui_error,
             "debug": debug,
         },

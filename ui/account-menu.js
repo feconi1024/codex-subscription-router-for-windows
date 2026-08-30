@@ -44,6 +44,26 @@ function codexMuxScopePluginRequest(method, params) {
   return { ...(params || {}), codexMuxAccountId: accountId };
 }
 
+function codexMuxSetAccountMenuState({
+  mounted,
+  accountsLoaded,
+  accountCount,
+  requestFailed,
+}) {
+  const safeAccountCount =
+    typeof accountCount === "number" &&
+    Number.isSafeInteger(accountCount) &&
+    accountCount >= 0
+      ? accountCount
+      : 0;
+  globalThis.__codexMuxAccountMenuState = {
+    mounted: mounted === true,
+    accountsLoaded: accountsLoaded === true,
+    accountCount: safeAccountCount,
+    requestFailed: requestFailed === true,
+  };
+}
+
 async function codexMuxProfileData(accountId = null) {
   const query = accountId
     ? `?accountId=${encodeURIComponent(accountId)}`
@@ -236,19 +256,53 @@ function CodexMuxAccountMenu() {
   const [codeCopied, setCodeCopied] = kXc.useState(false);
   const loginAccountId = login?.accountId || null;
 
+  kXc.useEffect(() => {
+    globalThis.__codexMuxAccountMenuMounted = true;
+    codexMuxSetAccountMenuState({
+      mounted: true,
+      accountsLoaded: false,
+      accountCount: 0,
+      requestFailed: false,
+    });
+    return () => {
+      globalThis.__codexMuxAccountMenuMounted = false;
+      codexMuxSetAccountMenuState({
+        mounted: false,
+        accountsLoaded: false,
+        accountCount: 0,
+        requestFailed: false,
+      });
+    };
+  }, []);
+
   const refresh = kXc.useCallback(async () => {
     try {
       const result = await codexMuxRequest("/accounts");
-      const nextAccounts = result.accounts || [];
-      globalThis.__codexMuxConnectedAccounts = nextAccounts.filter(
+      const nextAccounts = Array.isArray(result.accounts) ? result.accounts : [];
+      const connectedAccounts = nextAccounts.filter(
         (account) => account.connected && account.enabled,
       );
+      if (globalThis.__codexMuxAccountMenuMounted !== true) return;
+      globalThis.__codexMuxConnectedAccounts = connectedAccounts;
       setAccounts(nextAccounts);
       setError("");
+      codexMuxSetAccountMenuState({
+        mounted: true,
+        accountsLoaded: true,
+        accountCount: nextAccounts.length,
+        requestFailed: false,
+      });
       if (nextAccounts.some((account) => account.connected)) setLoading(false);
     } catch (requestError) {
+      if (globalThis.__codexMuxAccountMenuMounted !== true) return;
       setError(requestError.message);
       setLoading(false);
+      codexMuxSetAccountMenuState({
+        mounted: true,
+        accountsLoaded: false,
+        accountCount: 0,
+        requestFailed: true,
+      });
     }
   }, []);
 

@@ -300,6 +300,35 @@ def _source_stability(source: Any, initial_identity: Mapping[str, object]) -> di
     }
 
 
+def _public_button_diagnostics(buttons: object) -> list[dict[str, object]]:
+    if not isinstance(buttons, list):
+        return []
+    output: list[dict[str, object]] = []
+    for button in buttons:
+        if not isinstance(button, dict):
+            continue
+        item: dict[str, object] = {}
+        for key in ("ariaLabel", "type"):
+            value = button.get(key)
+            if isinstance(value, str):
+                item[key] = value[:200]
+        disabled = button.get("disabled")
+        if isinstance(disabled, bool):
+            item["disabled"] = disabled
+        rect = button.get("rect")
+        if isinstance(rect, dict):
+            safe_rect: dict[str, object] = {}
+            for key in ("x", "y", "width", "height"):
+                value = rect.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    safe_rect[key] = value
+            if safe_rect:
+                item["rect"] = safe_rect
+        if item:
+            output.append(item)
+    return output
+
+
 def _public_probe(result: object) -> object:
     if not isinstance(result, dict):
         return result
@@ -363,13 +392,86 @@ def _public_probe(result: object) -> object:
             for key in ("pass", "status_code")
             if key in health
         }
+    classification = result.get("chatgpt_classification")
+    if isinstance(classification, dict):
+        output["chatgpt_classification"] = {
+            key: classification.get(key)
+            for key in ("status", "reason")
+            if isinstance(classification.get(key), str)
+        }
+    router_account_menu = result.get("router_account_menu")
+    if isinstance(router_account_menu, dict):
+        safe_router_menu: dict[str, object] = {}
+        for key in ("injected", "mounted", "accounts_loaded", "request_failed", "pass"):
+            value = router_account_menu.get(key)
+            if isinstance(value, bool):
+                safe_router_menu[key] = value
+        account_count = router_account_menu.get("account_count")
+        if type(account_count) is int and account_count >= 0:
+            safe_router_menu["account_count"] = account_count
+        status = router_account_menu.get("status")
+        if isinstance(status, str) and status in {
+            "PASS",
+            "ROUTER_MENU_NOT_INJECTED",
+            "ROUTER_MENU_NOT_MOUNTED",
+            "ROUTER_MENU_ACCOUNTS_LOADING",
+            "ROUTER_MENU_ACCOUNTS_LOAD_FAILED",
+        }:
+            safe_router_menu["status"] = status
+        output["router_account_menu"] = safe_router_menu
+    production_gate = result.get("production_gate")
+    if isinstance(production_gate, dict):
+        gate_keys = (
+            "launcher_running",
+            "chatgpt_classification",
+            "mux_health",
+            "ui_bridge",
+            "router_account_menu",
+            "mux_process",
+            "real_codex_process",
+            "production_sandbox",
+            "cleanup",
+        )
+        checks = production_gate.get("checks")
+        safe_checks: dict[str, bool] = {}
+        if isinstance(checks, dict):
+            for key in gate_keys:
+                value = checks.get(key)
+                if isinstance(value, bool):
+                    safe_checks[key] = value
+        failed = production_gate.get("failed")
+        safe_failed = (
+            [value for value in failed if value in gate_keys]
+            if isinstance(failed, list)
+            else [key for key in gate_keys if safe_checks.get(key) is False]
+        )
+        output["production_gate"] = {
+            "pass": production_gate.get("pass") is True,
+            "failed": safe_failed,
+            "checks": safe_checks,
+        }
+    native_profile = result.get("native_profile_trigger_observed")
+    if isinstance(native_profile, str):
+        output["native_profile_trigger_observed"] = native_profile[:100]
     ui_bridge = result.get("ui_bridge")
     if isinstance(ui_bridge, dict):
         output["ui_bridge"] = {
             key: ui_bridge.get(key)
-            for key in ("pass", "status_code", "account_menu_rendered")
+            for key in ("pass", "status_code")
             if key in ui_bridge
         }
+        router_gate_failed = (
+            isinstance(router_account_menu, dict)
+            and router_account_menu.get("pass") is not True
+        )
+        production_gate_failed = (
+            isinstance(production_gate, dict)
+            and production_gate.get("pass") is not True
+        )
+        if router_gate_failed or production_gate_failed:
+            debug = ui_bridge.get("debug")
+            buttons = debug.get("buttons") if isinstance(debug, dict) else None
+            output["ui_bridge"]["native_button_diagnostics"] = _public_button_diagnostics(buttons)
     sandbox = output.get("chromium_sandbox")
     if isinstance(sandbox, dict):
         output["chromium_sandbox"] = {

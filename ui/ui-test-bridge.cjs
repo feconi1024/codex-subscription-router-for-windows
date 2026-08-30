@@ -342,7 +342,8 @@ async function capture(action, delayMs, includeDebug) {
   if (includeDebug) {
     result.debug = await window.webContents.executeJavaScript(`(() => {
       const composer=document.querySelector('textarea[placeholder]')??document.querySelector('[contenteditable="true"]');
-      const describe=element=>{const rect=element.getBoundingClientRect(); return {ariaLabel:element.getAttribute('aria-label'),disabled:element.disabled,text:element.textContent.trim().slice(0,80),type:element.type,rect:{x:rect.x,y:rect.y,width:rect.width,height:rect.height}}};
+      const describe=element=>{const rect=element.getBoundingClientRect(); return {ariaLabel:element.getAttribute('aria-label'),disabled:element.disabled,type:element.type,rect:{x:rect.x,y:rect.y,width:rect.width,height:rect.height}}};
+      const accountMenuState=globalThis.__codexMuxAccountMenuState??{};
       return {
         readyState: document.readyState,
         href: location.href,
@@ -350,6 +351,13 @@ async function capture(action, delayMs, includeDebug) {
         rootHtml: document.querySelector('#root')?.innerHTML?.slice(0,1_000)??null,
         composer:composer?describe(composer):null,
         buttons:[...document.querySelectorAll('button')].filter(button=>{const rect=button.getBoundingClientRect();return rect.width>0&&rect.height>0&&rect.bottom>innerHeight-180}).map(describe),
+        router:{
+          accountMenuInjected:globalThis.__codexMuxAccountMenuInjected===true,
+          accountMenuMounted:globalThis.__codexMuxAccountMenuMounted===true,
+          accountsLoaded:accountMenuState.accountsLoaded===true,
+          accountCount:Number.isSafeInteger(accountMenuState.accountCount)&&accountMenuState.accountCount>=0?accountMenuState.accountCount:0,
+          requestFailed:accountMenuState.requestFailed===true,
+        },
       };
     })()`);
     result.diagnostics = diagnostics.slice(-50);

@@ -201,7 +201,10 @@ def _legacy_renderer_variant_values(bundle: str) -> dict[str, object]:
                 "window.__codexMuxResetAccountSelector??null]});"
             ),
             "usage_slot": "usageItems:Ct",
-            "usage_slot_replacement": "usageItems:(0,$5.jsx)(CodexMuxAccountMenu,{})",
+            "usage_slot_replacement": (
+                "usageItems:(globalThis.__codexMuxAccountMenuInjected=true,"
+                "(0,$5.jsx)(CodexMuxAccountMenu,{}))"
+            ),
             "open_change": (
                 "triggerButton:Dt,onOpenChange:l,children:P",
                 "open:s,onOpenChange:l,contentWidth:`panel`,triggerButton:Dt",
@@ -293,7 +296,10 @@ def _legacy_renderer_variant_values(bundle: str) -> dict[str, object]:
             "window.__codexMuxResetAccountSelector??null]});"
         ),
         "usage_slot": "usageItems:Ge",
-        "usage_slot_replacement": "usageItems:(0,e7.jsx)(CodexMuxAccountMenu,{})",
+        "usage_slot_replacement": (
+            "usageItems:(globalThis.__codexMuxAccountMenuInjected=true,"
+            "(0,e7.jsx)(CodexMuxAccountMenu,{}))"
+        ),
         "open_change": (
             "triggerButton:Ke,onOpenChange:o,children:(0,e7.jsx)(bXc",
             "return(0,e7.jsx)(vH,{open:a,onOpenChange:o,contentWidth:`panel`",
@@ -465,7 +471,10 @@ def _windows_26_820_renderer_values() -> dict[str, object]:
             + ",globalThis.__codexMuxResetAccountSelector??null]})"
         ),
         "usage_slot": "usageItems:wt",
-        "usage_slot_replacement": "usageItems:(0,p8.jsx)(CodexMuxAccountMenu,{})",
+        "usage_slot_replacement": (
+            "usageItems:(globalThis.__codexMuxAccountMenuInjected=true,"
+            "(0,p8.jsx)(CodexMuxAccountMenu,{}))"
+        ),
         "open_change": (
             "open:s,side:`top`,sideOffset:6,triggerButton:Ot,onOpenChange:l,children:N",
         ),
@@ -687,7 +696,10 @@ def _windows_26_825_renderer_values() -> dict[str, object]:
         "usage_header": usage_header,
         "usage_header_replacement": usage_header_replacement,
         "usage_slot": "usageItems:h",
-        "usage_slot_replacement": "usageItems:(0,l8.jsx)(CodexMuxAccountMenu,{})",
+        "usage_slot_replacement": (
+            "usageItems:(globalThis.__codexMuxAccountMenuInjected=true,"
+            "(0,l8.jsx)(CodexMuxAccountMenu,{}))"
+        ),
         "open_change": (
             "open:s,side:`top`,sideOffset:6,triggerButton:Ot,onOpenChange:c,children:[N,null]",
         ),
