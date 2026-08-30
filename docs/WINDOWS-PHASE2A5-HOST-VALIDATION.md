@@ -33,6 +33,43 @@ The existing Phase 2A.4 CI baseline was green before this round.  The current
 round must still pass both `checks` and `windows-go-core` before compatibility
 promotion.
 
+## Patched-shell staging layout fix
+
+The failed native run for commit `646fde9a4dc59de145e8a3faa9a0c0be0e1c5a19`
+reached the static staged-layout check after the Go build calls.  The check
+incorrectly appended the installation-root-relative `app\ChatGPT.exe` value
+below the staged `app` directory, producing the false path
+`<staged>\app\app\ChatGPT.exe`.
+
+Commit `522c60a6d91e965cf0b7bd4f9ffa6d4d41ea0009` fixes the contract with
+`resolve_staged_launch_path`, which accepts only `app\ChatGPT.exe` and
+`app\Codex.exe` and resolves them from the staged installation root.  It also
+uses `validate_staged_layout` to report each missing required file by name and
+path without including control-token contents.  `launch.json` remains:
+
+```json
+{
+  "schema_version": 1,
+  "desktop_launch_executable": "app\\ChatGPT.exe"
+}
+```
+
+The regression fixture covers both supported launch names, rejects traversal,
+drive-qualified, UNC, outside-`app`, and unsupported paths, and verifies the
+exact missing-file diagnostic.  No `go.mod`, renderer variant, reviewed-source
+record, bootstrap, integrity, source-discovery, host-context, LOCALAPPDATA, or
+production ACL decision changed.  The production ACL strategy remains `NONE`.
+
+The implementation result is:
+
+```text
+PHASE 2A.5 STAGING FIX PASS
+```
+
+The required `checks` and `windows-go-core` jobs both passed for that exact
+commit in GitHub Actions run `33302529462`.  The aggregate Phase 2A.5 verdict
+still requires the independent native rerun below.
+
 ## Codex-hosted validator evidence
 
 The previous native Phase 2A.4 run was performed from the packaged Codex host
@@ -105,3 +142,16 @@ PHASE 2A.5 FAIL
 ```
 
 `PHASE 2B` is not ready and must not be started automatically.
+
+## Next manual operation
+
+Both CI gates are now green.  From an independently opened ordinary
+PowerShell, run the native validation with the explicit CI gate:
+
+```powershell
+Set-Location -LiteralPath 'E:\Projects\codex-subscription-router-for-windows'
+.\scripts\windows\run_phase2a5_host_validation.ps1 --ci-verified
+```
+
+Do not add a second account, send a real chat, or begin Phase 2B.  Do not
+launch this external-host validation automatically from Codex.
