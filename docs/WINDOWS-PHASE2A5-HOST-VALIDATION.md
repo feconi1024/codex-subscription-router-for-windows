@@ -144,6 +144,12 @@ explicit screenshot capture, bounded renderer evaluation, single-flight state
 probes, typed timeout classification, and preservation of HTTP 401/500
 status codes.
 
+The transport/state separation implementation is commit
+`0703895449c5b9f36af363be2282d9d37492ac32`.  Both required CI jobs,
+`checks` and `windows-go-core`, passed for that exact commit in GitHub Actions
+run `33393233520`.  Native external-host validation is still required; this
+CI result does not claim native Desktop runtime proof.
+
 The implementation commit for this bootstrap/runtime fix is
 `af37cf277468f53b642dc63763beda8fbdb6a806`.  The required `checks` and
 `windows-go-core` jobs both passed for that exact commit in GitHub Actions run
