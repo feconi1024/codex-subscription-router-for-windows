@@ -127,6 +127,12 @@ unrelated listener.  A focused startup diagnostic can stop after launcher,
 mux health 200, bridge `LISTENING`, bridge HTTP 200, and a readable renderer
 marker; it does not require account-menu PASS.
 
+The implementation commit for this bootstrap/runtime fix is
+`af37cf277468f53b642dc63763beda8fbdb6a806`.  The required `checks` and
+`windows-go-core` jobs both passed for that exact commit in GitHub Actions run
+`33360072733`.  Native external-host validation is still required; this CI
+result does not claim native Desktop runtime proof.
+
 The implementation result for commit
 `692796b32cf4e95d67e7fa3488f6e2fe3a8c887d` is:
 
