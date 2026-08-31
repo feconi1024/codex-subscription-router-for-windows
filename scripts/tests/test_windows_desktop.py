@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import errno
 import hashlib
+import io
 import inspect
 import json
 import socket
@@ -10,6 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import urllib.error
 from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from pathlib import Path
@@ -119,9 +121,24 @@ from scripts.windows.smoke import (
     ROUTER_RENDERER_NOT_LOADED,
     ROUTER_UI_BRIDGE_HTTP_FAILED,
     ROUTER_UI_BRIDGE_NOT_STARTED,
+    ROUTER_UI_BRIDGE_PING_TIMEOUT,
     ROUTER_UI_BRIDGE_PORT_UNAVAILABLE,
+    ROUTER_UI_STATE_BUSY,
+    ROUTER_UI_STATE_HTTP_FAILED,
+    ROUTER_UI_STATE_NOT_STARTED,
+    ROUTER_UI_STATE_TIMEOUT,
+    HTTP_PROBE_CONNECTION_REFUSED,
+    HTTP_PROBE_CONNECTION_RESET,
+    HTTP_PROBE_HTTP_ERROR,
+    HTTP_PROBE_NONE,
+    HTTP_PROBE_OTHER_IO,
+    HTTP_PROBE_TIMEOUT,
+    HttpProbeResult,
     UI_BRIDGE_FOCUSED_PASS,
     UI_BRIDGE_TRANSPORT_READY,
+    _app_state_status,
+    _http_json_get,
+    _ui_bridge_transport,
     build_production_gate,
     _probe_candidate,
     classify_probe_output,
@@ -1023,9 +1040,17 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                 "state": UI_BRIDGE_TRANSPORT_READY,
                 "pass": True,
                 "status_code": 200,
-                "renderer_marker_readable": True,
+                "ping": {"status_code": 200, "error_kind": HTTP_PROBE_NONE, "ok": True},
                 "startup": {"stage": "LISTENING", "observed": True},
             },
+            app_state=HttpProbeResult(
+                200,
+                {
+                    "state_status": "OK",
+                    "debug": {"router": {"rendererPatchLoaded": True}},
+                },
+                HTTP_PROBE_NONE,
+            ),
         )
         self.assertTrue(diagnostic["pass"])
         self.assertEqual(
@@ -1034,7 +1059,8 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                 "launcher_alive",
                 "mux_health_200",
                 "ui_bridge_listening",
-                "ui_bridge_http_200",
+                "ui_bridge_ping_200",
+                "app_state_200",
                 "renderer_marker_readable",
             },
         )
@@ -1086,6 +1112,160 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             timeout=15,
         )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+    def test_ui_bridge_real_http_ping_state_and_explicit_screenshot(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is unavailable")
+        if not preflight_ui_bridge_port().get("pass"):
+            self.skipTest("UI bridge port is already occupied by an external process")
+        script = r'''
+const fs=require("node:fs"),http=require("node:http"),os=require("node:os"),path=require("node:path"),
+  Module=require("node:module"),EventEmitter=require("node:events");
+const tmp=fs.mkdtempSync(path.join(os.tmpdir(),"codex-bridge-http-test-"));
+const mux=path.join(tmp,"mux");fs.mkdirSync(mux);
+const token="a".repeat(64);fs.writeFileSync(path.join(mux,"control-token"),token);
+const status=path.join(tmp,"status.json");let captureCalls=0;
+const window={isDestroyed:()=>false,isVisible:()=>true,getBounds:()=>({x:0,y:0,width:1200,height:800}),
+  getContentBounds:()=>({x:0,y:0,width:1200,height:800}),show:()=>{},focus:()=>{}};
+window.webContents={id:1,isLoading:()=>false,getURL:()=>"https://chatgpt.com/",
+  executeJavaScript:()=>Promise.resolve({state_status:"OK",readyState:"complete",
+    router:{rendererPatchLoaded:true,accountMenuInjected:false,accountMenuMounted:false,accountsLoaded:false,accountCount:0,requestFailed:false},
+    desktop_auth:{state:"UNKNOWN"},renderer_runtime:{readyState:"complete",rootPresent:true,profileControllerReady:false},
+    profile_controller:{ready:false,activationAttempted:false,activationSucceeded:false},runtime_errors:[],buttons:[]}),
+  capturePage:()=>{captureCalls++;return Promise.resolve({toPNG:()=>Buffer.from("png")});}};
+const app=new EventEmitter();const load=Module._load;
+Module._load=(request,parent,isMain)=>request==="electron"?{app,BrowserWindow:{getAllWindows:()=>[window]}}:load(request,parent,isMain);
+process.env.CODEX_MUX_UI_TESTS="1";process.env.CODEX_MUX_HOME=mux;process.env.CODEX_MUX_UI_BRIDGE_STATUS_PATH=status;
+const bridge=require(process.cwd()+"/ui/ui-test-bridge.cjs");
+function request(pathname,timeout=4000,requestToken=token){return new Promise((resolve,reject)=>{
+  const req=http.get({host:"127.0.0.1",port:48124,path:pathname,headers:{"x-codex-mux-token":requestToken}},res=>{
+    let raw="";res.setEncoding("utf8");res.on("data",chunk=>raw+=chunk);res.on("end",()=>{
+      let body=null;try{body=JSON.parse(raw);}catch{}resolve({status:res.statusCode,body});});});
+  req.setTimeout(timeout,()=>{req.destroy(new Error("client timeout"));});req.on("error",reject);
+});}
+(async()=>{
+  await bridge.start();
+  const ping=await request("/v1/test/ping");
+  if(ping.status!==200||JSON.stringify(ping.body)!==JSON.stringify({ok:true}))throw new Error("ping failed");
+  const unauthorized=await request("/v1/test/ping",4000,"wrong-token");
+  if(unauthorized.status!==401)throw new Error("ping token check failed");
+  const state=await request("/v1/test/app-state?debug=1");
+  if(state.status!==200||state.body?.state_status!=="OK"||state.body?.imageBase64!==undefined)throw new Error("default state path failed");
+  if(captureCalls!==0)throw new Error("default app-state captured a screenshot");
+  const screenshot=await request("/v1/test/screenshot");
+  if(screenshot.status!==200||typeof screenshot.body?.imageBase64!=="string"||captureCalls!==1)throw new Error("explicit screenshot path failed");
+  process.stdout.write(JSON.stringify({ping:ping.body,state:state.body.state_status,captureCalls})+"\n");process.exit(0);
+})().catch(error=>{process.stderr.write(String(error&&error.stack||error)+"\n");process.exit(1);});
+'''
+        result = subprocess.run(
+            [node, "-e", script],
+            cwd=Path(__file__).resolve().parents[2],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn('"captureCalls":1', result.stdout)
+
+    def test_ui_bridge_ping_survives_hanging_renderer_and_state_is_bounded(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is unavailable")
+        if not preflight_ui_bridge_port().get("pass"):
+            self.skipTest("UI bridge port is already occupied by an external process")
+        script = r'''
+const fs=require("node:fs"),http=require("node:http"),os=require("node:os"),path=require("node:path"),
+  Module=require("node:module"),EventEmitter=require("node:events");
+const tmp=fs.mkdtempSync(path.join(os.tmpdir(),"codex-bridge-hang-test-"));const mux=path.join(tmp,"mux");fs.mkdirSync(mux);
+const token="b".repeat(64);fs.writeFileSync(path.join(mux,"control-token"),token);const status=path.join(tmp,"status.json");
+const window={isDestroyed:()=>false,isVisible:()=>true,getBounds:()=>({x:0,y:0,width:1200,height:800}),show:()=>{},focus:()=>{}};
+window.webContents={id:1,isLoading:()=>false,getURL:()=>"https://chatgpt.com/",executeJavaScript:()=>new Promise(()=>{}),capturePage:()=>{throw new Error("capturePage must not run");}};
+const app=new EventEmitter();const load=Module._load;Module._load=(request,parent,isMain)=>request==="electron"?{app,BrowserWindow:{getAllWindows:()=>[window]}}:load(request,parent,isMain);
+process.env.CODEX_MUX_UI_TESTS="1";process.env.CODEX_MUX_HOME=mux;process.env.CODEX_MUX_UI_BRIDGE_STATUS_PATH=status;
+const bridge=require(process.cwd()+"/ui/ui-test-bridge.cjs");
+function request(pathname,timeout=7000){return new Promise((resolve,reject)=>{const req=http.get({host:"127.0.0.1",port:48124,path:pathname,headers:{"x-codex-mux-token":token}},res=>{let raw="";res.setEncoding("utf8");res.on("data",chunk=>raw+=chunk);res.on("end",()=>{let body=null;try{body=JSON.parse(raw);}catch{}resolve({status:res.statusCode,body});});});req.setTimeout(timeout,()=>req.destroy(new Error("client timeout")));req.on("error",reject);});}
+(async()=>{await bridge.start();const statePromise=request("/v1/test/app-state?debug=1");await new Promise(resolve=>setTimeout(resolve,100));
+  const ping=await request("/v1/test/ping",1000);if(ping.status!==200||ping.body?.ok!==true)throw new Error("ping was blocked by renderer state");
+  const state=await statePromise;if(state.status!==200||state.body?.state_status!=="STATE_TIMEOUT")throw new Error("state timeout was not bounded");
+  const busy=await request("/v1/test/app-state?debug=1");if(busy.status!==200||busy.body?.state_status!=="STATE_BUSY")throw new Error("state overlap was not bounded");
+  process.stdout.write(JSON.stringify({ping:ping.body,state:state.body.state_status,busy:busy.body.state_status})+"\n");process.exit(0);
+})().catch(error=>{process.stderr.write(String(error&&error.stack||error)+"\n");process.exit(1);});
+'''
+        result = subprocess.run(
+            [node, "-e", script],
+            cwd=Path(__file__).resolve().parents[2],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn('"state":"STATE_TIMEOUT"', result.stdout)
+        self.assertIn('"busy":"STATE_BUSY"', result.stdout)
+
+    def test_http_probe_timeout_and_http_statuses_are_typed_and_safe(self) -> None:
+        with patch(
+            "scripts.windows.smoke.urllib.request.urlopen",
+            side_effect=socket.timeout(),
+        ):
+            timeout_result = _http_json_get("http://127.0.0.1:48124/v1/test/ping")
+        self.assertIsInstance(timeout_result, HttpProbeResult)
+        self.assertIsNone(timeout_result.status_code)
+        self.assertEqual(timeout_result.error_kind, HTTP_PROBE_TIMEOUT)
+
+        for status_code in (401, 500):
+            error = urllib.error.HTTPError(
+                "http://127.0.0.1:48124/v1/test/ping",
+                status_code,
+                "secret exception text",
+                hdrs=None,
+                fp=io.BytesIO(b'{"error":"unauthorized"}'),
+            )
+            with patch("scripts.windows.smoke.urllib.request.urlopen", side_effect=error):
+                result = _http_json_get("http://127.0.0.1:48124/v1/test/ping")
+            self.assertEqual(result.status_code, status_code)
+            self.assertEqual(result.error_kind, HTTP_PROBE_HTTP_ERROR)
+            self.assertNotIn("secret", json.dumps(result.__dict__, sort_keys=True))
+
+    def test_state_failure_after_ping_does_not_fail_transport_gate(self) -> None:
+        port = {"pass": True, "host": "127.0.0.1", "port": 48124, "status": "READY"}
+        transport = _ui_bridge_transport(
+            port_preflight=port,
+            startup={"stage": "LISTENING", "observed": True},
+            ping=HttpProbeResult(200, {"ok": True}, HTTP_PROBE_NONE),
+        )
+        ping_timeout = _ui_bridge_transport(
+            port_preflight=port,
+            startup={"stage": "LISTENING", "observed": True},
+            ping=HttpProbeResult(None, None, HTTP_PROBE_TIMEOUT),
+        )
+        self.assertEqual(ping_timeout["state"], ROUTER_UI_BRIDGE_PING_TIMEOUT)
+        for status_code in (401, 500):
+            failed_ping = _ui_bridge_transport(
+                port_preflight=port,
+                startup={"stage": "LISTENING", "observed": True},
+                ping=HttpProbeResult(status_code, {"error": "safe"}, HTTP_PROBE_HTTP_ERROR),
+            )
+            self.assertEqual(failed_ping["state"], ROUTER_UI_BRIDGE_HTTP_FAILED)
+            self.assertEqual(failed_ping["status_code"], status_code)
+        state = HttpProbeResult(None, None, HTTP_PROBE_TIMEOUT)
+        self.assertEqual(transport["state"], UI_BRIDGE_TRANSPORT_READY)
+        self.assertEqual(_app_state_status(state), ROUTER_UI_STATE_TIMEOUT)
+        gate = router_account_menu_gate(
+            {},
+            transport_state=transport["state"],
+            state_status=_app_state_status(state),
+        )
+        self.assertEqual(gate["status"], ROUTER_UI_STATE_TIMEOUT)
+        self.assertFalse(gate["pass"])
 
     def test_router_account_menu_gate_reports_specific_runtime_failures(self) -> None:
         base = {
@@ -1351,7 +1531,20 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             "ui_bridge": {
                 "pass": True,
                 "status_code": 200,
+                "error_kind": "NONE",
                 "transport_state": "READY",
+                "ping": {
+                    "status_code": 200,
+                    "error_kind": "NONE",
+                    "ok": True,
+                    "body": {"token": "token-secret"},
+                },
+                "app_state": {
+                    "status_code": 504,
+                    "error_kind": "HTTP_ERROR",
+                    "state": "ROUTER_UI_STATE_TIMEOUT",
+                    "body": {"account": "user@example.com"},
+                },
                 "startup": {
                     "stage": "LISTENING",
                     "observed": True,
@@ -1391,6 +1584,8 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         self.assertIn("native_button_diagnostics", public["ui_bridge"])
         self.assertEqual(public["ui_bridge"]["transport_state"], "READY")
         self.assertEqual(public["ui_bridge"]["startup"]["stage"], "LISTENING")
+        self.assertEqual(public["ui_bridge"]["ping"]["status_code"], 200)
+        self.assertEqual(public["ui_bridge"]["app_state"]["state"], "ROUTER_UI_STATE_TIMEOUT")
         self.assertEqual(
             public["build_metadata_summary"]["bootstrap_patch"]["ui_test_bridge_module_system"],
             "commonjs",
@@ -1653,6 +1848,10 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         self.assertIn("valid_format", bridge)
         self.assertIn('server.once("listening"', bridge)
         self.assertIn('server.listen(PORT, HOST)', bridge)
+        self.assertIn('/v1/test/ping', bridge)
+        self.assertIn('/v1/test/screenshot', bridge)
+        self.assertIn('STATE_CAPTURE_SCRIPT', bridge)
+        self.assertIn('STATE_BUSY', bridge)
         self.assertIn("app.quit()", bridge)
         self.assertIn("render-process-gone", bridge)
         self.assertIn("unhandledrejection", account_menu)
@@ -1987,6 +2186,7 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                 }
             }
             captured: dict[str, object] = {}
+            requested_urls: list[str] = []
 
             class FinishedProcess:
                 pid = 1234
@@ -2001,7 +2201,10 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                     return 0
 
             def fake_http(url: str, **_kwargs: object):
+                requested_urls.append(url)
                 if "/health" in url:
+                    return 200, {"ok": True}, None
+                if "/ping" in url:
                     return 200, {"ok": True}, None
                 return 200, ui_body, None
 
@@ -2024,11 +2227,14 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             ), patch(
                 "scripts.windows.smoke.terminate_attributed_processes",
                 return_value={"tracked": [1234], "requested": [], "terminated": [], "errors": []},
+            ), patch(
+                "scripts.windows.smoke._read_ui_bridge_status",
+                return_value={"stage": "LISTENING", "observed": True},
             ), patch("scripts.windows.smoke._http_json_get", side_effect=fake_http), patch(
                 "scripts.windows.smoke.time.sleep",
                 return_value=None,
             ):
-                run_patched_shell_smoke(
+                result = run_patched_shell_smoke(
                     layout.patched_shell,
                     real,
                     timeout_seconds=1.0,
@@ -2041,6 +2247,13 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                     validation_profile_root_override=layout.root,
                     validation_profile_local_appdata=local_appdata,
                 )
+            self.assertEqual(result["ui_bridge"]["transport_state"], UI_BRIDGE_TRANSPORT_READY)
+            self.assertEqual(result["ui_bridge"]["ping"]["status_code"], 200)
+            self.assertEqual(result["ui_bridge"]["app_state"]["status_code"], 200)
+            self.assertLess(
+                next(index for index, url in enumerate(requested_urls) if "/ping" in url),
+                next(index for index, url in enumerate(requested_urls) if "/app-state" in url),
+            )
             environment = captured["env"]
             self.assertIsInstance(environment, dict)
             self.assertEqual(environment["CODEX_HOME"], str(layout.codex_home))

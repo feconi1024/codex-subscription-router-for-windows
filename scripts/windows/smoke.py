@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import errno
 import os
 import re
 import shutil
@@ -694,25 +695,104 @@ def _probe_candidate(
         }
 
 
+HTTP_PROBE_NONE = "NONE"
+HTTP_PROBE_TIMEOUT = "TIMEOUT"
+HTTP_PROBE_CONNECTION_REFUSED = "CONNECTION_REFUSED"
+HTTP_PROBE_CONNECTION_RESET = "CONNECTION_RESET"
+HTTP_PROBE_HTTP_ERROR = "HTTP_ERROR"
+HTTP_PROBE_OTHER_IO = "OTHER_IO"
+HTTP_PROBE_ERROR_KINDS = {
+    HTTP_PROBE_NONE,
+    HTTP_PROBE_TIMEOUT,
+    HTTP_PROBE_CONNECTION_REFUSED,
+    HTTP_PROBE_CONNECTION_RESET,
+    HTTP_PROBE_HTTP_ERROR,
+    HTTP_PROBE_OTHER_IO,
+}
+
+
+@dataclass(frozen=True)
+class HttpProbeResult:
+    """Bounded, non-sensitive result for one localhost/health HTTP probe."""
+
+    status_code: int | None
+    body: object | None
+    error_kind: str = HTTP_PROBE_NONE
+
+    def __iter__(self):
+        # Keep old test doubles and callers that unpacked the tuple working
+        # while exposing the typed result to new diagnostics.
+        yield self.status_code
+        yield self.body
+        yield self.error_kind
+
+
+def _parse_http_json(raw: bytes) -> tuple[object | None, bool]:
+    try:
+        return json.loads(raw.decode("utf-8", errors="replace")), True
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, False
+
+
+def _http_error_kind(error: BaseException) -> str:
+    if isinstance(error, (socket.timeout, TimeoutError)):
+        return HTTP_PROBE_TIMEOUT
+    if isinstance(error, ConnectionRefusedError):
+        return HTTP_PROBE_CONNECTION_REFUSED
+    if isinstance(error, ConnectionResetError):
+        return HTTP_PROBE_CONNECTION_RESET
+    reason = getattr(error, "reason", None)
+    if isinstance(reason, (socket.timeout, TimeoutError)):
+        return HTTP_PROBE_TIMEOUT
+    if isinstance(reason, ConnectionRefusedError):
+        return HTTP_PROBE_CONNECTION_REFUSED
+    if isinstance(reason, ConnectionResetError):
+        return HTTP_PROBE_CONNECTION_RESET
+    code = getattr(error, "errno", None)
+    if code in {errno.ETIMEDOUT, 10060}:
+        return HTTP_PROBE_TIMEOUT
+    if code in {errno.ECONNREFUSED, 10061}:
+        return HTTP_PROBE_CONNECTION_REFUSED
+    if code in {errno.ECONNRESET, 10054}:
+        return HTTP_PROBE_CONNECTION_RESET
+    return HTTP_PROBE_OTHER_IO
+
+
+def _coerce_http_probe(value: object) -> HttpProbeResult:
+    if isinstance(value, HttpProbeResult):
+        return value
+    if isinstance(value, tuple) and len(value) >= 3:
+        status_code = value[0] if type(value[0]) is int else None
+        body = value[1]
+        raw_error_kind = value[2]
+        error_kind = raw_error_kind if raw_error_kind in HTTP_PROBE_ERROR_KINDS else (
+            HTTP_PROBE_NONE if raw_error_kind is None else HTTP_PROBE_OTHER_IO
+        )
+        return HttpProbeResult(status_code, body, error_kind)
+    return HttpProbeResult(None, None, HTTP_PROBE_OTHER_IO)
+
+
 def _http_json_get(
     url: str,
     *,
     headers: dict[str, str] | None = None,
     timeout_seconds: float = 0.75,
-) -> tuple[int | None, object | None, str | None]:
+) -> HttpProbeResult:
     request = urllib.request.Request(url, headers=headers or {}, method="GET")
     try:
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             raw = response.read()
             status = int(response.status)
     except urllib.error.HTTPError as error:
-        return int(error.code), None, str(error)
+        try:
+            body, _ = _parse_http_json(error.read())
+        except OSError:
+            body = None
+        return HttpProbeResult(int(error.code), body, HTTP_PROBE_HTTP_ERROR)
     except (OSError, ValueError, urllib.error.URLError) as error:
-        return None, None, str(error)
-    try:
-        return status, json.loads(raw.decode("utf-8", errors="replace")), None
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        return status, None, str(error)
+        return HttpProbeResult(None, None, _http_error_kind(error))
+    body, parsed = _parse_http_json(raw)
+    return HttpProbeResult(status, body, HTTP_PROBE_NONE if parsed else HTTP_PROBE_OTHER_IO)
 
 
 def _process_path_matches(row: RunningProcessCandidate, expected: Path) -> bool:
@@ -825,8 +905,13 @@ ROUTER_RENDERER_NOT_LOADED = "ROUTER_RENDERER_NOT_LOADED"
 ROUTER_RENDERER_RUNTIME_ERROR = "ROUTER_RENDERER_RUNTIME_ERROR"
 ROUTER_UI_NOT_READY = "ROUTER_UI_NOT_READY"
 ROUTER_UI_BRIDGE_NOT_STARTED = "ROUTER_UI_BRIDGE_NOT_STARTED"
+ROUTER_UI_BRIDGE_PING_TIMEOUT = "ROUTER_UI_BRIDGE_PING_TIMEOUT"
 ROUTER_UI_BRIDGE_HTTP_FAILED = "ROUTER_UI_BRIDGE_HTTP_FAILED"
 ROUTER_UI_BRIDGE_PORT_UNAVAILABLE = "ROUTER_UI_BRIDGE_PORT_UNAVAILABLE"
+ROUTER_UI_STATE_NOT_STARTED = "ROUTER_UI_STATE_NOT_STARTED"
+ROUTER_UI_STATE_TIMEOUT = "ROUTER_UI_STATE_TIMEOUT"
+ROUTER_UI_STATE_BUSY = "ROUTER_UI_STATE_BUSY"
+ROUTER_UI_STATE_HTTP_FAILED = "ROUTER_UI_STATE_HTTP_FAILED"
 ROUTER_DESKTOP_AUTH_REQUIRED = "ROUTER_DESKTOP_AUTH_REQUIRED"
 ROUTER_DESKTOP_AUTH_UNKNOWN = "ROUTER_DESKTOP_AUTH_UNKNOWN"
 ROUTER_PROFILE_CONTROLLER_NOT_READY = "ROUTER_PROFILE_CONTROLLER_NOT_READY"
@@ -847,6 +932,11 @@ AUTH_PERSISTENCE_QUIESCENCE_SECONDS = 2.0
 UI_BRIDGE_HOST = "127.0.0.1"
 UI_BRIDGE_PORT = 48124
 UI_BRIDGE_TRANSPORT_READY = "READY"
+HEALTH_PROBE_TIMEOUT_SECONDS = 0.75
+UI_BRIDGE_PING_TIMEOUT_SECONDS = 0.75
+UI_BRIDGE_STATE_TIMEOUT_SECONDS = 5.0
+UI_BRIDGE_ACTION_TIMEOUT_SECONDS = 7.0
+UI_BRIDGE_GRACEFUL_QUIT_TIMEOUT_SECONDS = 2.0
 _UI_BRIDGE_STARTUP_STAGES = {
     "NOT_STARTED",
     "LOADER_REACHED",
@@ -981,9 +1071,17 @@ def _ui_bridge_transport(
     *,
     port_preflight: dict[str, object],
     startup: dict[str, object],
-    status_code: int | None,
-    body: object,
+    ping: object | None = None,
+    status_code: int | None = None,
+    body: object = None,
+    error_kind: str | None = None,
 ) -> dict[str, object]:
+    ping_result = (
+        _coerce_http_probe(ping)
+        if ping is not None
+        else HttpProbeResult(status_code, body, error_kind or HTTP_PROBE_NONE)
+    )
+    ping_body_ok = isinstance(ping_result.body, dict) and ping_result.body.get("ok") is True
     if port_preflight.get("pass") is not True:
         state = ROUTER_UI_BRIDGE_PORT_UNAVAILABLE
     elif startup.get("stage") != "LISTENING":
@@ -994,17 +1092,40 @@ def _ui_bridge_transport(
             if failed_stage == "LISTEN" and error_code == "EADDRINUSE"
             else ROUTER_UI_BRIDGE_NOT_STARTED
         )
-    elif status_code != 200 or not isinstance(body, dict):
-        state = ROUTER_UI_BRIDGE_HTTP_FAILED
-    else:
+    elif ping_result.status_code == 200 and ping_body_ok:
         state = UI_BRIDGE_TRANSPORT_READY
+    elif ping_result.error_kind == HTTP_PROBE_TIMEOUT:
+        state = ROUTER_UI_BRIDGE_PING_TIMEOUT
+    else:
+        state = ROUTER_UI_BRIDGE_HTTP_FAILED
     return {
         "state": state,
         "pass": state == UI_BRIDGE_TRANSPORT_READY,
-        "status_code": status_code,
+        "status_code": ping_result.status_code,
+        "error_kind": ping_result.error_kind,
+        "ping": {
+            "status_code": ping_result.status_code,
+            "error_kind": ping_result.error_kind,
+            "ok": ping_body_ok,
+        },
         "startup": startup,
-        "renderer_marker_readable": _renderer_marker_readable(body) if state == UI_BRIDGE_TRANSPORT_READY else False,
     }
+
+
+def _app_state_status(probe: object | None) -> str:
+    if probe is None:
+        return ROUTER_UI_STATE_NOT_STARTED
+    result = _coerce_http_probe(probe)
+    body_status = result.body.get("state_status") if isinstance(result.body, dict) else None
+    if body_status == "STATE_BUSY":
+        return ROUTER_UI_STATE_BUSY
+    if body_status == "STATE_TIMEOUT" or result.error_kind == HTTP_PROBE_TIMEOUT:
+        return ROUTER_UI_STATE_TIMEOUT
+    if body_status == "STATE_EVALUATION_FAILED":
+        return ROUTER_UI_STATE_HTTP_FAILED
+    if result.status_code == 200 and isinstance(result.body, dict) and body_status in {None, "OK"}:
+        return "READY"
+    return ROUTER_UI_STATE_HTTP_FAILED
 
 
 def focused_ui_bridge_diagnostic(
@@ -1012,8 +1133,23 @@ def focused_ui_bridge_diagnostic(
     launcher_running: bool,
     mux_health: bool,
     transport: dict[str, object],
+    app_state: object | None = None,
+    app_state_status: str | None = None,
 ) -> dict[str, object]:
-    """Evaluate the bounded startup proof without requiring account-menu PASS."""
+    """Evaluate transport and renderer-state proof without requiring account-menu PASS."""
+
+    ping = transport.get("ping") if isinstance(transport.get("ping"), dict) else {}
+    if not ping and "status_code" in transport:
+        ping = {"status_code": transport.get("status_code"), "ok": transport.get("pass") is True}
+    state_result = _coerce_http_probe(app_state) if app_state is not None else None
+    state_body = state_result.body if state_result is not None else None
+    resolved_state_status = app_state_status or _app_state_status(state_result)
+    state_ok = (
+        state_result is not None
+        and state_result.status_code == 200
+        and isinstance(state_body, dict)
+        and resolved_state_status == "READY"
+    )
 
     checks = {
         "launcher_alive": bool(launcher_running),
@@ -1021,14 +1157,21 @@ def focused_ui_bridge_diagnostic(
         "ui_bridge_listening": transport.get("startup", {}).get("stage") == "LISTENING"
         if isinstance(transport.get("startup"), dict)
         else False,
-        "ui_bridge_http_200": transport.get("status_code") == 200 and transport.get("pass") is True,
-        "renderer_marker_readable": transport.get("renderer_marker_readable") is True,
+        "ui_bridge_ping_200": ping.get("status_code") == 200 and ping.get("ok") is True,
+        "app_state_200": state_ok,
+        "renderer_marker_readable": _renderer_marker_readable(state_body) if state_ok else False,
     }
     return {
         "pass": all(checks.values()),
         "checks": checks,
         "transport_state": transport.get("state"),
         "status_code": transport.get("status_code"),
+        "ping": ping,
+        "app_state": {
+            "status_code": state_result.status_code if state_result is not None else None,
+            "error_kind": state_result.error_kind if state_result is not None else HTTP_PROBE_OTHER_IO,
+            "state": resolved_state_status,
+        },
         "startup": transport.get("startup", {}),
     }
 
@@ -1138,6 +1281,7 @@ def router_account_menu_gate(
     activation_attempted: bool = False,
     activation_succeeded: bool = False,
     transport_state: str | None = None,
+    state_status: str | None = None,
 ) -> dict[str, object]:
     """Evaluate only Router-owned account-menu runtime evidence.
 
@@ -1149,6 +1293,7 @@ def router_account_menu_gate(
     if transport_state is not None and transport_state != UI_BRIDGE_TRANSPORT_READY:
         status = transport_state if transport_state in {
             ROUTER_UI_BRIDGE_NOT_STARTED,
+            ROUTER_UI_BRIDGE_PING_TIMEOUT,
             ROUTER_UI_BRIDGE_HTTP_FAILED,
             ROUTER_UI_BRIDGE_PORT_UNAVAILABLE,
         } else ROUTER_UI_BRIDGE_NOT_STARTED
@@ -1158,6 +1303,22 @@ def router_account_menu_gate(
             "activation_succeeded": activation_succeeded,
             "transport_state": status,
             "status": status,
+            "pass": False,
+        }
+    if state_status is not None and state_status != "READY":
+        safe_state_status = state_status if state_status in {
+            ROUTER_UI_STATE_NOT_STARTED,
+            ROUTER_UI_STATE_TIMEOUT,
+            ROUTER_UI_STATE_BUSY,
+            ROUTER_UI_STATE_HTTP_FAILED,
+        } else ROUTER_UI_STATE_HTTP_FAILED
+        return {
+            **evidence,
+            "activation_attempted": activation_attempted,
+            "activation_succeeded": activation_succeeded,
+            "transport_state": transport_state,
+            "state_status": safe_state_status,
+            "status": safe_state_status,
             "pass": False,
         }
     runtime = evidence["renderer_runtime"]
@@ -1191,7 +1352,7 @@ def router_account_menu_gate(
             status = ROUTER_MENU_ACCOUNTS_LOADING
         else:
             status = PASS
-        return {**evidence, "activation_attempted": activation_attempted, "activation_succeeded": activation_succeeded, "transport_state": transport_state, "status": status, "pass": status == PASS}
+        return {**evidence, "activation_attempted": activation_attempted, "activation_succeeded": activation_succeeded, "transport_state": transport_state, "state_status": state_status, "status": status, "pass": status == PASS}
     if not evidence["renderer_loaded"]:
         status = ROUTER_RENDERER_NOT_LOADED
     elif auth == "AUTH_REQUIRED":
@@ -1214,7 +1375,7 @@ def router_account_menu_gate(
         status = ROUTER_MENU_ACCOUNTS_LOADING
     else:
         status = PASS
-    return {**evidence, "activation_attempted": activation_attempted, "activation_succeeded": activation_succeeded, "transport_state": transport_state, "status": status, "pass": status == PASS}
+    return {**evidence, "activation_attempted": activation_attempted, "activation_succeeded": activation_succeeded, "transport_state": transport_state, "state_status": state_status, "status": status, "pass": status == PASS}
 
 
 def _native_profile_trigger_diagnostic(ui_body: object) -> str:
@@ -1609,23 +1770,27 @@ def run_patched_shell_smoke(
         except (OSError, subprocess.SubprocessError) as error:
             launch_error = str(error)
 
+        health_probe: HttpProbeResult | None = None
         health_status: int | None = None
         health_body: object | None = None
-        health_error: str | None = None
+        health_error_kind: str = HTTP_PROBE_OTHER_IO
+        ping_probe: HttpProbeResult | None = None
+        state_probe: HttpProbeResult | None = None
         ui_status: int | None = None
         ui_body: object | None = None
-        ui_error: str | None = None
+        ui_error_kind: str = HTTP_PROBE_OTHER_IO
         ui_bridge_startup: dict[str, object] = {"stage": "NOT_STARTED", "observed": False}
         ui_bridge_transport = _ui_bridge_transport(
             port_preflight=port_preflight,
             startup=ui_bridge_startup,
-            status_code=ui_status,
-            body=ui_body,
+            ping=ping_probe,
         )
+        state_status = ROUTER_UI_STATE_NOT_STARTED
         focused_bridge = focused_ui_bridge_diagnostic(
             launcher_running=False,
             mux_health=False,
             transport=ui_bridge_transport,
+            app_state=state_probe,
         )
         launcher_observed_running = False
         router_account_menu = router_account_menu_gate(
@@ -1665,46 +1830,76 @@ def run_patched_shell_smoke(
                     "windows": windows,
                 }
             )
-            if health_status != 200:
-                health_status, health_body, health_error = _http_json_get(
-                    "http://127.0.0.1:48123/v1/health"
+            if health_probe is None or health_probe.status_code != 200:
+                health_probe = _coerce_http_probe(
+                    _http_json_get(
+                        "http://127.0.0.1:48123/v1/health",
+                        timeout_seconds=HEALTH_PROBE_TIMEOUT_SECONDS,
+                    )
                 )
+            health_status = health_probe.status_code
+            health_body = health_probe.body
+            health_error_kind = health_probe.error_kind
             health_ready = (
                 health_status == 200
                 and isinstance(health_body, dict)
                 and health_body.get("ok") is True
             )
-            if health_ready and (ui_status != 200 or not router_account_menu["pass"]):
-                ui_status, ui_body, ui_error = _http_json_get(
-                    f"http://{UI_BRIDGE_HOST}:{UI_BRIDGE_PORT}/v1/test/app-state?debug=1",
-                    headers={"x-codex-mux-token": token},
-                )
             ui_bridge_startup = _read_ui_bridge_status(bridge_status_path)
             if health_ready:
+                if ping_probe is None or ping_probe.status_code != 200 or not (
+                    isinstance(ping_probe.body, dict) and ping_probe.body.get("ok") is True
+                ):
+                    ping_probe = _coerce_http_probe(
+                        _http_json_get(
+                            f"http://{UI_BRIDGE_HOST}:{UI_BRIDGE_PORT}/v1/test/ping",
+                            headers={"x-codex-mux-token": token},
+                            timeout_seconds=UI_BRIDGE_PING_TIMEOUT_SECONDS,
+                        )
+                    )
                 ui_bridge_transport = _ui_bridge_transport(
                     port_preflight=port_preflight,
                     startup=ui_bridge_startup,
-                    status_code=ui_status,
-                    body=ui_body,
+                    ping=ping_probe,
                 )
+                if ui_bridge_transport["state"] == UI_BRIDGE_TRANSPORT_READY and _app_state_status(state_probe) != "READY":
+                    state_probe = _coerce_http_probe(
+                        _http_json_get(
+                            f"http://{UI_BRIDGE_HOST}:{UI_BRIDGE_PORT}/v1/test/app-state?debug=1",
+                            headers={"x-codex-mux-token": token},
+                            timeout_seconds=UI_BRIDGE_STATE_TIMEOUT_SECONDS,
+                        )
+                    )
             else:
                 ui_bridge_transport = {
                     "state": ROUTER_UI_BRIDGE_NOT_STARTED,
                     "pass": False,
                     "status_code": None,
+                    "error_kind": HTTP_PROBE_OTHER_IO,
+                    "ping": {"status_code": None, "error_kind": HTTP_PROBE_OTHER_IO, "ok": False},
                     "startup": ui_bridge_startup,
-                    "renderer_marker_readable": False,
                 }
+            ui_status = state_probe.status_code if state_probe is not None else None
+            ui_body = state_probe.body if state_probe is not None else None
+            ui_error_kind = state_probe.error_kind if state_probe is not None else HTTP_PROBE_OTHER_IO
+            state_status = (
+                _app_state_status(state_probe)
+                if ui_bridge_transport["state"] == UI_BRIDGE_TRANSPORT_READY
+                else None
+            )
             focused_bridge = focused_ui_bridge_diagnostic(
                 launcher_running=launcher_observed_running,
                 mux_health=health_ready,
                 transport=ui_bridge_transport,
+                app_state=state_probe,
+                app_state_status=state_status,
             )
             router_account_menu = router_account_menu_gate(
                 ui_body,
                 activation_attempted=activation_attempted,
                 activation_succeeded=activation_succeeded,
                 transport_state=ui_bridge_transport["state"],
+                state_status=state_status,
             )
             if (
                 fail_if_auth_required
@@ -1714,7 +1909,7 @@ def run_patched_shell_smoke(
             ):
                 break
             desktop_auth = router_account_menu.get("desktop_auth")
-            if isinstance(desktop_auth, dict) and desktop_auth.get("state") == "AUTHENTICATED":
+            if state_status == "READY" and isinstance(desktop_auth, dict) and desktop_auth.get("state") == "AUTHENTICATED":
                 authentication_confirmed = True
                 authentication_confirmed_at = authentication_confirmed_at or time.monotonic()
             if (
@@ -1725,21 +1920,27 @@ def run_patched_shell_smoke(
                 and ui_bridge_transport["state"] == UI_BRIDGE_TRANSPORT_READY
             ):
                 action_url = f"http://{UI_BRIDGE_HOST}:{UI_BRIDGE_PORT}/v1/test/app-state?action=profile-router-open&debug=1&delayMs=400"
-                action_status, action_body, action_error = _http_json_get(
-                    action_url,
-                    headers={"x-codex-mux-token": token},
+                action_probe = _coerce_http_probe(
+                    _http_json_get(
+                        action_url,
+                        headers={"x-codex-mux-token": token},
+                        timeout_seconds=UI_BRIDGE_ACTION_TIMEOUT_SECONDS,
+                    )
                 )
                 activation_attempted = True
-                activation_succeeded = action_status == 200 and isinstance(action_body, dict)
-                if isinstance(action_body, dict):
-                    ui_body = action_body
-                    ui_status = action_status
-                    ui_error = action_error
+                activation_succeeded = action_probe.status_code == 200 and _app_state_status(action_probe) == "READY"
+                if isinstance(action_probe.body, dict):
+                    state_probe = action_probe
+                    ui_body = action_probe.body
+                    ui_status = action_probe.status_code
+                    ui_error_kind = action_probe.error_kind
+                    state_status = _app_state_status(state_probe)
                 router_account_menu = router_account_menu_gate(
                     ui_body,
                     activation_attempted=activation_attempted,
                     activation_succeeded=activation_succeeded,
                     transport_state=ui_bridge_transport["state"],
+                    state_status=state_status,
                 )
             if (
                 authentication_preparation
@@ -1755,16 +1956,19 @@ def run_patched_shell_smoke(
                     f"http://{UI_BRIDGE_HOST}:{UI_BRIDGE_PORT}/v1/test/app-state?"
                     "action=desktop-auth-graceful-quit&debug=0&delayMs=0"
                 )
-                action_status, action_body, action_error = _http_json_get(
-                    action_url,
-                    headers={"x-codex-mux-token": token},
+                action_probe = _coerce_http_probe(
+                    _http_json_get(
+                        action_url,
+                        headers={"x-codex-mux-token": token},
+                        timeout_seconds=UI_BRIDGE_GRACEFUL_QUIT_TIMEOUT_SECONDS,
+                    )
                 )
-                if action_status == 200 and isinstance(action_body, dict) and action_body.get("ok") is True:
+                if action_probe.status_code == 200 and isinstance(action_probe.body, dict) and action_probe.body.get("ok") is True:
                     graceful_shutdown_requested = True
                 else:
                     graceful_shutdown_status = "FAILED"
                     graceful_shutdown_error = "graceful Desktop shutdown was not accepted"
-                    if action_error:
+                    if action_probe.error_kind != HTTP_PROBE_NONE:
                         graceful_shutdown_error = "graceful Desktop shutdown request failed"
             if graceful_shutdown_requested and process.poll() is not None:
                 graceful_shutdown_succeeded = True
@@ -1787,6 +1991,7 @@ def run_patched_shell_smoke(
             if (
                 health_status == 200
                 and ui_status == 200
+                and state_status == "READY"
                 and router_account_menu["pass"]
                 and mux_process_observed
                 and real_codex_process_observed
@@ -1859,24 +2064,38 @@ def run_patched_shell_smoke(
         if launch_error is None
         else {"status": CRASHED, "reason": f"could not launch patched shell: {launch_error}", "relevant_log_lines": {}}
     )
+    health_status = health_probe.status_code if health_probe is not None else None
+    health_body = health_probe.body if health_probe is not None else None
+    health_error_kind = health_probe.error_kind if health_probe is not None else HTTP_PROBE_OTHER_IO
+    ui_status = state_probe.status_code if state_probe is not None else None
+    ui_body = state_probe.body if state_probe is not None else None
+    ui_error_kind = state_probe.error_kind if state_probe is not None else HTTP_PROBE_OTHER_IO
     debug = ui_body.get("debug") if isinstance(ui_body, dict) else None
     health_pass = health_status == 200 and isinstance(health_body, dict) and health_body.get("ok") is True
     ui_bridge_transport = _ui_bridge_transport(
         port_preflight=port_preflight,
         startup=ui_bridge_startup,
-        status_code=ui_status,
-        body=ui_body,
+        ping=ping_probe,
+    )
+    final_state_status = _app_state_status(state_probe)
+    state_status_for_gate = (
+        final_state_status
+        if ui_bridge_transport["state"] == UI_BRIDGE_TRANSPORT_READY
+        else None
     )
     focused_bridge = focused_ui_bridge_diagnostic(
         launcher_running=launcher_observed_running,
         mux_health=health_pass,
         transport=ui_bridge_transport,
+        app_state=state_probe,
+        app_state_status=state_status_for_gate,
     )
     router_account_menu = router_account_menu_gate(
         ui_body,
         activation_attempted=activation_attempted,
         activation_succeeded=activation_succeeded,
         transport_state=ui_bridge_transport["state"],
+        state_status=state_status_for_gate,
     )
     native_profile_trigger_observed = _native_profile_trigger_diagnostic(ui_body)
     mux_observed = any(
@@ -1957,6 +2176,8 @@ def run_patched_shell_smoke(
             if auth_required and router_account_menu.get("status") == ROUTER_DESKTOP_AUTH_REQUIRED
             else f"patched shell UI test bridge transport gate failed: {ui_bridge_transport['state']}"
             if ui_bridge_transport["state"] != UI_BRIDGE_TRANSPORT_READY
+            else f"patched shell UI state acquisition gate failed: {final_state_status}"
+            if final_state_status != "READY"
             else "development-only sandbox bypass showed the patched Router launcher, UI bridge, mux health, account menu, and mux-to-real-codex chain"
             if required_pass and development_only
             else "patched Router launcher, ChatGPT UI bridge, mux health, account menu, and mux-to-real-codex chain passed"
@@ -2019,15 +2240,27 @@ def run_patched_shell_smoke(
             "pass": health_pass,
             "status_code": health_status,
             "body": health_body,
-            "error": health_error,
+            "error_kind": health_error_kind,
         },
         "ui_bridge": {
             "pass": ui_bridge_pass,
-            "status_code": ui_status,
+            "status_code": ping_probe.status_code if ping_probe is not None else None,
+            "error_kind": ping_probe.error_kind if ping_probe is not None else HTTP_PROBE_OTHER_IO,
             "transport_state": ui_bridge_transport["state"],
             "startup": ui_bridge_startup,
             "port_preflight": port_preflight,
-            "error": ui_error,
+            "ping": {
+                "status_code": ping_probe.status_code if ping_probe is not None else None,
+                "error_kind": ping_probe.error_kind if ping_probe is not None else HTTP_PROBE_OTHER_IO,
+                "ok": isinstance(ping_probe.body, dict) and ping_probe.body.get("ok") is True
+                if ping_probe is not None
+                else False,
+            },
+            "app_state": {
+                "status_code": ui_status,
+                "error_kind": ui_error_kind,
+                "state": final_state_status,
+            },
             "debug": debug,
         },
         "mux_process_observed": mux_process_observed,

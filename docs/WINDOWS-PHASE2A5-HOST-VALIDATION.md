@@ -118,14 +118,31 @@ error name/code, and (for `CONTROL_TOKEN_READ`) the booleans
 `exists`, `readable`, and `valid_format`.  The status path is removed after
 the probe.
 
-The native smoke ordering is now launcher alive, mux health, bridge transport,
-renderer marker, authentication/profile state, and account-menu state.  A
-missing bridge returns `ROUTER_UI_BRIDGE_NOT_STARTED`; a non-200 bridge
-request returns `ROUTER_UI_BRIDGE_HTTP_FAILED`; and an occupied
-`127.0.0.1:48124` returns `ROUTER_UI_BRIDGE_PORT_UNAVAILABLE` without terminating the
-unrelated listener.  A focused startup diagnostic can stop after launcher,
-mux health 200, bridge `LISTENING`, bridge HTTP 200, and a readable renderer
-marker; it does not require account-menu PASS.
+The native smoke ordering is now launcher alive, mux health, bridge
+`LISTENING`, the token-authenticated main-process `GET /v1/test/ping`, and
+only then renderer state acquisition through `GET /v1/test/app-state?debug=1`.
+Transport readiness requires ping HTTP 200 with `{ "ok": true }`; it does not
+call `BrowserWindow`, `executeJavaScript`, or screenshot capture.  A missing
+bridge returns `ROUTER_UI_BRIDGE_NOT_STARTED`, a ping timeout returns
+`ROUTER_UI_BRIDGE_PING_TIMEOUT`, a non-200 ping returns
+`ROUTER_UI_BRIDGE_HTTP_FAILED`, and an occupied `127.0.0.1:48124` returns
+`ROUTER_UI_BRIDGE_PORT_UNAVAILABLE` without terminating the unrelated
+listener.  App-state failures are separate (`ROUTER_UI_STATE_TIMEOUT`,
+`ROUTER_UI_STATE_BUSY`, or `ROUTER_UI_STATE_HTTP_FAILED`) and never relabel a
+healthy ping as a bridge failure.  Default app-state polling no longer
+captures PNG data; screenshots remain explicit at
+`GET /v1/test/screenshot`.
+
+The focused diagnostic reports launcher, mux health, bridge listening, ping
+HTTP 200, app-state HTTP 200, and renderer-marker readability independently;
+it does not require account-menu PASS.
+
+Regression coverage uses actual localhost HTTP with a fake Electron surface:
+it proves the listening-to-ping-to-app-state sequence, ping responsiveness
+while renderer evaluation hangs, no screenshot on default state polling,
+explicit screenshot capture, bounded renderer evaluation, single-flight state
+probes, typed timeout classification, and preservation of HTTP 401/500
+status codes.
 
 The implementation commit for this bootstrap/runtime fix is
 `af37cf277468f53b642dc63763beda8fbdb6a806`.  The required `checks` and

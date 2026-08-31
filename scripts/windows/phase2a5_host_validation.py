@@ -622,6 +622,28 @@ _PUBLIC_UI_BRIDGE_ERROR_CODES = {
     "MODULE_NOT_FOUND",
     "TOKEN_INVALID_FORMAT",
 }
+_PUBLIC_HTTP_ERROR_KINDS = {
+    "NONE",
+    "TIMEOUT",
+    "CONNECTION_REFUSED",
+    "CONNECTION_RESET",
+    "HTTP_ERROR",
+    "OTHER_IO",
+}
+_PUBLIC_UI_BRIDGE_TRANSPORT_STATES = {
+    "READY",
+    "ROUTER_UI_BRIDGE_NOT_STARTED",
+    "ROUTER_UI_BRIDGE_PING_TIMEOUT",
+    "ROUTER_UI_BRIDGE_HTTP_FAILED",
+    "ROUTER_UI_BRIDGE_PORT_UNAVAILABLE",
+}
+_PUBLIC_UI_STATE_STATUSES = {
+    "READY",
+    "ROUTER_UI_STATE_NOT_STARTED",
+    "ROUTER_UI_STATE_TIMEOUT",
+    "ROUTER_UI_STATE_BUSY",
+    "ROUTER_UI_STATE_HTTP_FAILED",
+}
 
 
 def _public_ui_bridge_startup(value: object) -> dict[str, object]:
@@ -671,6 +693,25 @@ def _public_ui_bridge_port(value: object) -> dict[str, object]:
     return output
 
 
+def _public_http_probe(value: object, *, include_state: bool = False) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, object] = {}
+    status_code = value.get("status_code")
+    if type(status_code) is int and 100 <= status_code <= 599:
+        output["status_code"] = status_code
+    error_kind = value.get("error_kind")
+    if isinstance(error_kind, str) and error_kind in _PUBLIC_HTTP_ERROR_KINDS:
+        output["error_kind"] = error_kind
+    if isinstance(value.get("ok"), bool):
+        output["ok"] = value["ok"]
+    if include_state:
+        state = value.get("state")
+        if isinstance(state, str) and state in _PUBLIC_UI_STATE_STATUSES:
+            output["state"] = state
+    return output
+
+
 def _public_focused_ui_bridge(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
         return {}
@@ -685,18 +726,14 @@ def _public_focused_ui_bridge(value: object) -> dict[str, object]:
                 "launcher_alive",
                 "mux_health_200",
                 "ui_bridge_listening",
-                "ui_bridge_http_200",
+                "ui_bridge_ping_200",
+                "app_state_200",
                 "renderer_marker_readable",
             )
             if isinstance(checks.get(key), bool)
         }
     state = value.get("transport_state")
-    if state in {
-        "READY",
-        "ROUTER_UI_BRIDGE_NOT_STARTED",
-        "ROUTER_UI_BRIDGE_HTTP_FAILED",
-        "ROUTER_UI_BRIDGE_PORT_UNAVAILABLE",
-    }:
+    if state in _PUBLIC_UI_BRIDGE_TRANSPORT_STATES:
         output["transport_state"] = state
     status_code = value.get("status_code")
     if type(status_code) is int:
@@ -704,6 +741,12 @@ def _public_focused_ui_bridge(value: object) -> dict[str, object]:
     startup = _public_ui_bridge_startup(value.get("startup"))
     if startup:
         output["startup"] = startup
+    ping = _public_http_probe(value.get("ping"))
+    if ping:
+        output["ping"] = ping
+    app_state = _public_http_probe(value.get("app_state"), include_state=True)
+    if app_state:
+        output["app_state"] = app_state
     return output
 
 
@@ -1075,11 +1118,14 @@ def _public_probe(result: object) -> object:
         }
     health = result.get("health")
     if isinstance(health, dict):
-        output["health"] = {
-            key: health.get(key)
-            for key in ("pass", "status_code")
-            if key in health
-        }
+        safe_health: dict[str, object] = {}
+        if isinstance(health.get("pass"), bool):
+            safe_health["pass"] = health["pass"]
+        if type(health.get("status_code")) is int and 100 <= health["status_code"] <= 599:
+            safe_health["status_code"] = health["status_code"]
+        if health.get("error_kind") in _PUBLIC_HTTP_ERROR_KINDS:
+            safe_health["error_kind"] = health["error_kind"]
+        output["health"] = safe_health
     classification = result.get("chatgpt_classification")
     if isinstance(classification, dict):
         output["chatgpt_classification"] = {
@@ -1104,13 +1150,11 @@ def _public_probe(result: object) -> object:
             if isinstance(value, bool):
                 safe_router_menu[key] = value
         transport_state = router_account_menu.get("transport_state")
-        if transport_state in {
-            "READY",
-            "ROUTER_UI_BRIDGE_NOT_STARTED",
-            "ROUTER_UI_BRIDGE_HTTP_FAILED",
-            "ROUTER_UI_BRIDGE_PORT_UNAVAILABLE",
-        }:
+        if transport_state in _PUBLIC_UI_BRIDGE_TRANSPORT_STATES:
             safe_router_menu["transport_state"] = transport_state
+        state_status = router_account_menu.get("state_status")
+        if state_status in _PUBLIC_UI_STATE_STATUSES:
+            safe_router_menu["state_status"] = state_status
         account_count = router_account_menu.get("account_count")
         if type(account_count) is int and account_count >= 0:
             safe_router_menu["account_count"] = account_count
@@ -1118,8 +1162,13 @@ def _public_probe(result: object) -> object:
         if isinstance(status, str) and status in {
             "PASS",
             "ROUTER_UI_BRIDGE_NOT_STARTED",
+            "ROUTER_UI_BRIDGE_PING_TIMEOUT",
             "ROUTER_UI_BRIDGE_HTTP_FAILED",
             "ROUTER_UI_BRIDGE_PORT_UNAVAILABLE",
+            "ROUTER_UI_STATE_NOT_STARTED",
+            "ROUTER_UI_STATE_TIMEOUT",
+            "ROUTER_UI_STATE_BUSY",
+            "ROUTER_UI_STATE_HTTP_FAILED",
             "ROUTER_RENDERER_RUNTIME_ERROR",
             "ROUTER_UI_NOT_READY",
             "ROUTER_DESKTOP_AUTH_REQUIRED",
@@ -1186,18 +1235,16 @@ def _public_probe(result: object) -> object:
         output["native_profile_trigger_observed"] = native_profile[:100]
     ui_bridge = result.get("ui_bridge")
     if isinstance(ui_bridge, dict):
-        output["ui_bridge"] = {
-            key: ui_bridge.get(key)
-            for key in ("pass", "status_code")
-            if key in ui_bridge
-        }
+        safe_ui_bridge: dict[str, object] = {}
+        if isinstance(ui_bridge.get("pass"), bool):
+            safe_ui_bridge["pass"] = ui_bridge["pass"]
+        if type(ui_bridge.get("status_code")) is int and 100 <= ui_bridge["status_code"] <= 599:
+            safe_ui_bridge["status_code"] = ui_bridge["status_code"]
+        if ui_bridge.get("error_kind") in _PUBLIC_HTTP_ERROR_KINDS:
+            safe_ui_bridge["error_kind"] = ui_bridge["error_kind"]
+        output["ui_bridge"] = safe_ui_bridge
         transport_state = ui_bridge.get("transport_state")
-        if transport_state in {
-            "READY",
-            "ROUTER_UI_BRIDGE_NOT_STARTED",
-            "ROUTER_UI_BRIDGE_HTTP_FAILED",
-            "ROUTER_UI_BRIDGE_PORT_UNAVAILABLE",
-        }:
+        if transport_state in _PUBLIC_UI_BRIDGE_TRANSPORT_STATES:
             output["ui_bridge"]["transport_state"] = transport_state
         startup = _public_ui_bridge_startup(ui_bridge.get("startup"))
         if startup:
@@ -1205,6 +1252,12 @@ def _public_probe(result: object) -> object:
         port_preflight = _public_ui_bridge_port(ui_bridge.get("port_preflight"))
         if port_preflight:
             output["ui_bridge"]["port_preflight"] = port_preflight
+        ping = _public_http_probe(ui_bridge.get("ping"))
+        if ping:
+            output["ui_bridge"]["ping"] = ping
+        app_state = _public_http_probe(ui_bridge.get("app_state"), include_state=True)
+        if app_state:
+            output["ui_bridge"]["app_state"] = app_state
         router_gate_failed = (
             isinstance(router_account_menu, dict)
             and router_account_menu.get("pass") is not True

@@ -42,6 +42,15 @@ const STARTUP_ERROR_CODES = new Set([
   "TOKEN_INVALID_FORMAT",
 ]);
 let startupPromise = null;
+let rendererEvaluationInFlight = null;
+let stateCaptureInFlight = null;
+
+// Keep the transport probe independent from renderer work. State collection is
+// deliberately bounded because a navigating or suspended renderer must not
+// make the main-process HTTP server appear dead.
+const STATE_EVAL_TIMEOUT_MS = 3_000;
+const SCREENSHOT_TIMEOUT_MS = 10_000;
+const STATE_RESPONSE_STATUSES = new Set(["OK", "STATE_BUSY", "STATE_TIMEOUT", "STATE_EVALUATION_FAILED"]);
 
 function startupStatusPath() {
   const value = process.env.CODEX_MUX_UI_BRIDGE_STATUS_PATH;
@@ -193,6 +202,160 @@ function safeUrl(window) {
     return null;
   }
 }
+
+function boundedPromise(promise, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve({ ok: false, status: "TIMEOUT" });
+    }, timeoutMs);
+    Promise.resolve(promise).then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ ok: true, value });
+      },
+      () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ ok: false, status: "FAILED" });
+      },
+    );
+  });
+}
+
+function executeRendererBounded(window, script, timeoutMs = STATE_EVAL_TIMEOUT_MS) {
+  if (rendererEvaluationInFlight !== null) {
+    return Promise.resolve({ ok: false, status: "STATE_BUSY" });
+  }
+  const raw = Promise.resolve().then(() => window.webContents.executeJavaScript(script));
+  const tracked = raw.then(
+    (value) => ({ ok: true, value }),
+    () => ({ ok: false, status: "STATE_EVALUATION_FAILED" }),
+  );
+  rendererEvaluationInFlight = tracked;
+  tracked.then(() => {
+    if (rendererEvaluationInFlight === tracked) rendererEvaluationInFlight = null;
+  });
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve({ ok: false, status: "STATE_TIMEOUT" });
+    }, timeoutMs);
+    tracked.then((result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    });
+  });
+}
+
+const STATE_CAPTURE_SCRIPT = `(() => {
+  const authStates = new Set(['AUTHENTICATED','AUTH_REQUIRED','UNKNOWN']);
+  const safeAuth = value => authStates.has(value) ? value : 'UNKNOWN';
+  const safeCount = value => Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  const safeSource = value => {
+    if (typeof value !== 'string') return null;
+    const pieces = value.split(/[\\\\/]/);
+    const basename = pieces[pieces.length - 1] || '';
+    return basename.length > 0 && basename.length <= 200 ? basename : null;
+  };
+  const safeError = value => {
+    if (!value || typeof value !== 'object') return null;
+    const kinds = new Set(['error','unhandledrejection','render-process-gone']);
+    const names = new Set(['Error','EvalError','RangeError','ReferenceError','SyntaxError','TypeError','URIError']);
+    const item = {
+      kind: kinds.has(value.kind) ? value.kind : 'error',
+      name: names.has(value.name) ? value.name : 'Error',
+      source_asset: safeSource(value.source_asset),
+      line: safeCount(value.line),
+      column: safeCount(value.column),
+    };
+    if (item.kind === 'render-process-gone') {
+      const reasons = new Set(['clean-exit','abnormal-exit','crashed','killed','oom','launch-failed']);
+      item.reason = reasons.has(value.reason) ? value.reason : 'unknown';
+      item.exit_code = safeCount(value.exit_code);
+    }
+    return item;
+  };
+  const state = globalThis.__codexMuxAccountMenuState ?? {};
+  const savedRuntime = globalThis.__codexMuxRendererRuntime ?? {};
+  const body = document.body;
+  const root = document.querySelector('#root') || body?.firstElementChild || null;
+  const composer = document.querySelector('textarea[placeholder],[contenteditable="true"]');
+  let visible = 0;
+  for (const element of document.querySelectorAll('button,a,input,textarea,[role="button"],[contenteditable="true"]')) {
+    const rect = element.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) visible++;
+  }
+  const pathname = typeof globalThis.location?.pathname === 'string' ? globalThis.location.pathname.toLowerCase() : '';
+  const authRoute = /(^|\\/)(auth|login|signin|sign-in)(\\/|$)/.test(pathname);
+  const controller = globalThis.__codexMuxProfileMenuControllerReady === true || savedRuntime.profileControllerReady === true;
+  let detected = 'UNKNOWN';
+  if (authRoute) detected = 'AUTH_REQUIRED';
+  else if (globalThis.__codexMuxAuthenticatedShellReady === true || (composer && controller)) detected = 'AUTHENTICATED';
+  else if (document.readyState === 'complete' && root && !composer && !controller) detected = 'AUTH_REQUIRED';
+  const savedAuth = safeAuth(globalThis.__codexMuxDesktopAuth);
+  const errors = Array.isArray(globalThis.__codexMuxRuntimeErrors) ? globalThis.__codexMuxRuntimeErrors : [];
+  const readyState = ['loading','interactive','complete'].includes(document.readyState) ? document.readyState : 'unknown';
+  const describe = element => {
+    const rect = element.getBoundingClientRect();
+    const label = element.getAttribute('aria-label');
+    const allowedLabel = label === 'Open profile menu' || /^Show (combined )?profile stats$/.test(label || '') ? label : null;
+    return {
+      ariaLabel: allowedLabel,
+      disabled: element.disabled === true,
+      type: typeof element.type === 'string' ? element.type : null,
+      rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+    };
+  };
+  const runtime = {
+    readyState,
+    rootPresent: root !== null,
+    rootChildCount: safeCount(savedRuntime.rootChildCount || root?.children?.length),
+    bodyChildCount: safeCount(savedRuntime.bodyChildCount || body?.children?.length),
+    buttonCount: safeCount(savedRuntime.buttonCount || document.querySelectorAll('button').length),
+    visibleInteractiveCount: safeCount(savedRuntime.visibleInteractiveCount || visible),
+    composerPresent: composer !== null,
+    profileControllerReady: controller,
+    runtimeErrorCount: errors.length,
+    lastSafeRuntimeError: safeError(errors.at(-1)),
+  };
+  return {
+    state_status: 'OK',
+    router: {
+      rendererPatchLoaded: globalThis.__codexMuxRendererPatchLoaded === true,
+      accountMenuInjected: globalThis.__codexMuxAccountMenuInjected === true,
+      accountMenuMounted: globalThis.__codexMuxAccountMenuMounted === true,
+      accountsLoaded: state.accountsLoaded === true,
+      accountCount: safeCount(state.accountCount),
+      requestFailed: state.requestFailed === true,
+    },
+    desktop_auth: { state: detected !== 'UNKNOWN' ? detected : savedAuth },
+    renderer_runtime: runtime,
+    profile_controller: {
+      ready: globalThis.__codexMuxProfileMenuControllerReady === true,
+      activationAttempted: globalThis.__codexMuxProfileMenuActivationAttempted === true,
+      activationSucceeded: globalThis.__codexMuxProfileMenuActivationSucceeded === true,
+    },
+    runtime_errors: errors.slice(-20).map(safeError).filter(Boolean),
+    readyState,
+    composer: composer ? describe(composer) : null,
+    buttons: [...document.querySelectorAll('button')]
+      .filter(button => {
+        const rect = button.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && rect.bottom > innerHeight - 180;
+      })
+      .map(describe),
+  };
+})()`;
 
 function emptyRouterFlags() {
   return {
@@ -733,42 +896,187 @@ async function requestGracefulDesktopQuit() {
   return { ok: true, status: "QUIT_REQUESTED" };
 }
 
-async function capture(action, delayMs, includeDebug) {
-  let window = action === null ? await observationWindow() : mainWindow();
+function emptyStateDebug() {
+  return {
+    readyState: "unknown",
+    composer: null,
+    buttons: [],
+    router: emptyRouterFlags(),
+    desktop_auth: { state: "UNKNOWN" },
+    renderer_runtime: null,
+    profile_controller: { ready: false, activationAttempted: false, activationSucceeded: false },
+    runtime_errors: [],
+    termination: null,
+    windows: [],
+  };
+}
+
+function safeRect(value) {
+  if (!value || typeof value !== "object") return null;
+  const result = {};
+  for (const key of ["x", "y", "width", "height"]) {
+    if (typeof value[key] === "number" && Number.isFinite(value[key])) result[key] = value[key];
+  }
+  return Object.keys(result).length === 4 ? result : null;
+}
+
+function safeElementDescription(value) {
+  if (!value || typeof value !== "object") return null;
+  const label = value.ariaLabel;
+  return {
+    ariaLabel:
+      label === "Open profile menu" || /^Show (combined )?profile stats$/.test(label || "")
+        ? label
+        : null,
+    disabled: value.disabled === true,
+    type: typeof value.type === "string" ? value.type : null,
+    rect: safeRect(value.rect),
+  };
+}
+
+function safeStateSnapshot(raw) {
+  const stateStatus = raw?.state_status;
+  const status = STATE_RESPONSE_STATUSES.has(stateStatus) ? stateStatus : "STATE_EVALUATION_FAILED";
+  const debug = emptyStateDebug();
+  if (!raw || typeof raw !== "object") return { state_status: status, debug };
+  if (["loading", "interactive", "complete", "unknown"].includes(raw.readyState)) {
+    debug.readyState = raw.readyState;
+  }
+  debug.composer = safeElementDescription(raw.composer);
+  if (Array.isArray(raw.buttons)) {
+    debug.buttons = raw.buttons.map(safeElementDescription).filter(Boolean).slice(-100);
+  }
+  const router = raw.router;
+  if (router && typeof router === "object") {
+    debug.router = {
+      rendererPatchLoaded: router.rendererPatchLoaded === true,
+      accountMenuInjected: router.accountMenuInjected === true,
+      accountMenuMounted: router.accountMenuMounted === true,
+      accountsLoaded: router.accountsLoaded === true,
+      accountCount: safeInteger(router.accountCount) ?? 0,
+      requestFailed: router.requestFailed === true,
+    };
+  }
+  const authState = raw.desktop_auth?.state;
+  debug.desktop_auth = { state: authState === "AUTHENTICATED" || authState === "AUTH_REQUIRED" || authState === "UNKNOWN" ? authState : "UNKNOWN" };
+  const runtime = raw.renderer_runtime;
+  if (runtime && typeof runtime === "object") {
+    debug.renderer_runtime = {
+      readyState: ["loading", "interactive", "complete", "unknown"].includes(runtime.readyState) ? runtime.readyState : "unknown",
+      rootPresent: runtime.rootPresent === true,
+      rootChildCount: safeInteger(runtime.rootChildCount) ?? 0,
+      bodyChildCount: safeInteger(runtime.bodyChildCount) ?? 0,
+      buttonCount: safeInteger(runtime.buttonCount) ?? 0,
+      visibleInteractiveCount: safeInteger(runtime.visibleInteractiveCount) ?? 0,
+      composerPresent: runtime.composerPresent === true,
+      profileControllerReady: runtime.profileControllerReady === true,
+      runtimeErrorCount: safeInteger(runtime.runtimeErrorCount) ?? 0,
+      lastSafeRuntimeError: safeRuntimeDiagnostic(runtime.lastSafeRuntimeError),
+    };
+  }
+  const controller = raw.profile_controller;
+  if (controller && typeof controller === "object") {
+    debug.profile_controller = {
+      ready: controller.ready === true,
+      activationAttempted: controller.activationAttempted === true,
+      activationSucceeded: controller.activationSucceeded === true,
+    };
+  }
+  if (Array.isArray(raw.runtime_errors)) {
+    debug.runtime_errors = raw.runtime_errors
+      .map(safeRuntimeDiagnostic)
+      .filter(Boolean)
+      .slice(-20);
+  }
+  return { state_status: status, debug };
+}
+
+function safeContentBounds(window) {
+  try {
+    const bounds = window.getContentBounds();
+    return safeRect(bounds);
+  } catch {
+    return safeBounds(window);
+  }
+}
+
+function stateFallback(status) {
+  return { state_status: status, debug: emptyStateDebug() };
+}
+
+async function captureStateInternal(action, delayMs, includeDebug) {
+  let window = mainWindow();
   if (!window) throw new Error("Codex Subscription Router has no main window");
   if (action !== null) await runAction(window, action, delayMs);
-  window = (await observationWindow()) ?? window;
-  const image = await window.webContents.capturePage();
+  window = mainWindow() ?? window;
+  const evaluated = await executeRendererBounded(window, STATE_CAPTURE_SCRIPT);
+  const snapshot = evaluated.ok ? safeStateSnapshot(evaluated.value) : stateFallback(evaluated.status);
   const result = {
-    bounds: window.getContentBounds(),
-    imageBase64: image.toPNG().toString("base64"),
+    bounds: safeContentBounds(window),
+    state_status: snapshot.state_status,
   };
   if (includeDebug) {
-    const routerFlags = await readRouterFlags(window);
-    const desktopAuth = await readDesktopAuth(window);
-    const rendererRuntime = await readRendererRuntime(window);
-    const profileController = await readProfileController(window);
-    const runtimeErrors = await readRuntimeDiagnostics(window);
-    result.debug = await window.webContents.executeJavaScript(`(() => {
-      const composer=document.querySelector('textarea[placeholder]')??document.querySelector('[contenteditable="true"]');
-      const describe=element=>{const rect=element.getBoundingClientRect(); const label=element.getAttribute('aria-label'); return {ariaLabel:label==='Open profile menu'||/^Show (combined )?profile stats$/.test(label||'')?label:null,disabled:element.disabled,type:element.type,rect:{x:rect.x,y:rect.y,width:rect.width,height:rect.height}}};
-      return {
-        readyState: document.readyState,
-        composer:composer?describe(composer):null,
-        buttons:[...document.querySelectorAll('button')].filter(button=>{const rect=button.getBoundingClientRect();return rect.width>0&&rect.height>0&&rect.bottom>innerHeight-180}).map(describe),
-      };
-    })()`);
+    result.debug = snapshot.debug;
     result.debug.url = safeUrl(window);
-    result.debug.router = routerFlags;
-    result.debug.desktop_auth = desktopAuth;
-    result.debug.renderer_runtime = rendererRuntime;
-    result.debug.profile_controller = profileController;
-    result.debug.runtime_errors = runtimeErrors;
     result.debug.termination = null;
-    result.debug.windows = await windowDiagnostics();
+    result.debug.windows = [
+      {
+        webContentsId: safeWebContentsId(window),
+        visible: safeVisible(window),
+        bounds: safeBounds(window),
+        isLoading: safeLoading(window),
+        url: safeUrl(window),
+        rendererPatchLoaded: result.debug.router.rendererPatchLoaded,
+        accountMenuInjected: result.debug.router.accountMenuInjected,
+        desktopAuth: result.debug.desktop_auth.state,
+      },
+    ];
     result.diagnostics = diagnostics.slice(-50);
   }
   return result;
+}
+
+async function captureState(action, delayMs, includeDebug) {
+  if (stateCaptureInFlight !== null) return stateFallback("STATE_BUSY");
+  const operation = captureStateInternal(action, delayMs, includeDebug);
+  stateCaptureInFlight = operation;
+  try {
+    return await operation;
+  } finally {
+    if (stateCaptureInFlight === operation) {
+      if (rendererEvaluationInFlight !== null) {
+        const pendingEvaluation = rendererEvaluationInFlight;
+        pendingEvaluation.then(() => {
+          if (stateCaptureInFlight === operation) stateCaptureInFlight = null;
+        });
+      } else {
+        stateCaptureInFlight = null;
+      }
+    }
+  }
+}
+
+async function captureScreenshot(action, delayMs, includeDebug) {
+  let window = mainWindow();
+  if (!window) throw new Error("Codex Subscription Router has no main window");
+  if (action !== null) await runAction(window, action, delayMs);
+  window = mainWindow() ?? window;
+  const captured = await boundedPromise(window.webContents.capturePage(), SCREENSHOT_TIMEOUT_MS);
+  if (!captured.ok) throw new Error("screenshot capture timed out");
+  const result = {
+    bounds: safeContentBounds(window),
+    imageBase64: captured.value.toPNG().toString("base64"),
+  };
+  if (includeDebug) {
+    const snapshot = await captureStateSnapshotForScreenshot(window);
+    result.debug = snapshot.debug;
+  }
+  return result;
+}
+
+async function captureStateSnapshotForScreenshot(window) {
+  const evaluated = await executeRendererBounded(window, STATE_CAPTURE_SCRIPT);
+  return evaluated.ok ? safeStateSnapshot(evaluated.value) : stateFallback(evaluated.status);
 }
 
 function readControlToken(muxHome) {
@@ -830,7 +1138,15 @@ function start() {
       return;
     }
     const url = new URL(request.url, `http://${HOST}:${PORT}`);
-    if (request.method !== "GET" || url.pathname !== "/v1/test/app-state") {
+    if (request.method === "GET" && url.pathname === "/v1/test/ping") {
+      // This endpoint must remain main-process-only. In particular, do not
+      // inspect BrowserWindow or touch renderer/credential state here.
+      writeJson(response, 200, { ok: true });
+      return;
+    }
+    const isAppState = request.method === "GET" && url.pathname === "/v1/test/app-state";
+    const isScreenshot = request.method === "GET" && url.pathname === "/v1/test/screenshot";
+    if (!isAppState && !isScreenshot) {
       writeJson(response, 404, { error: "not found" });
       return;
     }
@@ -886,7 +1202,13 @@ function start() {
         });
         return;
       }
-      writeJson(response, 200, await capture(action, delayMs, includeDebug));
+      writeJson(
+        response,
+        200,
+        isScreenshot
+          ? await captureScreenshot(action, delayMs, includeDebug)
+          : await captureState(action, delayMs, includeDebug),
+      );
     } catch {
       writeJson(response, 500, { error: "internal error" });
     }
