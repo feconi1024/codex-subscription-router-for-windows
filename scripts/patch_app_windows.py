@@ -55,7 +55,6 @@ try:
         source_access_probes,
         is_windowsapps_path,
         inventory_desktop_executables,
-        path_is_within,
         select_authoritative_desktop_candidate,
     )
     from .windows.fuses import FuseSnapshot
@@ -144,7 +143,6 @@ except ImportError:
         source_access_probes,
         is_windowsapps_path,
         inventory_desktop_executables,
-        path_is_within,
         select_authoritative_desktop_candidate,
     )
     from windows.fuses import FuseSnapshot
@@ -1312,6 +1310,31 @@ def _metadata(
     }
 
 
+def _same_router_destination_directory(
+    destination_parent: Path,
+    router_root: Path,
+    resolved_destination_parent: Path,
+    resolved_router_root: Path,
+) -> bool:
+    """Return whether the rollback directory and Router root are the same path."""
+
+    for left, right in (
+        (destination_parent, router_root),
+        (resolved_destination_parent, resolved_router_root),
+    ):
+        try:
+            if os.path.normcase(os.path.abspath(os.fspath(left))) == os.path.normcase(
+                os.path.abspath(os.fspath(right))
+            ):
+                return True
+        except (OSError, ValueError):
+            continue
+    try:
+        return os.path.samefile(destination_parent, router_root)
+    except (OSError, ValueError):
+        return False
+
+
 def _atomic_install(
     staged: Path,
     destination: Path,
@@ -1327,15 +1350,25 @@ def _atomic_install(
     except ValueError as error:
         raise RuntimeError(f"unknown Windows Desktop install policy: {policy}") from error
     if policy == InstallPolicy.EPHEMERAL_ROLLBACK:
-        destination_parent = destination.parent.resolve(strict=False)
         if router_root is None:
             raise RuntimeError("ephemeral rollback requires an explicit Router-owned root")
-        router_root = router_root.expanduser().resolve(strict=False)
+        # The destination must be an immediate child of the supplied Router-owned
+        # root. Compare the lexical paths first, then resolved paths and samefile;
+        # Windows runners can expose the same temporary directory through path
+        # aliases that make direct Path equality unreliable.
+        destination_parent = destination.parent.expanduser()
+        router_root = router_root.expanduser()
+        resolved_destination_parent = destination_parent.resolve(strict=False)
+        resolved_router_root = router_root.resolve(strict=False)
         if (
-            is_windowsapps_path(destination_parent)
-            or is_windowsapps_path(router_root)
-            or destination_parent != router_root
-            or not path_is_within(destination, router_root)
+            is_windowsapps_path(resolved_destination_parent)
+            or is_windowsapps_path(resolved_router_root)
+            or not _same_router_destination_directory(
+                destination_parent,
+                router_root,
+                resolved_destination_parent,
+                resolved_router_root,
+            )
         ):
             raise RuntimeError("ephemeral rollback must remain in the Router-owned destination directory")
     if destination.exists() and not force:
