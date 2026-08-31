@@ -30,7 +30,10 @@ try:
         enumerate_windows_for_processes,
         is_native_windows_executable,
         is_windowsapps_path,
+        inventory_processes_under_root,
         path_is_within,
+        quiesce_processes_under_root,
+        ROUTER_VALIDATION_SHELL_BUSY,
         select_authoritative_desktop_candidate,
         sha256_file,
         terminate_attributed_processes,
@@ -57,7 +60,10 @@ except ImportError:
         enumerate_windows_for_processes,
         is_native_windows_executable,
         is_windowsapps_path,
+        inventory_processes_under_root,
         path_is_within,
+        quiesce_processes_under_root,
+        ROUTER_VALIDATION_SHELL_BUSY,
         select_authoritative_desktop_candidate,
         sha256_file,
         terminate_attributed_processes,
@@ -795,12 +801,65 @@ def _http_json_get(
     return HttpProbeResult(status, body, HTTP_PROBE_NONE if parsed else HTTP_PROBE_OTHER_IO)
 
 
+def request_validation_shell_graceful_quit(
+    token: str,
+    *,
+    timeout_seconds: float = 2.0,
+) -> dict[str, object]:
+    """Request the test-only validation-shell shutdown action over the bridge."""
+
+    if re.fullmatch(r"[0-9a-f]{64}", token.strip(), re.IGNORECASE) is None:
+        return {
+            "attempted": False,
+            "accepted": False,
+            "supported": False,
+            "status_code": None,
+            "error_kind": HTTP_PROBE_OTHER_IO,
+        }
+    probe = _coerce_http_probe(
+        _http_json_get(
+            f"http://{UI_BRIDGE_HOST}:{UI_BRIDGE_PORT}/v1/test/app-state?"
+            "action=validation-shell-graceful-quit&debug=0&delayMs=0",
+            headers={"x-codex-mux-token": token.strip()},
+            timeout_seconds=timeout_seconds,
+        )
+    )
+    accepted = (
+        probe.status_code == 200
+        and isinstance(probe.body, dict)
+        and probe.body.get("ok") is True
+    )
+    return {
+        "attempted": True,
+        "accepted": accepted,
+        "supported": accepted,
+        "status_code": probe.status_code,
+        "error_kind": probe.error_kind,
+    }
+
+
 def _process_path_matches(row: RunningProcessCandidate, expected: Path) -> bool:
     return (
         row.executable is not None
         and row.executable.expanduser().resolve(strict=False)
         == expected.expanduser().resolve(strict=False)
     )
+
+
+def _terminate_path_owned_processes(
+    root: Path,
+    snapshot: Iterable[RunningProcessCandidate],
+) -> dict[str, object]:
+    """Use the existing race-tolerant terminator for exact root-owned rows."""
+
+    rows = inventory_processes_under_root(root, snapshot)
+    result = terminate_attributed_processes(
+        (row.pid for row in rows),
+        rows,
+        root,
+    )
+    result["owned_process_count"] = len(rows)
+    return result
 
 
 def _has_windows_short_path_component(path: Path) -> bool:
@@ -1749,6 +1808,7 @@ def run_patched_shell_smoke(
     process: subprocess.Popen[bytes] | None = None
     started = time.monotonic()
     temporary_log_path: Path | None = None
+    validation_shell_lifecycle: dict[str, object] = {}
     if user_data_override is not None:
         log_handle_fd, temporary_log_name = tempfile.mkstemp(prefix="codex-router-patched-shell-", suffix=".log")
         os.close(log_handle_fd)
@@ -2040,6 +2100,20 @@ def run_patched_shell_smoke(
             except (OSError, subprocess.SubprocessError) as error:
                 cleanup.setdefault("errors", []).append(f"root cleanup: {error}")
 
+        # PID-tree attribution is useful for observations, but it is not the
+        # cleanup postcondition. Sweep the exact Router installation root so
+        # late-spawned and reparented Electron children cannot survive under a
+        # false cleanup PASS.
+        post_smoke_lifecycle = quiesce_processes_under_root(
+            root,
+            initial_snapshot=final_snapshot,
+            snapshot_provider=discover_process_snapshot_native,
+            termination_fn=_terminate_path_owned_processes,
+            sleep_fn=time.sleep,
+        )
+        validation_shell_lifecycle = {"post_smoke": post_smoke_lifecycle}
+        cleanup["validation_shell_lifecycle"] = validation_shell_lifecycle
+
         if authentication_preparation and graceful_shutdown_attempted and not graceful_shutdown_succeeded:
             graceful_shutdown_status = "FORCED_CLEANUP" if harness_requested_termination else "FAILED"
 
@@ -2126,6 +2200,10 @@ def run_patched_shell_smoke(
         or argument.casefold().startswith("--disable-gpu-sandbox=")
         for argument in command
     )
+    post_cleanup_pass = (
+        isinstance(validation_shell_lifecycle.get("post_smoke"), dict)
+        and validation_shell_lifecycle["post_smoke"].get("quiescent") is True
+    )
     production_gate = build_production_gate(
         launcher_running=launch_error is None and launcher_observed_running,
         chatgpt_classification=classification.get("status") == PASS,
@@ -2135,15 +2213,16 @@ def run_patched_shell_smoke(
         mux_process=mux_process_observed,
         real_codex_process=real_codex_process_observed,
         production_sandbox=not production_flags_present,
-        cleanup=not cleanup.get("errors"),
+        cleanup=post_cleanup_pass,
     )
     required_pass = bool(production_gate["pass"])
     if focused_bridge_diagnostic_only:
-        required_pass = focused_bridge["pass"] is True and not cleanup.get("errors")
+        required_pass = focused_bridge["pass"] is True and post_cleanup_pass and not cleanup.get("errors")
     if authentication_preparation:
         required_pass = (
             authentication_confirmed
             and graceful_shutdown_succeeded
+            and post_cleanup_pass
             and not cleanup.get("errors")
         )
     if development_only and not required_pass:
@@ -2163,6 +2242,8 @@ def run_patched_shell_smoke(
         if required_pass and development_only
         else PATCHED_SHELL_PASS
         if required_pass
+        else ROUTER_VALIDATION_SHELL_BUSY
+        if not post_cleanup_pass
         else PATCHED_SHELL_BLOCKED
     )
     return {
@@ -2182,6 +2263,8 @@ def run_patched_shell_smoke(
             if required_pass and development_only
             else "patched Router launcher, ChatGPT UI bridge, mux health, account menu, and mux-to-real-codex chain passed"
             if required_pass
+            else "Router-owned processes remained under the validation shell after bounded cleanup"
+            if not post_cleanup_pass
             else "patched Router shell did not satisfy every bounded production-path gate"
         ),
         "installation_root": str(root),
@@ -2269,6 +2352,7 @@ def run_patched_shell_smoke(
         "final_processes": final_processes,
         "final_windows": final_windows,
         "cleanup": cleanup,
+        "validation_shell_lifecycle": validation_shell_lifecycle,
         "log_tail": log_text,
         "manual_operation_required": bool(cleanup.get("errors")) or not required_pass or development_only,
     }

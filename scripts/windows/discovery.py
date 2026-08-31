@@ -11,10 +11,11 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 
 WINDOWS_NATIVE_MACHINES = {0x014C, 0x8664, 0xAA64}
@@ -31,6 +32,27 @@ DESKTOP_EXECUTABLE_NAMES = ("ChatGPT.exe", "Codex.exe")
 OPENAI_AUMID_PATTERNS = ("OpenAI.Codex_*!App", "OpenAI.ChatGPT_*!App")
 EXACT_26_820_PACKAGE_NAME = "OpenAI.Codex"
 EXACT_26_820_PACKAGE_VERSION = "26.820.7780.0"
+ROUTER_VALIDATION_SHELL_BUSY = "ROUTER_VALIDATION_SHELL_BUSY"
+ROUTER_VALIDATION_SHELL_RENAME_BLOCKED = "ROUTER_VALIDATION_SHELL_RENAME_BLOCKED"
+VALIDATION_SHELL_QUIESCENT = "QUIESCENT"
+VALIDATION_SHELL_QUIESCENCE_INTERVAL_SECONDS = 0.25
+VALIDATION_SHELL_QUIESCENCE_TIMEOUT_SECONDS = 5.0
+
+
+class ValidationShellBusyError(RuntimeError):
+    """An exact Router-owned process prevented validation-shell replacement."""
+
+    def __init__(self, message: str, *, evidence: dict[str, object] | None = None) -> None:
+        super().__init__(message)
+        self.evidence = evidence or {}
+
+
+class ValidationShellRenameBlockedError(RuntimeError):
+    """The validation shell rename failed without live owned-process evidence."""
+
+    def __init__(self, message: str, *, evidence: dict[str, object] | None = None) -> None:
+        super().__init__(message)
+        self.evidence = evidence or {}
 
 
 def _is_known_aumid(value: str) -> bool:
@@ -784,6 +806,192 @@ def terminate_attributed_processes(
     }
 
 
+def _process_inventory_evidence(
+    root: Path,
+    rows: Iterable[RunningProcessCandidate],
+) -> dict[str, object]:
+    """Return bounded evidence for processes proven to live under one root."""
+
+    processes: list[dict[str, object]] = []
+    for row in rows:
+        item: dict[str, object] = {"pid": row.pid, "name": Path(row.name).name[:100]}
+        if row.executable is not None:
+            item["executable_basename"] = row.executable.name[:100]
+        processes.append(item)
+    return {
+        "root": str(root),
+        "owned_process_count": len(processes),
+        "processes": processes[:50],
+    }
+
+
+def terminate_processes_under_root(
+    root: Path,
+    snapshot: Iterable[RunningProcessCandidate] | None = None,
+) -> dict[str, object]:
+    """Terminate only processes whose readable executable is inside ``root``."""
+
+    rows = inventory_processes_under_root(root, snapshot)
+    result = terminate_attributed_processes(
+        (row.pid for row in rows),
+        rows,
+        root,
+    )
+    result["owned_process_count"] = len(rows)
+    return result
+
+
+def quiesce_processes_under_root(
+    root: Path,
+    *,
+    graceful_quit: Callable[[], object] | None = None,
+    timeout_seconds: float = VALIDATION_SHELL_QUIESCENCE_TIMEOUT_SECONDS,
+    stable_interval_seconds: float = VALIDATION_SHELL_QUIESCENCE_INTERVAL_SECONDS,
+    initial_snapshot: Iterable[RunningProcessCandidate] | None = None,
+    snapshot_provider: Callable[[], Iterable[RunningProcessCandidate]] | None = None,
+    termination_fn: Callable[[Path, Iterable[RunningProcessCandidate]], dict[str, object]] | None = None,
+    sleep_fn: Callable[[float], object] = time.sleep,
+    monotonic_fn: Callable[[], float] = time.monotonic,
+) -> dict[str, object]:
+    """Self-heal and prove a bounded two-scan process quiescence window.
+
+    Ownership is established only from readable executable paths. Parentage,
+    process names, and the process that launched the shell are intentionally
+    not used as ownership evidence.
+    """
+
+    root = Path(root).expanduser().resolve(strict=False)
+    provider = snapshot_provider or discover_process_snapshot_native
+    terminator = termination_fn or terminate_processes_under_root
+    interval = max(0.0, float(stable_interval_seconds))
+    timeout = max(0.0, float(timeout_seconds))
+    # The scan bound keeps the helper deterministic even when a test double or
+    # an unavailable sleep implementation does not advance wall-clock time.
+    scan_interval = max(interval, 0.001)
+    max_scans = max(2, int(timeout / scan_interval) + 2)
+    deadline = monotonic_fn() + timeout
+
+    inventory_error_count = 0
+    scans = 0
+    clean_scans = 0
+    initial_rows: tuple[RunningProcessCandidate, ...] = ()
+    remaining_rows: tuple[RunningProcessCandidate, ...] = ()
+    graceful_quit_attempted = False
+    graceful_quit_accepted = False
+    graceful_quit_response: dict[str, object] = {}
+    force_requested: set[int] = set()
+    force_terminated: set[int] = set()
+    termination_error_count = 0
+    cleanup_attempted = False
+
+    def read_owned_rows(
+        provided_snapshot: Iterable[RunningProcessCandidate] | None = None,
+    ) -> tuple[RunningProcessCandidate, ...] | None:
+        nonlocal inventory_error_count
+        try:
+            snapshot = provided_snapshot if provided_snapshot is not None else provider()
+            return inventory_processes_under_root(root, snapshot)
+        except Exception:
+            inventory_error_count += 1
+            return None
+
+    first_rows = read_owned_rows(initial_snapshot)
+    if first_rows is None:
+        initial_rows = ()
+        remaining_rows = ()
+    else:
+        initial_rows = first_rows
+        remaining_rows = first_rows
+        cleanup_attempted = bool(first_rows)
+        if first_rows and graceful_quit is not None:
+            try:
+                raw_response = graceful_quit()
+            except Exception:
+                raw_response = {"attempted": True, "accepted": False, "error_kind": "OTHER_IO"}
+            graceful_quit_attempted = (
+                raw_response.get("attempted") is True
+                if isinstance(raw_response, dict) and isinstance(raw_response.get("attempted"), bool)
+                else True
+            )
+            if isinstance(raw_response, dict):
+                graceful_quit_accepted = raw_response.get("accepted") is True
+                for key in ("status_code", "error_kind", "supported"):
+                    value = raw_response.get(key)
+                    if type(value) is int and key == "status_code" and 100 <= value <= 599:
+                        graceful_quit_response[key] = value
+                    elif isinstance(value, str) and key == "error_kind" and value in {
+                        "NONE",
+                        "TIMEOUT",
+                        "CONNECTION_REFUSED",
+                        "CONNECTION_RESET",
+                        "HTTP_ERROR",
+                        "OTHER_IO",
+                    }:
+                        graceful_quit_response[key] = value
+                    elif isinstance(value, bool) and key == "supported":
+                        graceful_quit_response[key] = value
+            if interval > 0 and monotonic_fn() < deadline:
+                sleep_fn(min(interval, max(0.0, deadline - monotonic_fn())))
+
+    while scans < max_scans:
+        rows = read_owned_rows()
+        scans += 1
+        if rows is None:
+            clean_scans = 0
+            break
+        remaining_rows = rows
+        if rows:
+            cleanup_attempted = True
+            clean_scans = 0
+            try:
+                termination = terminator(root, rows)
+            except Exception:
+                termination = {"requested": [], "terminated": [], "errors": ["termination unavailable"]}
+            requested = termination.get("requested") if isinstance(termination, dict) else None
+            terminated = termination.get("terminated") if isinstance(termination, dict) else None
+            errors = termination.get("errors") if isinstance(termination, dict) else None
+            if isinstance(requested, list):
+                force_requested.update(pid for pid in requested if type(pid) is int and pid >= 0)
+            if isinstance(terminated, list):
+                force_terminated.update(pid for pid in terminated if type(pid) is int and pid >= 0)
+            if isinstance(errors, list):
+                termination_error_count += len([error for error in errors if isinstance(error, str)])
+        else:
+            clean_scans += 1
+            if clean_scans >= 2 and inventory_error_count == 0:
+                break
+
+        if scans >= 2 and monotonic_fn() >= deadline:
+            break
+        if scans >= max_scans:
+            break
+        if interval > 0:
+            remaining = max(0.0, deadline - monotonic_fn())
+            if remaining > 0:
+                sleep_fn(min(interval, remaining))
+
+    quiescent = not remaining_rows and clean_scans >= 2 and inventory_error_count == 0
+    lifecycle = {
+        "status": VALIDATION_SHELL_QUIESCENT if quiescent else ROUTER_VALIDATION_SHELL_BUSY,
+        "root": str(root),
+        "initial_count": len(initial_rows),
+        "initial_processes": _process_inventory_evidence(root, initial_rows)["processes"],
+        "cleanup_attempted": cleanup_attempted,
+        "graceful_quit_attempted": graceful_quit_attempted,
+        "graceful_quit_accepted": graceful_quit_accepted,
+        "graceful_quit_response": graceful_quit_response,
+        "force_termination_requested": len(force_requested),
+        "force_termination_terminated": len(force_terminated),
+        "termination_error_count": termination_error_count,
+        "remaining_count": len(remaining_rows),
+        "remaining_processes": _process_inventory_evidence(root, remaining_rows)["processes"],
+        "quiescent": quiescent,
+        "scans": scans,
+        "inventory_error_count": inventory_error_count,
+    }
+    return lifecycle
+
+
 def _rows_to_process_candidates(parsed: Any) -> list[RunningProcessCandidate]:
     rows = parsed if isinstance(parsed, list) else [parsed]
     candidates: list[RunningProcessCandidate] = []
@@ -859,11 +1067,49 @@ def is_windowsapps_path(path: Path) -> bool:
 def path_is_within(path: Path, root: Path) -> bool:
     """Compare Windows paths without trusting case-sensitive string equality."""
     try:
-        candidate = os.path.abspath(os.fspath(path))
-        parent = os.path.abspath(os.fspath(root))
+        # ``realpath`` canonicalizes existing junction/symlink components while
+        # ``commonpath`` preserves a component boundary (so ``root-evil`` is
+        # not treated as a child of ``root``).  Do not replace this with a
+        # string-prefix comparison.
+        candidate = os.path.realpath(os.path.abspath(os.fspath(path)))
+        parent = os.path.realpath(os.path.abspath(os.fspath(root)))
         return os.path.normcase(os.path.commonpath((candidate, parent))) == os.path.normcase(parent)
     except (OSError, ValueError):
         return False
+
+
+def inventory_processes_under_root(
+    root: Path,
+    snapshot: Iterable[RunningProcessCandidate] | None = None,
+) -> tuple[RunningProcessCandidate, ...]:
+    """Inventory processes owned by a Router root using executable paths only."""
+
+    resolved_root = Path(root).expanduser().resolve(strict=False)
+    rows = snapshot if snapshot is not None else discover_process_snapshot_native()
+    return tuple(
+        row
+        for row in rows
+        if row.executable is not None and path_is_within(row.executable, resolved_root)
+    )
+
+
+def router_owned_root(local_appdata: Path | None = None) -> Path:
+    """Return the root reserved for Router-generated Windows artifacts."""
+
+    if local_appdata is None:
+        raw_local_appdata = os.environ.get("LOCALAPPDATA")
+        local_appdata = (
+            Path(raw_local_appdata).expanduser()
+            if raw_local_appdata
+            else Path.home() / "AppData" / "Local"
+        )
+    return (Path(local_appdata).expanduser() / "Codex Subscription Router").resolve(strict=False)
+
+
+def is_router_owned_path(path: Path, local_appdata: Path | None = None) -> bool:
+    """Return whether a path belongs to the Router-owned artifact boundary."""
+
+    return path_is_within(path, router_owned_root(local_appdata))
 
 
 def read_pe_machine(path: Path) -> int | None:
@@ -1396,7 +1642,14 @@ def _source_layout(root: Path, package: PackageMetadata, source_kind: str) -> De
 def _source_from_process_candidates(
     candidates: Iterable[RunningProcessCandidate],
 ) -> DesktopSource | None:
-    selected = select_running_process(candidates)
+    # Router-generated shells are useful to lifecycle diagnostics but can
+    # never become the official Desktop source used for review or patching.
+    source_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.executable is None or not is_router_owned_path(candidate.executable)
+    ]
+    selected = select_running_process(source_candidates)
     if selected is None or selected.executable is None:
         return None
     try:

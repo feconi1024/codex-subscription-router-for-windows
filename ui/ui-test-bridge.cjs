@@ -896,6 +896,13 @@ async function requestGracefulDesktopQuit() {
   return { ok: true, status: "QUIT_REQUESTED" };
 }
 
+function requestValidationShellGracefulQuit() {
+  // This action is available only because start() is gated by
+  // CODEX_MUX_UI_TESTS. It deliberately avoids renderer/authentication state
+  // so stale validation shells can be retired before the next atomic rebuild.
+  return { ok: true, status: "VALIDATION_SHELL_QUIT_REQUESTED" };
+}
+
 function emptyStateDebug() {
   return {
     readyState: "unknown",
@@ -1168,13 +1175,14 @@ function start() {
 	  action !== "appshots-open" &&
 	  action !== "appshots-hotkey" &&
 	  action !== "appshots-settings-trigger" &&
-	  action !== "computer-use-details" &&
-	  action !== "submit-computer-use" &&
+      action !== "computer-use-details" &&
+      action !== "submit-computer-use" &&
+      action !== "validation-shell-graceful-quit" &&
       action !== "desktop-auth-graceful-quit" &&
       action !== "quota-thread" &&
       action !== "first-thread" &&
       action !== "back-to-app" &&
-      action !== "submit-quota"
+	  action !== "submit-quota"
     ) {
       writeJson(response, 400, { error: "unsupported action" });
       return;
@@ -1186,6 +1194,19 @@ function start() {
     }
     const includeDebug = url.searchParams.get("debug") === "1";
     try {
+      if (action === "validation-shell-graceful-quit") {
+        const outcome = requestValidationShellGracefulQuit();
+        writeJson(response, 200, outcome);
+        // Let the HTTP response flush before requesting Electron's normal
+        // shutdown path. This is a test-only lifecycle action, never a
+        // process kill and never an authentication-dependent operation.
+        setImmediate(() => {
+          try {
+            app.quit();
+          } catch {}
+        });
+        return;
+      }
       if (action === "desktop-auth-graceful-quit") {
         const outcome = await requestGracefulDesktopQuit();
         if (!outcome.ok) {

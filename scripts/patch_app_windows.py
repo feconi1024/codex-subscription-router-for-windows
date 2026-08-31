@@ -55,8 +55,14 @@ try:
         sha256_file,
         source_access_probes,
         is_windowsapps_path,
+        inventory_processes_under_root,
         inventory_desktop_executables,
         select_authoritative_desktop_candidate,
+        ValidationShellBusyError,
+        ValidationShellRenameBlockedError,
+        _process_inventory_evidence,
+        ROUTER_VALIDATION_SHELL_BUSY,
+        ROUTER_VALIDATION_SHELL_RENAME_BLOCKED,
     )
     from .windows.fuses import FuseSnapshot
     from .windows.acl import prepare_windows_electron_payload_acl, validate_router_app_root
@@ -144,8 +150,14 @@ except ImportError:
         sha256_file,
         source_access_probes,
         is_windowsapps_path,
+        inventory_processes_under_root,
         inventory_desktop_executables,
         select_authoritative_desktop_candidate,
+        ValidationShellBusyError,
+        ValidationShellRenameBlockedError,
+        _process_inventory_evidence,
+        ROUTER_VALIDATION_SHELL_BUSY,
+        ROUTER_VALIDATION_SHELL_RENAME_BLOCKED,
     )
     from windows.fuses import FuseSnapshot
     from windows.acl import prepare_windows_electron_payload_acl, validate_router_app_root
@@ -1504,6 +1516,22 @@ def _same_router_destination_directory(
         return False
 
 
+def _is_access_denied(error: OSError) -> bool:
+    return isinstance(error, PermissionError) or getattr(error, "winerror", None) == 5
+
+
+def _assert_ephemeral_destination_quiescent(destination: Path) -> None:
+    """Refuse the rollback rename while an exact owned process is alive."""
+
+    owned = inventory_processes_under_root(destination)
+    if owned:
+        evidence = _process_inventory_evidence(destination, owned)
+        raise ValidationShellBusyError(
+            f"{ROUTER_VALIDATION_SHELL_BUSY}: the validation shell destination is still in use",
+            evidence=evidence,
+        )
+
+
 def _atomic_install(
     staged: Path,
     destination: Path,
@@ -1566,7 +1594,27 @@ def _atomic_install(
                     break
             if rollback is None:
                 raise RuntimeError("could not allocate a unique ephemeral rollback path")
-            destination.rename(rollback)
+            # This is intentionally immediately before the destructive half of
+            # the atomic replacement. The earlier validator gate prevents the
+            # common stale-process case; this assertion closes the late-spawn
+            # race without weakening rollback semantics.
+            _assert_ephemeral_destination_quiescent(destination)
+            try:
+                destination.rename(rollback)
+            except OSError as rename_error:
+                if _is_access_denied(rename_error):
+                    owned = inventory_processes_under_root(destination)
+                    evidence = _process_inventory_evidence(destination, owned)
+                    if owned:
+                        raise ValidationShellBusyError(
+                            f"{ROUTER_VALIDATION_SHELL_BUSY}: the validation shell destination remains in use",
+                            evidence=evidence,
+                        ) from rename_error
+                    raise ValidationShellRenameBlockedError(
+                        f"{ROUTER_VALIDATION_SHELL_RENAME_BLOCKED}: the validation shell destination could not be renamed",
+                        evidence=evidence,
+                    ) from rename_error
+                raise
     try:
         staged.rename(destination)
     except OSError as install_error:

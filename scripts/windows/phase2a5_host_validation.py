@@ -22,6 +22,11 @@ try:
         discover_real_codex,
         format_source_diagnostics,
         inventory_desktop_executables,
+        quiesce_processes_under_root,
+        ROUTER_VALIDATION_SHELL_BUSY,
+        ROUTER_VALIDATION_SHELL_RENAME_BLOCKED,
+        ValidationShellBusyError,
+        ValidationShellRenameBlockedError,
         sha256_file,
     )
     from .host_context import detect_windows_host_context, run_localappdata_canary
@@ -51,6 +56,7 @@ try:
         final_layout_smoke_root,
         run_patched_shell_smoke,
         run_phase2a5_sandbox_validation,
+        request_validation_shell_graceful_quit,
         validation_profile_layout,
     )
     from .integrity import asar_header_digest
@@ -68,6 +74,11 @@ except ImportError:
         discover_real_codex,
         format_source_diagnostics,
         inventory_desktop_executables,
+        quiesce_processes_under_root,
+        ROUTER_VALIDATION_SHELL_BUSY,
+        ROUTER_VALIDATION_SHELL_RENAME_BLOCKED,
+        ValidationShellBusyError,
+        ValidationShellRenameBlockedError,
         sha256_file,
     )
     from windows.host_context import detect_windows_host_context, run_localappdata_canary
@@ -97,6 +108,7 @@ except ImportError:
         final_layout_smoke_root,
         run_patched_shell_smoke,
         run_phase2a5_sandbox_validation,
+        request_validation_shell_graceful_quit,
         validation_profile_layout,
     )
     from windows.integrity import asar_header_digest
@@ -904,6 +916,90 @@ def _public_termination(value: object) -> dict[str, object]:
     return output
 
 
+_PUBLIC_VALIDATION_SHELL_LIFECYCLE_STATUSES = {
+    "QUIESCENT",
+    ROUTER_VALIDATION_SHELL_BUSY,
+    ROUTER_VALIDATION_SHELL_RENAME_BLOCKED,
+}
+
+
+def _public_validation_shell_lifecycle(value: object) -> dict[str, object]:
+    """Expose only bounded root-owned process lifecycle evidence."""
+
+    if not isinstance(value, dict):
+        return {}
+
+    def safe_stage(stage: object) -> dict[str, object]:
+        if not isinstance(stage, dict):
+            return {}
+        output: dict[str, object] = {}
+        status = stage.get("status")
+        if isinstance(status, str) and status in _PUBLIC_VALIDATION_SHELL_LIFECYCLE_STATUSES:
+            output["status"] = status
+        for key in (
+            "initial_count",
+            "force_termination_requested",
+            "force_termination_terminated",
+            "remaining_count",
+            "termination_error_count",
+            "scans",
+            "inventory_error_count",
+        ):
+            item = stage.get(key)
+            if type(item) is int and item >= 0:
+                output[key] = item
+        for key in (
+            "cleanup_attempted",
+            "graceful_quit_attempted",
+            "graceful_quit_accepted",
+            "quiescent",
+        ):
+            if isinstance(stage.get(key), bool):
+                output[key] = stage[key]
+        root = stage.get("root")
+        if isinstance(root, str) and len(root) <= 1000:
+            output["root"] = root
+        response = stage.get("graceful_quit_response")
+        if isinstance(response, dict):
+            safe_response: dict[str, object] = {}
+            status_code = response.get("status_code")
+            if type(status_code) is int and 100 <= status_code <= 599:
+                safe_response["status_code"] = status_code
+            error_kind = response.get("error_kind")
+            if error_kind in _PUBLIC_HTTP_ERROR_KINDS:
+                safe_response["error_kind"] = error_kind
+            if isinstance(response.get("supported"), bool):
+                safe_response["supported"] = response["supported"]
+            if safe_response:
+                output["graceful_quit_response"] = safe_response
+        for key in ("initial_processes", "remaining_processes"):
+            processes = stage.get(key)
+            if not isinstance(processes, list):
+                continue
+            safe_processes: list[dict[str, object]] = []
+            for process in processes[:50]:
+                if not isinstance(process, dict):
+                    continue
+                safe_process: dict[str, object] = {}
+                pid = process.get("pid")
+                if type(pid) is int and pid >= 0:
+                    safe_process["pid"] = pid
+                for process_key in ("name", "executable_basename"):
+                    name = process.get(process_key)
+                    if isinstance(name, str) and len(name) <= 100:
+                        safe_process[process_key] = name
+                if safe_process:
+                    safe_processes.append(safe_process)
+            output[key] = safe_processes
+        return output
+
+    return {
+        key: safe_stage(value[key])
+        for key in ("pre_rebuild", "post_smoke", "atomic_install")
+        if key in value and safe_stage(value[key])
+    }
+
+
 def _public_cleanup(value: object) -> dict[str, object]:
     """Keep cleanup evidence useful without exporting process or token payloads."""
 
@@ -941,6 +1037,9 @@ def _public_cleanup(value: object) -> dict[str, object]:
             and isinstance(item.get("name"), str)
             and item.get("cleanup_required") is False
         ][:50]
+    lifecycle = _public_validation_shell_lifecycle(value.get("validation_shell_lifecycle"))
+    if lifecycle:
+        output["validation_shell_lifecycle"] = lifecycle
     return output
 
 
@@ -1050,6 +1149,7 @@ def _public_probe(result: object) -> object:
         "mirror_plan",
         "backup_inventory",
         "validation_orphans",
+        "validation_shell_lifecycle",
     )
     output = {key: result[key] for key in allowed if key in result}
     if "focused_bridge_diagnostic_only" in result:
@@ -1066,6 +1166,10 @@ def _public_probe(result: object) -> object:
         output["backup_inventory"] = _public_backup_inventory(result.get("backup_inventory"))
     if "validation_orphans" in result:
         output["validation_orphans"] = _public_validation_orphans(result.get("validation_orphans"))
+    if "validation_shell_lifecycle" in result:
+        output["validation_shell_lifecycle"] = _public_validation_shell_lifecycle(
+            result.get("validation_shell_lifecycle")
+        )
     if "desktop_auth" in result:
         output["desktop_auth"] = _public_desktop_auth(result.get("desktop_auth"))
     if "renderer_runtime" in result:
@@ -1363,6 +1467,31 @@ def _persistent_profile_state_is_intact(layout: object) -> bool:
         return False
 
 
+def _request_validation_shell_quit(profile_layout: object) -> dict[str, object]:
+    """Use the test-only bridge action when the persistent token is readable."""
+
+    mux_home = getattr(profile_layout, "mux_home", None)
+    if not isinstance(mux_home, Path):
+        return {
+            "attempted": False,
+            "accepted": False,
+            "supported": False,
+            "status_code": None,
+            "error_kind": "OTHER_IO",
+        }
+    try:
+        token = (mux_home / "control-token").read_text(encoding="utf-8").strip()
+    except OSError:
+        return {
+            "attempted": False,
+            "accepted": False,
+            "supported": False,
+            "status_code": None,
+            "error_kind": "OTHER_IO",
+        }
+    return request_validation_shell_graceful_quit(token)
+
+
 def _run_external_patched_shell(
     source: Any,
     selected_real: RealCodexCandidate,
@@ -1423,40 +1552,94 @@ def _run_external_patched_shell(
                 }
             else:
                 destination = profile_layout.patched_shell if profile_layout is not None else root / "patched-shell"
-                metadata = build_windows_desktop(
-                    source,
-                    selected_real,
+                pre_rebuild_lifecycle = quiesce_processes_under_root(
                     destination,
-                    force=persistent,
-                    allow_untested_source=False,
-                    reviewed_source=reviewed_source,
-                    payload_acl_strategy=acl_strategy,
-                    mux_home_override=(profile_layout.mux_home if profile_layout is not None else None),
-                    validation_profile_local_appdata=persistent_local_appdata,
+                    graceful_quit=(
+                        (lambda: _request_validation_shell_quit(profile_layout))
+                        if profile_layout is not None
+                        else None
+                    ),
                 )
-                result = run_patched_shell_smoke(
-                    destination,
-                    selected_real,
-                    timeout_seconds=timeout_seconds,
-                    disposable_root=not persistent,
-                    user_data_override=(profile_layout.user_data if profile_layout is not None else None),
-                    codex_home_override=(profile_layout.codex_home if profile_layout is not None else None),
-                    mux_home_override=(profile_layout.mux_home if profile_layout is not None else None),
-                    preserve_user_data=persistent,
-                    auth_required=persistent,
-                    validation_profile_root_override=root if persistent else None,
-                    validation_profile_local_appdata=persistent_local_appdata,
-                )
-                result["build_metadata_summary"] = {
-                    "destination": str(destination),
-                    "desktop_launch_executable": metadata.get("desktop_launch_executable"),
-                    "payload_acl_strategy": metadata.get("payload_acl_strategy"),
-                    "source_app_asar_sha256": metadata.get("source_app_asar_sha256"),
-                    "renderer_syntax_validation": metadata.get("renderer_syntax_validation"),
-                    "storage_preflight": metadata.get("storage_preflight"),
-                    "install_policy": metadata.get("install_policy"),
-                    "mirror_plan": metadata.get("mirror_plan"),
+                if not pre_rebuild_lifecycle.get("quiescent"):
+                    result = {
+                        "status": ROUTER_VALIDATION_SHELL_BUSY,
+                        "reason": (
+                            "Router-owned validation-shell processes remained after bounded pre-rebuild cleanup"
+                        ),
+                        "validation_shell_lifecycle": {"pre_rebuild": pre_rebuild_lifecycle},
+                        "manual_operation_required": True,
+                    }
+                else:
+                    metadata = build_windows_desktop(
+                        source,
+                        selected_real,
+                        destination,
+                        force=persistent,
+                        allow_untested_source=False,
+                        reviewed_source=reviewed_source,
+                        payload_acl_strategy=acl_strategy,
+                        mux_home_override=(profile_layout.mux_home if profile_layout is not None else None),
+                        validation_profile_local_appdata=persistent_local_appdata,
+                    )
+                    result = run_patched_shell_smoke(
+                        destination,
+                        selected_real,
+                        timeout_seconds=timeout_seconds,
+                        disposable_root=not persistent,
+                        user_data_override=(profile_layout.user_data if profile_layout is not None else None),
+                        codex_home_override=(profile_layout.codex_home if profile_layout is not None else None),
+                        mux_home_override=(profile_layout.mux_home if profile_layout is not None else None),
+                        preserve_user_data=persistent,
+                        auth_required=persistent,
+                        validation_profile_root_override=root if persistent else None,
+                        validation_profile_local_appdata=persistent_local_appdata,
+                    )
+                    existing_lifecycle = result.get("validation_shell_lifecycle")
+                    post_lifecycle = (
+                        existing_lifecycle
+                        if isinstance(existing_lifecycle, dict)
+                        else {}
+                    )
+                    result["validation_shell_lifecycle"] = {
+                        "pre_rebuild": pre_rebuild_lifecycle,
+                        **post_lifecycle,
+                    }
+                    result["build_metadata_summary"] = {
+                        "destination": str(destination),
+                        "desktop_launch_executable": metadata.get("desktop_launch_executable"),
+                        "payload_acl_strategy": metadata.get("payload_acl_strategy"),
+                        "source_app_asar_sha256": metadata.get("source_app_asar_sha256"),
+                        "renderer_syntax_validation": metadata.get("renderer_syntax_validation"),
+                        "storage_preflight": metadata.get("storage_preflight"),
+                        "install_policy": metadata.get("install_policy"),
+                        "mirror_plan": metadata.get("mirror_plan"),
+                    }
+    except ValidationShellBusyError as error:
+        result = {
+            "status": ROUTER_VALIDATION_SHELL_BUSY,
+            "reason": _safe_error(error),
+            "validation_shell_lifecycle": {
+                "atomic_install": {
+                    **getattr(error, "evidence", {}),
+                    "status": ROUTER_VALIDATION_SHELL_BUSY,
+                    "quiescent": False,
                 }
+            },
+            "manual_operation_required": True,
+        }
+    except ValidationShellRenameBlockedError as error:
+        result = {
+            "status": ROUTER_VALIDATION_SHELL_RENAME_BLOCKED,
+            "reason": _safe_error(error),
+            "validation_shell_lifecycle": {
+                "atomic_install": {
+                    **getattr(error, "evidence", {}),
+                    "status": ROUTER_VALIDATION_SHELL_RENAME_BLOCKED,
+                    "quiescent": False,
+                }
+            },
+            "manual_operation_required": True,
+        }
     except StorageBlockedError as error:
         result = {
             "status": PHASE2A5_STORAGE_BLOCKED,
@@ -1878,6 +2061,7 @@ def _artifact_result(result: dict[str, object]) -> dict[str, object]:
         "sandbox_validation",
         "acl_strategy_verdict",
         "patched_shell",
+        "validation_shell_lifecycle",
         "validation_profile",
         "storage_preflight",
         "backup_inventory",
@@ -1897,6 +2081,8 @@ def _artifact_result(result: dict[str, object]) -> dict[str, object]:
             output[key] = _public_sandbox(result[key])
         elif key == "patched_shell":
             output[key] = _public_probe(result[key])
+        elif key == "validation_shell_lifecycle":
+            output[key] = _public_validation_shell_lifecycle(result[key])
         elif key == "validation_profile":
             output[key] = _public_validation_profile(result[key])
         elif key == "auth_boots":
@@ -1964,6 +2150,7 @@ def run_phase2a5_host_validation(
         "sandbox_validation": None,
         "acl_strategy_verdict": "UNRESOLVED",
         "patched_shell": None,
+        "validation_shell_lifecycle": None,
         "mux_chain": None,
         "ci": {
             "status": "NOT RUN",
@@ -2124,6 +2311,8 @@ def run_phase2a5_host_validation(
                         local_appdata=local_appdata,
                     )
                     result["patched_shell"] = patched
+                    if isinstance(patched.get("validation_shell_lifecycle"), dict):
+                        result["validation_shell_lifecycle"] = patched["validation_shell_lifecycle"]
                     result["mux_chain"] = {
                         "launcher": "Codex Subscription Router.exe",
                         "desktop": "app\\ChatGPT.exe",
@@ -2181,6 +2370,13 @@ def run_phase2a5_host_validation(
                     elif patched.get("status") == PHASE2A5_PATCHED_SHELL_TOOLCHAIN_BLOCKED:
                         result["status"] = PHASE2A5_PATCHED_SHELL_TOOLCHAIN_BLOCKED
                         result["reason"] = patched.get("reason")
+                    elif patched.get("status") in {
+                        ROUTER_VALIDATION_SHELL_BUSY,
+                        ROUTER_VALIDATION_SHELL_RENAME_BLOCKED,
+                    }:
+                        result["status"] = patched.get("status")
+                        result["reason"] = patched.get("reason")
+                        result["manual_operation_required"] = patched.get("status") == ROUTER_VALIDATION_SHELL_BUSY
                     else:
                         result["status"] = PHASE2A5_PATCHED_SHELL_BLOCKED
                         result["reason"] = "the external normal-sandbox probe passed but the patched shell was blocked"

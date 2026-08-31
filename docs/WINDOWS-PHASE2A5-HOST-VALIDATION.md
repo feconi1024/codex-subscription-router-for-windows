@@ -48,6 +48,36 @@ mismatch stops with
 still retained in the artifact.  The old compatibility markdown remains a
 release list and is not widened by this registry refresh.
 
+## Stale validation-shell lifecycle gate
+
+Persistent patched-shell rebuilds now use a strict executable-path ownership
+invariant. `inventory_processes_under_root()` reads the native Windows process
+snapshot and considers a process Router-owned only when its readable
+executable path is inside the exact `patched-shell` root. Parentage, process
+names, launch timing, and external browser ancestry are not ownership proof.
+
+Before an `EPHEMERAL_ROLLBACK` rebuild, the validator performs a bounded
+quiescence loop. If stale Router-owned processes are found, it first tries the
+token-protected test-only `validation-shell-graceful-quit` bridge action;
+older shells that do not support that action are then handled by exact
+path-owned termination. The destination is not built or renamed unless two
+successive scans are clean. A stubborn root returns
+`ROUTER_VALIDATION_SHELL_BUSY`.
+
+The atomic installer repeats the inexpensive root check immediately before
+renaming the existing destination to its rollback path. A WinError 5 is
+reported as `ROUTER_VALIDATION_SHELL_BUSY` only when live owned-process
+evidence exists; otherwise it is `ROUTER_VALIDATION_SHELL_RENAME_BLOCKED`.
+The stage/rollback/restore sequence remains atomic, and persistent `User
+Data`, `CODEX_HOME`, and `CODEX_MUX_HOME` are never part of process cleanup.
+
+After every patched-shell smoke invocation, cleanup performs the same exact
+root inventory and bounded two-scan proof. Public artifacts expose only
+bounded counts, status, PIDs, and executable basenames through
+`validation_shell_lifecycle`; full machine process lists, command lines, and
+credentials are excluded. Router-owned processes are excluded from official
+Desktop source selection while remaining visible to lifecycle diagnostics.
+
 ## Storage-failure source classification
 
 The failed native copy named `resources\codex-code-mode-host`.  The repository

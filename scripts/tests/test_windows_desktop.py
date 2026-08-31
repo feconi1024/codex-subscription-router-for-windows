@@ -72,12 +72,19 @@ from scripts.windows.discovery import (
     read_appx_manifest_metadata,
     recognize_start_app_aumids,
     select_running_process,
+    inventory_processes_under_root,
+    quiesce_processes_under_root,
+    _source_from_process_candidates,
     process_tree_pids,
     attributable_process_pids,
     terminate_attributed_processes,
     inventory_desktop_executables,
     select_authoritative_desktop_candidate,
     path_is_within,
+    ROUTER_VALIDATION_SHELL_BUSY,
+    ROUTER_VALIDATION_SHELL_RENAME_BLOCKED,
+    ValidationShellBusyError,
+    ValidationShellRenameBlockedError,
 )
 from scripts.windows.fuses import FUSE_INDEX, FUSE_VALUES, SENTINEL, FuseSnapshot, read_fuses, write_fuse
 from scripts.windows.integrity import (
@@ -138,6 +145,7 @@ from scripts.windows.smoke import (
     UI_BRIDGE_TRANSPORT_READY,
     _app_state_status,
     _http_json_get,
+    request_validation_shell_graceful_quit,
     _ui_bridge_transport,
     build_production_gate,
     _probe_candidate,
@@ -172,6 +180,7 @@ from scripts.windows.phase2a5_host_validation import (
     _phase2a5_failure_status,
     _artifact_result,
     _public_probe,
+    _public_validation_shell_lifecycle,
     _run_external_patched_shell,
     _source_identity,
     _source_stability,
@@ -569,6 +578,176 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             RunningProcessCandidate(pid=12, name="unrelated.exe", parent_pid=99),
         ]
         self.assertEqual(process_tree_pids(10, snapshot), (10, 11))
+
+    def test_validation_process_inventory_uses_exact_executable_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "patched-shell"
+            owned = RunningProcessCandidate(
+                pid=10,
+                name="ChatGPT.exe",
+                parent_pid=999,
+                executable=root / "app" / "ChatGPT.exe",
+            )
+            reparented = RunningProcessCandidate(
+                pid=11,
+                name="helper.exe",
+                parent_pid=1,
+                executable=root / "runtime" / "helper.exe",
+            )
+            official = RunningProcessCandidate(
+                pid=12,
+                name="ChatGPT.exe",
+                parent_pid=10,
+                executable=Path(temporary) / "WindowsApps" / "OpenAI.Codex" / "app" / "ChatGPT.exe",
+            )
+            external_edge = RunningProcessCandidate(
+                pid=13,
+                name="msedge.exe",
+                parent_pid=10,
+                executable=Path(temporary) / "Microsoft Edge" / "msedge.exe",
+            )
+            inventory = inventory_processes_under_root(root, [owned, reparented, official, external_edge])
+        self.assertEqual([row.pid for row in inventory], [10, 11])
+
+    def test_validation_quiescence_force_cleanup_requires_two_clean_scans(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "patched-shell"
+            owned = RunningProcessCandidate(
+                pid=10,
+                name="ChatGPT.exe",
+                parent_pid=999,
+                executable=root / "app" / "ChatGPT.exe",
+            )
+            snapshots = iter(([owned], [], []))
+            terminations: list[tuple[int, ...]] = []
+
+            def terminate(_root: Path, snapshot: object) -> dict[str, object]:
+                rows = tuple(snapshot)  # type: ignore[arg-type]
+                terminations.append(tuple(row.pid for row in rows))
+                return {"requested": [row.pid for row in rows], "terminated": [row.pid for row in rows], "errors": []}
+
+            result = quiesce_processes_under_root(
+                root,
+                initial_snapshot=[owned],
+                snapshot_provider=lambda: next(snapshots),
+                termination_fn=terminate,
+                timeout_seconds=1.0,
+                stable_interval_seconds=0.0,
+                sleep_fn=lambda _seconds: None,
+                monotonic_fn=lambda: 0.0,
+            )
+        self.assertTrue(result["quiescent"])
+        self.assertEqual(result["status"], "QUIESCENT")
+        self.assertEqual(result["initial_count"], 1)
+        self.assertEqual(result["force_termination_requested"], 1)
+        self.assertEqual(result["remaining_count"], 0)
+        self.assertEqual(terminations, [(10,)])
+
+    def test_validation_quiescence_catches_late_and_reparented_child(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "patched-shell"
+            first = RunningProcessCandidate(
+                pid=10,
+                name="ChatGPT.exe",
+                parent_pid=999,
+                executable=root / "app" / "ChatGPT.exe",
+            )
+            late = RunningProcessCandidate(
+                pid=11,
+                name="helper.exe",
+                parent_pid=1,
+                executable=root / "app" / "late-helper.exe",
+            )
+            snapshots = iter(([first], [first], [first, late], [], []))
+            result = quiesce_processes_under_root(
+                root,
+                snapshot_provider=lambda: next(snapshots),
+                termination_fn=lambda _root, rows: {
+                    "requested": [row.pid for row in rows],
+                    "terminated": [row.pid for row in rows],
+                    "errors": [],
+                },
+                timeout_seconds=1.0,
+                stable_interval_seconds=0.0,
+                sleep_fn=lambda _seconds: None,
+                monotonic_fn=lambda: 0.0,
+            )
+        self.assertTrue(result["quiescent"])
+        self.assertEqual(result["force_termination_requested"], 2)
+        self.assertEqual(result["remaining_count"], 0)
+
+    def test_stubborn_validation_process_returns_busy_without_building(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "patched-shell"
+            owned = RunningProcessCandidate(
+                pid=10,
+                name="ChatGPT.exe",
+                executable=root / "app" / "ChatGPT.exe",
+            )
+            result = quiesce_processes_under_root(
+                root,
+                initial_snapshot=[owned],
+                snapshot_provider=lambda: [owned],
+                termination_fn=lambda _root, _rows: {"requested": [10], "terminated": [], "errors": []},
+                timeout_seconds=0.0,
+                stable_interval_seconds=0.0,
+                sleep_fn=lambda _seconds: None,
+                monotonic_fn=lambda: 0.0,
+            )
+        self.assertFalse(result["quiescent"])
+        self.assertEqual(result["status"], ROUTER_VALIDATION_SHELL_BUSY)
+        self.assertEqual(result["remaining_count"], 1)
+
+    def test_router_owned_source_processes_are_ignored_for_official_source_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            local_appdata = root / "local"
+            router_executable = local_appdata / "Codex Subscription Router" / "_validation-profile" / "patched-shell" / "app" / "ChatGPT.exe"
+            official_executable = root / "WindowsApps" / "OpenAI.Codex_26.825.6671.0" / "app" / "ChatGPT.exe"
+            for executable in (router_executable, official_executable):
+                (executable.parent / "resources").mkdir(parents=True, exist_ok=True)
+                executable.write_bytes(b"desktop")
+                (executable.parent / "resources" / "app.asar").write_bytes(b"asar")
+            rows = [
+                RunningProcessCandidate(10, "ChatGPT.exe", executable=router_executable),
+                RunningProcessCandidate(11, "ChatGPT.exe", executable=official_executable),
+            ]
+            with patch.dict(os.environ, {"LOCALAPPDATA": str(local_appdata)}, clear=False):
+                selected = _source_from_process_candidates(rows)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.executable, official_executable.resolve(strict=False))
+
+    def test_validation_process_cleanup_does_not_terminate_external_official_process(self) -> None:
+        official = RunningProcessCandidate(
+            12,
+            "ChatGPT.exe",
+            executable=Path(r"C:\Program Files\WindowsApps\OpenAI.Codex_26.825.6671.0\app\ChatGPT.exe"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "patched-shell"
+
+            class NativeCall:
+                def __init__(self, value: object):
+                    self.value = value
+                    self.argtypes = None
+                    self.restype = None
+
+                def __call__(self, *_args: object) -> object:
+                    return self.value
+
+            kernel32 = SimpleNamespace(
+                OpenProcess=NativeCall(1),
+                TerminateProcess=NativeCall(1),
+                WaitForSingleObject=NativeCall(0),
+                CloseHandle=NativeCall(1),
+            )
+            with patch("scripts.windows.discovery.os.name", "nt"), patch(
+                "scripts.windows.discovery.ctypes.WinDLL", return_value=kernel32
+            ):
+                result = terminate_attributed_processes({12}, [official], root)
+        self.assertEqual(result["requested"], [])
+        self.assertEqual(result["terminated"], [])
+        self.assertEqual(result["external_processes_observed"], [{"name": "ChatGPT.exe", "cleanup_required": False}])
 
     def test_attributed_cleanup_scope_tracks_new_mirror_and_descendant_processes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1153,6 +1332,8 @@ function request(pathname,timeout=4000,requestToken=token){return new Promise((r
   const state=await request("/v1/test/app-state?debug=1");
   if(state.status!==200||state.body?.state_status!=="OK"||state.body?.imageBase64!==undefined)throw new Error("default state path failed");
   if(captureCalls!==0)throw new Error("default app-state captured a screenshot");
+  const lifecycle=await request("/v1/test/app-state?action=validation-shell-graceful-quit&debug=0&delayMs=0");
+  if(lifecycle.status!==200||lifecycle.body?.ok!==true||lifecycle.body?.status!=="VALIDATION_SHELL_QUIT_REQUESTED")throw new Error("validation lifecycle action failed");
   const screenshot=await request("/v1/test/screenshot");
   if(screenshot.status!==200||typeof screenshot.body?.imageBase64!=="string"||captureCalls!==1)throw new Error("explicit screenshot path failed");
   process.stdout.write(JSON.stringify({ping:ping.body,state:state.body.state_status,captureCalls})+"\n");process.exit(0);
@@ -1850,6 +2031,8 @@ function request(pathname,timeout=7000){return new Promise((resolve,reject)=>{co
         self.assertIn('server.listen(PORT, HOST)', bridge)
         self.assertIn('/v1/test/ping', bridge)
         self.assertIn('/v1/test/screenshot', bridge)
+        self.assertIn('validation-shell-graceful-quit', bridge)
+        self.assertIn('requestValidationShellGracefulQuit', bridge)
         self.assertIn('STATE_CAPTURE_SCRIPT', bridge)
         self.assertIn('STATE_BUSY', bridge)
         self.assertIn("app.quit()", bridge)
@@ -2412,6 +2595,76 @@ function request(pathname,timeout=7000){return new Promise((resolve,reject)=>{co
             self.assertTrue((staged / "new-marker").is_file())
             self.assertEqual(list(profile.glob(".codex-router-windows-*")), [])
 
+    def test_ephemeral_rename_access_denied_with_owned_process_is_busy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profile = root / "_validation-profile"
+            destination = profile / "patched-shell"
+            staged = root / "staged"
+            destination.mkdir(parents=True)
+            staged.mkdir()
+            owned = RunningProcessCandidate(
+                10,
+                "ChatGPT.exe",
+                executable=destination / "app" / "ChatGPT.exe",
+            )
+            original_rename = Path.rename
+
+            def fail_destination_rename(path: Path, target: Path) -> Path:
+                if path == destination:
+                    raise PermissionError(5, "Access is denied")
+                return original_rename(path, target)
+
+            with patch(
+                "scripts.patch_app_windows.inventory_processes_under_root",
+                side_effect=[(), (owned,)],
+            ), patch.object(Path, "rename", new=fail_destination_rename), self.assertRaises(
+                ValidationShellBusyError
+            ) as raised:
+                _atomic_install(
+                    staged,
+                    destination,
+                    force=True,
+                    policy=InstallPolicy.EPHEMERAL_ROLLBACK,
+                    router_root=profile,
+                )
+        self.assertEqual(str(raised.exception).split(":", 1)[0], ROUTER_VALIDATION_SHELL_BUSY)
+        self.assertEqual(raised.exception.evidence["owned_process_count"], 1)
+
+    def test_ephemeral_rename_access_denied_without_owned_process_is_rename_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profile = root / "_validation-profile"
+            destination = profile / "patched-shell"
+            staged = root / "staged"
+            destination.mkdir(parents=True)
+            staged.mkdir()
+            original_rename = Path.rename
+
+            def fail_destination_rename(path: Path, target: Path) -> Path:
+                if path == destination:
+                    raise PermissionError(5, "Access is denied")
+                return original_rename(path, target)
+
+            with patch(
+                "scripts.patch_app_windows.inventory_processes_under_root",
+                side_effect=[(), ()],
+            ), patch.object(Path, "rename", new=fail_destination_rename), self.assertRaises(
+                ValidationShellRenameBlockedError
+            ) as raised:
+                _atomic_install(
+                    staged,
+                    destination,
+                    force=True,
+                    policy=InstallPolicy.EPHEMERAL_ROLLBACK,
+                    router_root=profile,
+                )
+        self.assertEqual(
+            str(raised.exception).split(":", 1)[0],
+            ROUTER_VALIDATION_SHELL_RENAME_BLOCKED,
+        )
+        self.assertEqual(raised.exception.evidence["owned_process_count"], 0)
+
     def test_router_backup_inventory_counts_only_windows_desktop_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2508,6 +2761,56 @@ function request(pathname,timeout=7000){return new Promise((resolve,reject)=>{co
             self.assertTrue(smoke.call_args.kwargs["auth_required"])
             self.assertEqual(result["status"], ROUTER_DESKTOP_AUTH_REQUIRED)
             self.assertTrue(result["validation_profile"]["preserved"])
+
+    def test_persistent_rebuild_stops_before_build_when_shell_is_busy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            profile = Path(temporary) / "Codex Subscription Router" / "_validation-profile"
+            busy = {
+                "status": ROUTER_VALIDATION_SHELL_BUSY,
+                "quiescent": False,
+                "initial_count": 1,
+                "remaining_count": 1,
+                "initial_processes": [{"pid": 10, "name": "ChatGPT.exe"}],
+                "remaining_processes": [{"pid": 10, "name": "ChatGPT.exe"}],
+            }
+            with patch(
+                "scripts.windows.phase2a5_host_validation.quiesce_processes_under_root",
+                return_value=busy,
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.build_windows_desktop"
+            ) as build:
+                result = _run_external_patched_shell(
+                    SimpleNamespace(),
+                    SimpleNamespace(),
+                    acl_strategy=PAYLOAD_ACL_NONE,
+                    timeout_seconds=1.0,
+                    validation_profile_root=profile,
+                )
+        build.assert_not_called()
+        self.assertEqual(result["status"], ROUTER_VALIDATION_SHELL_BUSY)
+        self.assertFalse(result["validation_shell_lifecycle"]["pre_rebuild"]["quiescent"])
+
+    def test_public_validation_lifecycle_excludes_command_lines(self) -> None:
+        safe = _public_validation_shell_lifecycle(
+            {
+                "pre_rebuild": {
+                    "status": "QUIESCENT",
+                    "root": r"C:\Router\patched-shell",
+                    "initial_count": 1,
+                    "remaining_count": 0,
+                    "quiescent": True,
+                    "initial_processes": [
+                        {
+                            "pid": 10,
+                            "name": "ChatGPT.exe",
+                            "command_line": "--secret-token=should-not-appear",
+                        }
+                    ],
+                }
+            }
+        )
+        self.assertEqual(safe["pre_rebuild"]["initial_processes"], [{"pid": 10, "name": "ChatGPT.exe"}])
+        self.assertNotIn("command_line", json.dumps(safe))
 
     def test_prepare_desktop_auth_builds_and_launches_the_persistent_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
