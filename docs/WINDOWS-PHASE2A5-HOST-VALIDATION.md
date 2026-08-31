@@ -92,8 +92,11 @@ copying it without weakening this requirement or reclassifying the failure as
 package protection.
 
 The existing Phase 2A.4 CI baseline was green before this round.  The current
-round must still pass both `checks` and `windows-go-core` before compatibility
-promotion.
+stale-validation-shell lifecycle implementation is commit
+`f3155c5f8b062b5fa59ee6bf2a1de1945a32af02`.  Both required jobs, `checks` and
+`windows-go-core`, passed for that exact commit in GitHub Actions run
+`33400316133`.  This CI result does not claim native Desktop runtime proof;
+the independently opened PowerShell validation remains the release evidence.
 
 ## Router UI runtime-gate fix
 
