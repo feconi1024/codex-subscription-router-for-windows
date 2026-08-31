@@ -1,6 +1,7 @@
 [
   {
     "package_name": "OpenAI.Codex",
+    "package_full_name": "OpenAI.Codex_26.820.7780.0_x64__2p2nqsd0c76g0",
     "package_version": "26.820.7780.0",
     "architecture": "X64",
     "app_file_version": "151.0.7922.170",
@@ -15,11 +16,27 @@
   },
   {
     "package_name": "OpenAI.Codex",
+    "package_full_name": "OpenAI.Codex_26.825.5331.0_x64__2p2nqsd0c76g0",
     "package_version": "26.825.5331.0",
     "architecture": "X64",
     "app_file_version": "151.0.7922.174",
     "app_asar_sha256": "178b65229452b17b0203ab41d5ceafedccd770c9bd42d239a6d048d27d80252b",
     "app_asar_header_sha256": "65349bb4cd49494d04898f0463f9d548fb77a86ba3c815231eebadad175427b6",
+    "renderer_variant": "windows-26.825",
+    "authoritative_shell": "app\\ChatGPT.exe",
+    "bootstrap_strategy": "environment-only",
+    "integrity_state": "FUSE_PRESENT_ASAR_VALIDATION_DISABLED",
+    "payload_acl_strategy": "UNRESOLVED",
+    "review_status": "PATCHABLE"
+  },
+  {
+    "package_name": "OpenAI.Codex",
+    "package_full_name": "OpenAI.Codex_26.825.6671.0_x64__2p2nqsd0c76g0",
+    "package_version": "26.825.6671.0",
+    "architecture": "X64",
+    "app_file_version": "151.0.7922.174",
+    "app_asar_sha256": "86e791e0eb330a1507057d30e450878f7c958e56e04e718f101ba80549e9baf2",
+    "app_asar_header_sha256": "096f71e3bedb78597af4dca1d339eeb155ff67cab988ebc1ec06831f663ec646",
     "renderer_variant": "windows-26.825",
     "authoritative_shell": "app\\ChatGPT.exe",
     "bootstrap_strategy": "environment-only",

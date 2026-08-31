@@ -1,0 +1,116 @@
+{
+  "phase": "2A.5",
+  "source_identity": {
+    "package_name": "OpenAI.Codex",
+    "package_full_name": "OpenAI.Codex_26.825.6671.0_x64__2p2nqsd0c76g0",
+    "package_version": "26.825.6671.0",
+    "architecture": "X64",
+    "app_file_version": "151.0.7922.174",
+    "chatgpt_exe_sha256": "3d74f70c186938ee87d431e839ba58196024912267bc36a2afa63922ea82b122",
+    "app_asar_sha256": "86e791e0eb330a1507057d30e450878f7c958e56e04e718f101ba80549e9baf2",
+    "app_asar_header_sha256": "096f71e3bedb78597af4dca1d339eeb155ff67cab988ebc1ec06831f663ec646",
+    "authoritative_shell": "app\\ChatGPT.exe"
+  },
+  "source_stability": {
+    "stable": true,
+    "status": "PASS",
+    "changed_fields": []
+  },
+  "renderer_contract_comparison": {
+    "reference_contract": "windows-26.825",
+    "candidate_source": "26.825.6671.0",
+    "compatible": true,
+    "read_only": true,
+    "patch_permission_granted": false,
+    "semantic_changes": [],
+    "surfaces": {
+      "renderer CSP": "UNCHANGED",
+      "native profile menu": "RENAMED_BUT_SEMANTICALLY_EQUIVALENT",
+      "app-server request bridge": "RENAMED_BUT_SEMANTICALLY_EQUIVALENT",
+      "profile statistics request": "RENAMED_BUT_SEMANTICALLY_EQUIVALENT",
+      "native usage modal": "RENAMED_BUT_SEMANTICALLY_EQUIVALENT",
+      "reset-credit query": "RENAMED_BUT_SEMANTICALLY_EQUIVALENT",
+      "reset-credit mutation": "RENAMED_BUT_SEMANTICALLY_EQUIVALENT",
+      "usage sheet header": "RENAMED_BUT_SEMANTICALLY_EQUIVALENT",
+      "usage menu slot": "UNCHANGED",
+      "usage-window selection": "UNCHANGED",
+      "profile menu open-state hook 1": "RENAMED_BUT_SEMANTICALLY_EQUIVALENT",
+      "profile menu outside open-state preservation": "RENAMED_BUT_SEMANTICALLY_EQUIVALENT",
+      "list-installed-apps RPC mapping": "RENAMED_BUT_SEMANTICALLY_EQUIVALENT",
+      "read-apps RPC mapping": "RENAMED_BUT_SEMANTICALLY_EQUIVALENT",
+      "list-apps RPC mapping": "RENAMED_BUT_SEMANTICALLY_EQUIVALENT",
+      "login-mcp-server RPC mapping": "UNCHANGED",
+      "list-mcp-server-status RPC mapping": "RENAMED_BUT_SEMANTICALLY_EQUIVALENT",
+      "listMcpServers RPC wrapper": "UNCHANGED",
+      "mcpServerStatus/list RPC call": "UNCHANGED",
+      "subscription depletion alert 1": "UNCHANGED",
+      "subscription depletion alert 2": "UNCHANGED",
+      "subscription depletion alert 3": "UNCHANGED",
+      "Profile avatar": "RENAMED_BUT_SEMANTICALLY_EQUIVALENT",
+      "Profile display name": "RENAMED_BUT_SEMANTICALLY_EQUIVALENT",
+      "Profile username and plan": "RENAMED_BUT_SEMANTICALLY_EQUIVALENT",
+      "Plugins settings content": "UNCHANGED",
+      "thread summary source component": "RENAMED_BUT_SEMANTICALLY_EQUIVALENT",
+      "thread summary insertion point": "RENAMED_BUT_SEMANTICALLY_EQUIVALENT"
+    },
+    "usage_value_site": {
+      "status": "UNCHANGED",
+      "binding_kind": "object-property-value",
+      "destructuring_binding_untouched": true
+    }
+  },
+  "renderer_syntax_validation": {
+    "status": "PASS",
+    "parser": "node",
+    "version": "v24.15.0",
+    "validated_asset_count": 9,
+    "isolated_candidate_patch": true,
+    "installed": false,
+    "launched": false
+  },
+  "bootstrap_review": {
+    "status": "PASS",
+    "strategy": "environment-only",
+    "user_data_path_support": "PASS",
+    "cli_path_support": "PASS",
+    "sparkle_disabled_behavior": "PASS",
+    "ui_test_bridge_injection": "PASS",
+    "mandatory_package_identity_dependency": false
+  },
+  "integrity_review": {
+    "status": "PASS",
+    "resolved": true,
+    "state": "FUSE_PRESENT_ASAR_VALIDATION_DISABLED",
+    "carrier": "chrome.dll",
+    "carrier_count": 1,
+    "asar_validation_resource_present": false,
+    "only_load_app_from_asar": "off"
+  },
+  "resource_layout_review": {
+    "app_chatgpt_exe": "present",
+    "app_resources_app_asar": "present",
+    "app_resources_app_asar_unpacked": "present",
+    "locales": "present",
+    "chrome_dll_fuse_carrier": "present",
+    "codex_code_mode_host": {
+      "present": true,
+      "classification": "UNKNOWN_REQUIRED",
+      "asar_path_reference_proven": false,
+      "optional_for_router": false
+    }
+  },
+  "real_codex_review": {
+    "status": "PASS",
+    "candidate_count": 1,
+    "path": "%LOCALAPPDATA%\\OpenAI\\Codex\\bin\\b99306303521e97e\\codex.exe",
+    "version": "codex-cli 0.151.0-alpha.7.2",
+    "sha256": "bfd4c3b971477a559eadaeae8b1e41382ccb7656bd0104970cf5c6c581f2da7d",
+    "authenticode_status": "Valid",
+    "signer": "CN=OpenAI OpCo, LLC; O=OpenAI OpCo, LLC; L=San Francisco; S=California; C=US"
+  },
+  "payload_acl_strategy": "UNRESOLVED",
+  "review_verdict": "PATCHABLE",
+  "native_validation_required": true,
+  "phase2b_ready": false,
+  "official_windowsapps_source_modified": false
+}

@@ -324,6 +324,44 @@ remains `ROUTER_DESKTOP_AUTH_REQUIRED`.  A second-boot failure is reported as
 `ROUTER_DESKTOP_AUTH_LOST_AFTER_REBUILD`.  These are prerequisite results, not
 Router injection failures or Phase 2B signals.
 
+## 26.825.6671.0 source review
+
+The independently reviewed official source is the exact package
+`OpenAI.Codex_26.825.6671.0_x64__2p2nqsd0c76g0` with package version
+`26.825.6671.0`, architecture `X64`, and authoritative shell
+`app\ChatGPT.exe`.  Its `ChatGPT.exe` FileVersion is `151.0.7922.174` and
+its read-only fingerprints are:
+
+```text
+ChatGPT.exe SHA-256: 3d74f70c186938ee87d431e839ba58196024912267bc36a2afa63922ea82b122
+app.asar SHA-256:    86e791e0eb330a1507057d30e450878f7c958e56e04e718f101ba80549e9baf2
+app.asar header:     096f71e3bedb78597af4dca1d339eeb155ff67cab988ebc1ec06831f663ec646
+```
+
+The source identity was stable across the review.  The 5331 and 6671
+renderer bindings map to the same semantic `windows-26.825` contract.  All
+28 reviewed surfaces are either `UNCHANGED` or
+`RENAMED_BUT_SEMANTICALLY_EQUIVALENT`; there are no missing, ambiguous, or
+semantic-change results.  In particular, `usageItems:wt` remains the
+object-property value site while the `usageItems:h` destructuring binding is
+not treated as the patch site.
+
+An isolated candidate patch passed Node syntax validation for 9 touched
+assets (`v24.15.0`).  It was not installed or launched.  Bootstrap review
+passed for environment-only user-data, CLI, Sparkle, and UI-test-bridge
+behavior.  Independent integrity review resolved one `chrome.dll` fuse
+carrier with ASAR validation disabled; `resources\default_app.asar.integrity`
+is absent and `resources\codex-code-mode-host` remains present and
+`UNKNOWN_REQUIRED`.
+
+The independently rediscovered real CLI is
+`%LOCALAPPDATA%\OpenAI\Codex\bin\b99306303521e97e\codex.exe`, version
+`codex-cli 0.151.0-alpha.7.2`, with a valid OpenAI Authenticode signature.
+The credential-free evidence is recorded in
+[WINDOWS-PHASE2A5-SOURCE-REVIEW-6671.json](WINDOWS-PHASE2A5-SOURCE-REVIEW-6671.json).
+The result is `PATCHABLE`, but native host validation is still required;
+Phase 2B is not ready.
+
 ## Verdict policy
 
 The runner uses the following Phase 2A.5 verdicts:
@@ -352,7 +390,7 @@ PHASE 2A.5 FAIL
 
 ## Next manual operation
 
-Both CI gates are now green.  First inspect/free sufficient space on the
+After the required CI gates are green, first inspect/free sufficient space on the
 validation volume and review the exact Router-owned backup/orphan inventory in
 the previous artifact.  Then, from an independently opened ordinary
 PowerShell, run the native validator directly:

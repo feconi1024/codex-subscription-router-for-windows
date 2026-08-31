@@ -707,6 +707,10 @@ def _windows_26_825_renderer_values() -> dict[str, object]:
         "app_server_anchor": app_server_anchor,
         "app_server_replacement": app_server_anchor,
         "profile_query": "async function Mbc(){let e=await dS.safeGet(`/wham/profiles/me`)",
+        "profile_query_replacement": (
+            "async function Mbc(){let e=await "
+            "codexMuxProfileData(globalThis.__codexMuxSelectedProfileAccountId??null)"
+        ),
         "usage_modal": "function GCo(e){let t=(0,KCo.c)(20),{defaultResetCreditsOpen:n,initialAvailableCount:r,isRateLimitReached:i,onClose:a,onResetComplete:o}=e",
         "reset_query": reset_query,
         "reset_query_replacement": reset_query_replacement,
@@ -780,6 +784,227 @@ def _windows_26_825_renderer_values() -> dict[str, object]:
         "thread_conversation_id": "c",
         "plugin_mappings": plugin_mappings,
     }
+
+
+def _windows_26_825_6671_renderer_values() -> dict[str, object]:
+    """Return the 26.825 semantic contract bound to the 26.825.6671 bundle.
+
+    The installed 26.825.6671 build keeps the reviewed behavior but its
+    minifier renamed several functions, imports, and the thread-summary
+    section component.  This is a source binding, not a second semantic
+    contract: the exact reviewed-source registry selects ``windows-26.825``
+    and this binding supplies the independently audited byte-level hooks.
+    """
+
+    values = _windows_26_825_renderer_values()
+    plugin_mappings = (
+        {
+            "name": "list-installed-apps RPC mapping",
+            "current": "Cb(e,n).sendRequest(`app/installed`,t?{forceRefresh:!0}:{})",
+            "replacement": (
+                "Cb(e,n).sendRequest(`app/installed`,"
+                'codexMuxScopePluginRequest("list-installed-apps",t?{forceRefresh:!0}:{}))'
+            ),
+        },
+        {
+            "name": "read-apps RPC mapping",
+            "current": "Cb(e,n).sendRequest(`app/read`,{appIds:t})",
+            "replacement": (
+                "Cb(e,n).sendRequest(`app/read`,"
+                'codexMuxScopePluginRequest("read-apps",{appIds:t}))'
+            ),
+        },
+        {
+            "name": "list-apps RPC mapping",
+            "current": (
+                "Cb(e,n).sendRequest(`app/list`,{cursor:i,limit:Ssr,"
+                "forceRefetch:t},{trace:a})"
+            ),
+            "replacement": (
+                "Cb(e,n).sendRequest(`app/list`,"
+                'codexMuxScopePluginRequest("list-apps",{cursor:i,limit:Ssr,forceRefetch:t}),'
+                "{trace:a})"
+            ),
+        },
+        {
+            "name": "login-mcp-server RPC mapping",
+            "current": "t.sendRequest(`mcpServer/oauth/login`,e)",
+            "replacement": (
+                't.sendRequest(`mcpServer/oauth/login`,'
+                'codexMuxScopePluginRequest("login-mcp-server",e))'
+            ),
+        },
+        {
+            "name": "list-mcp-server-status RPC mapping",
+            "current": (
+                "Cb(e,t).listMcpServers({cursor:i,detail:n,limit:100},"
+                "r===void 0?void 0:{trace:r})"
+            ),
+            "replacement": (
+                "Cb(e,t).listMcpServers("
+                'codexMuxScopePluginRequest("list-mcp-server-status",{cursor:i,detail:n,limit:100}),'
+                "r===void 0?void 0:{trace:r})"
+            ),
+        },
+        {
+            "name": "listMcpServers RPC wrapper",
+            "current": (
+                "listMcpServers(e,t){let n=JSON.stringify({options:t,params:e}),"
+                "r=this.mcpServerStatusPromises.get(n);if(r)return r;"
+                "let i=this.sendRequest(`mcpServerStatus/list`,e,t);"
+            ),
+            "replacement": (
+                "listMcpServers(e,t){let n=JSON.stringify({options:t,params:e}),"
+                "r=this.mcpServerStatusPromises.get(n);if(r)return r;"
+                "let i=this.sendRequest(`mcpServerStatus/list`,e,t);"
+            ),
+        },
+        {
+            "name": "mcpServerStatus/list RPC call",
+            "current": "this.sendRequest(`mcpServerStatus/list`,e,t)",
+            "replacement": "this.sendRequest(`mcpServerStatus/list`,e,t)",
+        },
+    )
+    values.update(
+        {
+            "source_binding": "26.825.6671.0",
+            "component_anchor": (
+                "function $Cc(e){let t=(0,ewc.c)(33),{accountIcon:n,accountLabel:r,"
+                "additionalItems:i,displayName:a,identityItems:o,isPetVisible:s,"
+                "onCopyUserId:c,onLogOut:l,onOpenProfile:u,onOpenSettings:d,"
+                "onOpenWorkspaceSettings:f,onTogglePet:p,settingsShortcut:m,"
+                "usageItems:h,workspaceSettingsRightIcon:g}=e"
+            ),
+            "component_replacements": {
+                "e7": "c8",
+                "kXc": "lwc",
+                "Lo": "u_",
+                "BW": "AL",
+                "QLs": "Qwo",
+                "_H": "VR",
+                "S2": "NZ",
+                "CH": "qR",
+                "jLa": "nzo",
+            },
+            "app_server_anchor": (
+                "function Cb(e,t){let n=e.get(wb);if(n==null)throw Error("
+                "`AppServerManager RPC is not connected`);return n.forHost(t)}"
+            ),
+            "app_server_replacement": (
+                "function Cb(e,t){let n=e.get(wb);if(n==null)throw Error("
+                "`AppServerManager RPC is not connected`);return n.forHost(t)}"
+            ),
+            "profile_query": "async function Ibc(){let e=await Yx.safeGet(`/wham/profiles/me`)",
+            "profile_query_replacement": (
+                "async function Ibc(){let e=await "
+                "codexMuxProfileData(globalThis.__codexMuxSelectedProfileAccountId??null)"
+            ),
+            "usage_modal": (
+                "function Qwo(e){let t=(0,$wo.c)(20),{defaultResetCreditsOpen:n,"
+                "initialAvailableCount:r,isRateLimitReached:i,onClose:a,onResetComplete:o}=e"
+            ),
+            "reset_query": (
+                "function Edi(){let e=(0,GL.c)(1),t;return "
+                "e[0]===Symbol.for(`react.memo_cache_sentinel`)?"
+                "(t={queryKey:[`rate-limit-reset-credits`],queryFn:Ddi,"
+                "refetchInterval:sx.ONE_MINUTE,staleTime:sx.FIVE_SECONDS},"
+                "e[0]=t):t=e[0],fx(t)}"
+            ),
+            "reset_query_replacement": (
+                "function Edi(){let e=window.__codexMuxResetAccountId;return "
+                "fx({queryKey:[`rate-limit-reset-credits`,e??`primary`],"
+                "queryFn:e?()=>codexMuxRateLimitResets(e):Ddi,"
+                "refetchInterval:sx.ONE_MINUTE,staleTime:sx.FIVE_SECONDS})}"
+            ),
+            "reset_mutation": (
+                "function Odi(){let e=(0,GL.c)(3),t=lx(),n=HE(),r;return "
+                "e[0]!==n||e[1]!==t?(r={mutationFn:kdi,onSuccess:(e,r)=>{"
+                "let{creditId:i}=r,a=e.code;if(a===`reset`||a===`already_redeemed`){"
+                "let n=e.code===`reset`?e.credit?.id??i:i;"
+                "t.setQueryData([`rate-limit-reset-credits`],e=>Qui(e,a,n))}"
+                "Promise.all([n([`rate-limit-status`]),"
+                "n([`rate-limit-reset-credits`])])}},e[0]=n,e[1]=t,e[2]=r):"
+                "r=e[2],mx(r)}"
+            ),
+            "reset_mutation_replacement": (
+                "function Odi(){let e=lx(),t=HE(),n=window.__codexMuxResetAccountId,"
+                "r=[`rate-limit-reset-credits`,n??`primary`];return mx({"
+                "mutationFn:n?i=>codexMuxConsumeRateLimitReset(n,i):kdi,"
+                "onSuccess:(a,o)=>{let{creditId:i}=o,c=a.code;"
+                "if(c===`reset`||c===`already_redeemed`){let n=c===`reset`?"
+                "a.credit?.id??i:i;e.setQueryData(r,e=>Qui(e,c,n))}"
+                "Promise.all([t([`rate-limit-status`]),t(r)])}})}"
+            ),
+            "usage_header": (
+                "_e=(0,gZ.jsx)(tR,{title:(0,gZ.jsx)(hz,{asChild:!0,"
+                "children:(0,gZ.jsx)(`h2`,{className:`m-0`,children:(0,gZ.jsx)(J,{"
+                "id:`codex.rateLimitResetPromptModal.usageTrackingHeading`,"
+                "defaultMessage:`Usage`,description:`Heading for the Codex usage limit modal`"
+                "})})})}),"
+            ),
+            "usage_header_replacement": (
+                "_e=(0,gZ.jsxs)(gZ.Fragment,{children:["
+                "(0,gZ.jsx)(tR,{title:(0,gZ.jsx)(hz,{asChild:!0,"
+                "children:(0,gZ.jsx)(`h2`,{className:`m-0`,children:(0,gZ.jsx)(J,{"
+                "id:`codex.rateLimitResetPromptModal.usageTrackingHeading`,"
+                "defaultMessage:`Usage`,description:`Heading for the Codex usage limit modal`"
+                "})})})}),globalThis.__codexMuxResetAccountSelector??null]}),"
+            ),
+            "usage_slot_replacement": (
+                "usageItems:(globalThis.__codexMuxAccountMenuInjected=true,"
+                "(0,c8.jsx)(CodexMuxAccountMenu,{}))"
+            ),
+            "profile_avatar": (
+                "avatar:(0,$.jsxs)($.Fragment,{children:[(0,$.jsxs)(`label`,"
+                '{"aria-disabled":z.isPending,className:Wt(`group relative flex size-20 '
+                "rounded-full outline-none focus-within:ring-1 focus-within:ring-ring`,"
+            ),
+            "profile_avatar_replacement": (
+                "avatar:(0,$.jsxs)($.Fragment,{children:["
+                "globalThis.CodexMuxProfileAvatarStack?.({onSelect:()=>F.refetch()})??null,"
+                "(0,$.jsxs)(`label`,{\"aria-disabled\":z.isPending,"
+                "className:Wt(globalThis.CodexMuxProfileAvatarStack?`hidden`:"
+                "`group relative flex size-20 rounded-full outline-none "
+                "focus-within:ring-1 focus-within:ring-ring`,"
+            ),
+            "profile_identity": (
+                "username:Le==null?null:(0,$.jsx)(q,{id:`profile.usernameValue`,"
+                "defaultMessage:`@{username}`,description:`Profile username shown with an at-sign prefix`,"
+                "values:{username:Le}})"
+            ),
+            "profile_identity_replacement": (
+                "username:globalThis.__codexMuxSelectedProfileAccountId&&Le!=null?"
+                "(0,$.jsx)(q,{id:`profile.usernameValue`,"
+                "defaultMessage:`@{username}`,description:`Profile username shown with an at-sign prefix`,"
+                "values:{username:Le}}):null"
+            ),
+            "thread_summary_anchor": (
+                "(0,XT.jsx)(Z.Section,{sectionKey:`tool-sources`,after:V,title:H,"
+                "titleSuffix:U,children:W})"
+            ),
+            "thread_route": "oa(Ca)",
+            "thread_section": "Z",
+            "plugin_mappings": plugin_mappings,
+        }
+    )
+    return values
+
+
+def _renderer_contract_bindings(variant_id: str) -> tuple[dict[str, object], ...]:
+    """Return source bindings owned by one semantic renderer contract."""
+
+    if variant_id == "windows-26.820":
+        return (renderer_variant_template(variant_id),)
+    if variant_id == "windows-26.825":
+        return (
+            renderer_variant_template(variant_id),
+            _windows_26_825_6671_renderer_values(),
+        )
+    if variant_id == "electron-6662":
+        return (renderer_variant_template(variant_id),)
+    if variant_id == "electron-original":
+        return (renderer_variant_template(variant_id),)
+    raise ValueError(f"unknown renderer contract: {variant_id}")
 
 
 def _variant_fingerprints(values: dict[str, object]) -> tuple[str, ...]:
@@ -856,6 +1081,64 @@ def _renderer_variants() -> tuple[RendererVariant, ...]:
 RENDERER_VARIANTS = _renderer_variants()
 
 
+def select_renderer_contract(bundle: str, contract_id: str) -> RendererVariant:
+    """Select one exact source binding for a reviewed semantic contract.
+
+    The reviewed-source registry owns the exact package identity and maps it
+    to ``contract_id``.  This function owns only the contract-to-renderer
+    semantics mapping, including multiple minifier bindings for one semantic
+    contract.  A bundle that matches more than one binding is rejected.
+    """
+
+    bindings = _renderer_contract_bindings(contract_id)
+    matches: list[dict[str, object]] = []
+    for values in bindings:
+        fingerprints = _variant_fingerprints(values)
+        if all(bundle.count(fingerprint) == 1 for fingerprint in fingerprints):
+            matches.append(values)
+    if len(matches) == 1:
+        values = matches[0]
+        return RendererVariant(
+            contract_id,
+            None,
+            None,
+            None,
+            _variant_fingerprints(values),
+            values,
+        )
+    if len(matches) > 1:
+        bindings_seen = [str(values.get("source_binding", "unknown")) for values in matches]
+        raise RuntimeError(
+            f"renderer contract binding is ambiguous for {contract_id!r}: {bindings_seen}"
+        )
+    raise RuntimeError(
+        f"no renderer binding matched exact fingerprints for contract {contract_id!r}"
+    )
+
+
+def detect_renderer_contract(bundle: str) -> RendererVariant:
+    """Detect one exact renderer binding without authorizing a source.
+
+    This is intentionally separate from the reviewed-source registry gate.
+    It is useful during a read-only source review, where the package identity
+    is being established before a new exact registry record can be added.
+    """
+
+    matches: list[RendererVariant] = []
+    for contract_id in sorted({item.variant_id for item in RENDERER_VARIANTS}):
+        try:
+            matches.append(select_renderer_contract(bundle, contract_id))
+        except RuntimeError:
+            continue
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"renderer contract detection is ambiguous: {[item.variant_id for item in matches]}"
+        )
+    raise RuntimeError("no exact renderer contract binding matched")
+
+
 def select_renderer_variant(
     bundle: str,
     *,
@@ -863,11 +1146,17 @@ def select_renderer_variant(
     package_version: str | None = None,
     app_asar_sha256: str | None = None,
 ) -> RendererVariant:
-    """Select one exact renderer contract using metadata and multiple fingerprints."""
+    """Select a legacy metadata-bound variant or one exact fixture contract.
+
+    Production builds must pass the contract ID obtained from the exact
+    reviewed-source registry to :func:`select_renderer_contract`.  This
+    compatibility selector remains for older callers and test fixtures; it
+    does not authorize a source identity.
+    """
     package_name = None if package_name in {None, "", "unknown"} else package_name
     package_version = None if package_version in {None, "", "unknown"} else package_version
     app_asar_sha256 = None if app_asar_sha256 in {None, ""} else app_asar_sha256
-    matches: list[RendererVariant] = []
+    metadata_bound_ids: set[str] = set()
     for variant in RENDERER_VARIANTS:
         if variant.package_name is not None and package_name is not None and package_name != variant.package_name:
             continue
@@ -875,8 +1164,17 @@ def select_renderer_variant(
             continue
         if variant.app_asar_sha256 is not None and app_asar_sha256 is not None and app_asar_sha256.casefold() != variant.app_asar_sha256:
             continue
-        if all(bundle.count(fingerprint) == 1 for fingerprint in variant.fingerprints):
-            matches.append(variant)
+        metadata_bound_ids.add(variant.variant_id)
+
+    candidate_ids = metadata_bound_ids or {
+        variant.variant_id for variant in RENDERER_VARIANTS
+    }
+    matches: list[RendererVariant] = []
+    for contract_id in candidate_ids:
+        try:
+            matches.append(select_renderer_contract(bundle, contract_id))
+        except RuntimeError:
+            continue
     if len(matches) == 1:
         return matches[0]
     metadata = {
@@ -1167,11 +1465,17 @@ def _audit_windows_26_825(
 def audit_renderer_anchors(
     extracted: Path,
     *,
+    renderer_variant: str | None = None,
     package_name: str | None = None,
     package_version: str | None = None,
     app_asar_sha256: str | None = None,
 ) -> list[AnchorAudit]:
-    """Audit exact semantic hooks without changing the extracted ASAR."""
+    """Audit exact hooks without changing the extracted ASAR.
+
+    When ``renderer_variant`` is supplied it is the reviewed-source
+    registry's contract ID and is authoritative.  Metadata-only selection is
+    retained solely for historical fixture callers.
+    """
     webview = extracted / "webview"
     assets = webview / "assets"
     index_path = webview / "index.html"
@@ -1184,14 +1488,36 @@ def audit_renderer_anchors(
     bundle_path = initial_bundles[0]
     bundle = bundle_path.read_text(encoding="utf-8")
     try:
-        variant = select_renderer_variant(
-            bundle,
-            package_name=package_name,
-            package_version=package_version,
-            app_asar_sha256=app_asar_sha256,
+        variant = (
+            select_renderer_contract(bundle, renderer_variant)
+            if renderer_variant is not None
+            else select_renderer_variant(
+                bundle,
+                package_name=package_name,
+                package_version=package_version,
+                app_asar_sha256=app_asar_sha256,
+            )
         )
-    except RuntimeError:
+    except (RuntimeError, ValueError) as error:
+        if renderer_variant is not None:
+            raise RuntimeError(
+                f"reviewed renderer contract could not be selected: {renderer_variant}"
+            ) from error
         variant = None
+    if variant is None and renderer_variant is None:
+        try:
+            variant = detect_renderer_contract(bundle)
+        except RuntimeError as error:
+            if "ambiguous" in str(error).casefold():
+                return [
+                    AnchorAudit(
+                        "renderer contract",
+                        bundle_path.name,
+                        "AMBIGUOUS",
+                        None,
+                        0,
+                    )
+                ]
     if variant is not None and variant.variant_id == "windows-26.820":
         return _audit_windows_26_820(extracted, index, bundle_path, bundle, variant.values)
     if variant is not None and variant.variant_id == "windows-26.825":
@@ -1409,12 +1735,16 @@ def _count_contract_anchor(extracted: Path, asset_glob: str, anchor: str) -> lis
 def compare_renderer_contract(
     extracted: Path,
     reference_variant: str = "windows-26.820",
+    *,
+    observed_variant: str | None = None,
 ) -> dict[str, object]:
-    """Compare an extracted renderer with a known contract without granting patch permission.
+    """Compare source surfaces without granting patch permission.
 
-    The comparison intentionally uses only the extracted bytes and explicit
-    contract templates.  It does not select a patch variant from package
-    metadata, write files, or make a semantic match patchable.
+    The reference contract describes the previously reviewed semantics.  The
+    observed contract is detected from exact fingerprints (or selected by a
+    reviewed contract ID) and supplies the byte-level source binding for the
+    current bundle.  Returned evidence contains counts, asset names, and a
+    semantic basis, never minified source text.
     """
 
     reference = renderer_variant_template(reference_variant)
@@ -1424,11 +1754,18 @@ def compare_renderer_contract(
     initial_bundles = sorted(assets.glob("app-initial-*.js"))
     result: dict[str, object] = {
         "reference_variant": reference_variant,
+        "reference_contract": reference_variant,
         "reference_fingerprint_count": len(_variant_fingerprints(reference)),
+        "observed_variant": "UNRESOLVED",
+        "candidate_source": None,
+        "observed_source_binding": None,
         "read_only": True,
         "patch_permission_granted": False,
         "patchable": False,
         "exact_fingerprint_matches": [],
+        "observed_fingerprint_matches": [],
+        "missing_fingerprints": [],
+        "ambiguous_fingerprints": [],
         "exact_replacement_anchor_matches": [],
         "surface_status": [],
         "missing_anchors": [],
@@ -1452,125 +1789,341 @@ def compare_renderer_contract(
     index_html = index_path.read_text(encoding="utf-8")
     bundle_path = initial_bundles[0]
     bundle = bundle_path.read_text(encoding="utf-8")
+    observed: RendererVariant | None = None
+    if observed_variant is not None:
+        try:
+            observed = select_renderer_contract(bundle, observed_variant)
+        except (RuntimeError, ValueError):
+            result["observed_contract_status"] = "NO_EXACT_BINDING"
+    else:
+        try:
+            observed = detect_renderer_contract(bundle)
+        except RuntimeError as error:
+            result["observed_contract_status"] = (
+                "AMBIGUOUS" if "ambiguous" in str(error).casefold() else "NO_EXACT_BINDING"
+            )
+    if observed is not None:
+        result["observed_variant"] = observed.variant_id
+        source_binding = observed.values.get("source_binding")
+        result["observed_source_binding"] = source_binding
+        result["candidate_source"] = source_binding or observed.variant_id
+        result["observed_contract_status"] = "PASS"
+
     exact_fingerprints: list[dict[str, object]] = []
     for fingerprint_index, anchor in enumerate(_variant_fingerprints(reference)):
         count = bundle.count(anchor)
         item = {
             "index": fingerprint_index,
-            "anchor": anchor,
             "asset": bundle_path.name,
             "count": count,
         }
         if count == 1:
             exact_fingerprints.append(item)
         elif count == 0:
-            missing = result["missing_anchors"]
+            missing = result["missing_fingerprints"]
             assert isinstance(missing, list)
             missing.append({"name": f"fingerprint-{fingerprint_index + 1}", **item})
         else:
-            ambiguous = result["ambiguous_anchors"]
+            ambiguous = result["ambiguous_fingerprints"]
             assert isinstance(ambiguous, list)
             ambiguous.append({"name": f"fingerprint-{fingerprint_index + 1}", **item})
     result["exact_fingerprint_matches"] = exact_fingerprints
 
-    current = renderer_variant_template("windows-26.825")
-    surfaces: list[tuple[str, str, str, str, str]] = [
-        ("renderer CSP", "webview/index.html", "connect-src &#39;self&#39;", "connect-src &#39;self&#39;", "unchanged"),
-        ("native profile menu", "app-initial", str(reference["component_anchor"]), str(current["component_anchor"]), "renamed"),
-        ("app-server request bridge", "app-initial", str(reference["app_server_anchor"]), str(current["app_server_anchor"]), "renamed"),
-        ("profile statistics request", "app-initial", str(reference["profile_query"]), str(current["profile_query"]), "renamed"),
-        ("native usage modal", "app-initial", str(reference["usage_modal"]), str(current["usage_modal"]), "semantically_changed"),
-        ("reset-credit query", "app-initial", str(reference["reset_query"]), str(current["reset_query"]), "semantically_changed"),
-        ("reset-credit mutation", "app-initial", str(reference["reset_mutation"]), str(current["reset_mutation"]), "semantically_changed"),
-        ("usage sheet header", "app-initial", str(reference["usage_header"]), str(current["usage_header"]), "semantically_changed"),
-        ("usage menu slot", "app-initial", str(reference["usage_slot"]), str(current["usage_slot"]), "renamed"),
-        ("app/list", "app-initial", str(reference["plugin_mappings"][2]["current"]), str(current["plugin_mappings"][2]["current"]), "renamed"),
-        ("app/installed", "app-initial", str(reference["plugin_mappings"][0]["current"]), str(current["plugin_mappings"][0]["current"]), "renamed"),
-        ("app/read", "app-initial", str(reference["plugin_mappings"][1]["current"]), str(current["plugin_mappings"][1]["current"]), "renamed"),
-        ("mcpServer/oauth/login", "app-initial", str(reference["plugin_mappings"][3]["current"]), str(current["plugin_mappings"][3]["current"]), "unchanged"),
-        ("mcpServerStatus/list", "app-initial", str(reference["plugin_mappings"][4]["current"]), str(current["plugin_mappings"][4]["current"]), "renamed"),
-        ("listMcpServers wrapper", "app-initial", str(reference["plugin_mappings"][5]["current"]), str(current["plugin_mappings"][5]["current"]), "unchanged"),
-        ("mcpServerStatus/list RPC call", "app-initial", str(reference["plugin_mappings"][6]["current"]), str(current["plugin_mappings"][6]["current"]), "unchanged"),
-        ("usage-window selection", "app-initial", "let y=v;if(g!=null){", "let y=v;if(g!=null){", "unchanged"),
-        ("profile menu open-state hook", "app-initial", str(reference["open_change"][0]), str(current["open_change"][0]), "renamed"),
-        ("profile menu outside open-state preservation", "app-initial", str(reference["open_preserved"]), str(current["open_preserved"]), "renamed"),
-        ("subscription depletion alert", "app-initial", "defaultMessage:`You’re out of Codex and Work usage`", "defaultMessage:`You’re out of Codex and Work usage`", "unchanged"),
-        ("Profile avatar", "profile-*.js", str(reference["profile_avatar"]), str(current["profile_avatar"]), "renamed"),
-        ("Profile display name", "profile-*.js", str(reference["profile_name"]), str(current["profile_name"]), "renamed"),
-        ("Profile username and plan", "profile-*.js", str(reference["profile_identity"]), str(current["profile_identity"]), "renamed"),
-        ("Plugins settings content", str(reference["plugin_glob"]), str(reference["plugin_anchor"]), str(current["plugin_anchor"]), "asset_moved"),
-        ("thread summary source component", "local-conversation-thread-*.js", str(reference["thread_anchor"]), str(current["thread_anchor"]), "renamed"),
-        ("thread summary insertion point", "local-conversation-thread-*.js", str(reference["thread_summary_anchor"]), str(current["thread_summary_anchor"]), "semantically_changed"),
+    observed_values = observed.values if observed is not None else None
+    observed_fingerprints: list[dict[str, object]] = []
+    if observed_values is not None:
+        for fingerprint_index, anchor in enumerate(_variant_fingerprints(observed_values)):
+            count = bundle.count(anchor)
+            if count == 1:
+                observed_fingerprints.append(
+                    {"index": fingerprint_index, "asset": bundle_path.name, "count": count}
+                )
+    result["observed_fingerprint_matches"] = observed_fingerprints
+
+    def _value(values: dict[str, object] | None, key: str) -> str | None:
+        if values is None:
+            return None
+        value = values.get(key)
+        if isinstance(value, (tuple, list)):
+            return str(value[0]) if value else None
+        return str(value) if value is not None else None
+
+    def _mapping(values: dict[str, object] | None) -> dict[str, str]:
+        if values is None:
+            return {}
+        mappings = values.get("plugin_mappings")
+        if not isinstance(mappings, (tuple, list)):
+            return {}
+        return {
+            str(item["name"]): str(item["current"])
+            for item in mappings
+            if isinstance(item, dict) and "name" in item and "current" in item
+        }
+
+    reference_mappings = _mapping(reference)
+    observed_mappings = _mapping(observed_values)
+    surfaces: list[tuple[str, str, str, str | None, str | None, str]] = [
+        (
+            "renderer CSP",
+            "webview/index.html",
+            "webview/index.html",
+            "connect-src &#39;self&#39;",
+            "connect-src &#39;self&#39;",
+            "same renderer connect-src self policy",
+        ),
+        (
+            "native profile menu",
+            "app-initial",
+            "app-initial",
+            _value(reference, "component_anchor"),
+            _value(observed_values, "component_anchor"),
+            "same profile-menu component and value props",
+        ),
+        (
+            "app-server request bridge",
+            "app-initial",
+            "app-initial",
+            _value(reference, "app_server_anchor"),
+            _value(observed_values, "app_server_anchor"),
+            "same host-scoped AppServerManager.forHost(hostId) bridge",
+        ),
+        (
+            "profile statistics request",
+            "app-initial",
+            "app-initial",
+            _value(reference, "profile_query"),
+            _value(observed_values, "profile_query"),
+            "same /wham/profiles/me profile statistics query",
+        ),
+        (
+            "native usage modal",
+            "app-initial",
+            "app-initial",
+            _value(reference, "usage_modal"),
+            _value(observed_values, "usage_modal"),
+            "same Usage modal props and reset-credit presentation",
+        ),
+        (
+            "reset-credit query",
+            "app-initial",
+            "app-initial",
+            _value(reference, "reset_query"),
+            _value(observed_values, "reset_query"),
+            "same rate-limit-reset-credits query key and refresh policy",
+        ),
+        (
+            "reset-credit mutation",
+            "app-initial",
+            "app-initial",
+            _value(reference, "reset_mutation"),
+            _value(observed_values, "reset_mutation"),
+            "same rate-limit-reset-credits consume operation and outcomes",
+        ),
+        (
+            "usage sheet header",
+            "app-initial",
+            "app-initial",
+            _value(reference, "usage_header"),
+            _value(observed_values, "usage_header"),
+            "same Usage sheet heading and reset selector slot",
+        ),
+        (
+            "usage menu slot",
+            "app-initial",
+            "app-initial",
+            _value(reference, "usage_slot"),
+            _value(observed_values, "usage_slot"),
+            "same object-literal usageItems value site outside destructuring",
+        ),
+        (
+            "usage-window selection",
+            "app-initial",
+            "app-initial",
+            "let y=v;if(g!=null){",
+            "let y=v;if(g!=null){",
+            "same selected usage-window value flow",
+        ),
+        (
+            "profile menu open-state hook 1",
+            "app-initial",
+            "app-initial",
+            _value(reference, "open_change"),
+            _value(observed_values, "open_change"),
+            "same profile-menu open-state callback and trigger",
+        ),
+        (
+            "profile menu outside open-state preservation",
+            "app-initial",
+            "app-initial",
+            _value(reference, "open_preserved"),
+            _value(observed_values, "open_preserved"),
+            "same outside profile-menu open-state preservation",
+        ),
     ]
+    for name, reference_anchor in reference_mappings.items():
+        surfaces.append(
+            (
+                name,
+                "app-initial",
+                "app-initial",
+                reference_anchor,
+                observed_mappings.get(name),
+                f"same app-server RPC mapping for {name.removesuffix(' RPC mapping')}",
+            )
+        )
+    for index, message in enumerate(
+        (
+            "defaultMessage:`You’re out of Codex and Work usage`",
+            "defaultMessage:`You’ve used all Codex and Work usage`",
+            "defaultMessage:`You’ve reached your usage limit`",
+        ),
+        start=1,
+    ):
+        surfaces.append(
+            (
+                f"subscription depletion alert {index}",
+                "app-initial",
+                "app-initial",
+                message,
+                message,
+                "same subscription-depletion alert condition",
+            )
+        )
+    surfaces.extend(
+        (
+            (
+                "Profile avatar",
+                "profile-*.js",
+                "profile-*.js",
+                _value(reference, "profile_avatar"),
+                _value(observed_values, "profile_avatar"),
+                "same profile avatar control and refresh callback",
+            ),
+            (
+                "Profile display name",
+                "profile-*.js",
+                "profile-*.js",
+                _value(reference, "profile_name"),
+                _value(observed_values, "profile_name"),
+                "same profile display-name identity field",
+            ),
+            (
+                "Profile username and plan",
+                "profile-*.js",
+                "profile-*.js",
+                _value(reference, "profile_identity"),
+                _value(observed_values, "profile_identity"),
+                "same profile username and plan identity fields",
+            ),
+            (
+                "Plugins settings content",
+                str(reference["plugin_glob"]),
+                str(observed_values["plugin_glob"]) if observed_values else str(reference["plugin_glob"]),
+                _value(reference, "plugin_anchor"),
+                _value(observed_values, "plugin_anchor"),
+                "same Plugins settings connected-content insertion point",
+            ),
+            (
+                "thread summary source component",
+                "local-conversation-thread-*.js",
+                "local-conversation-thread-*.js",
+                _value(reference, "thread_anchor"),
+                _value(observed_values, "thread_anchor"),
+                "same local conversation thread renderer component",
+            ),
+            (
+                "thread summary insertion point",
+                "local-conversation-thread-*.js",
+                "local-conversation-thread-*.js",
+                _value(reference, "thread_summary_anchor"),
+                _value(observed_values, "thread_summary_anchor"),
+                "same tool-sources thread summary section",
+            ),
+        )
+    )
+
+    def _locations(asset_label: str, anchor: str | None) -> list[dict[str, object]]:
+        if not anchor:
+            return []
+        if asset_label == "webview/index.html":
+            return [{"asset": index_path.name, "count": index_html.count(anchor)}]
+        if asset_label == "app-initial":
+            return [{"asset": bundle_path.name, "count": bundle.count(anchor)}]
+        return _count_contract_anchor(extracted, asset_label, anchor)
+
     exact_replacements: list[dict[str, object]] = []
     surface_status: list[dict[str, object]] = []
-    for name, asset_label, old_anchor, new_anchor, changed_kind in surfaces:
-        if asset_label == "webview/index.html":
-            old_locations = [{"asset": index_path.name, "count": index_html.count(old_anchor)}]
-            new_locations = old_locations
-        elif asset_label == "app-initial":
-            old_locations = [{"asset": bundle_path.name, "count": bundle.count(old_anchor)}]
-            new_locations = [{"asset": bundle_path.name, "count": bundle.count(new_anchor)}]
-        else:
-            old_locations = _count_contract_anchor(extracted, asset_label, old_anchor)
-            new_locations = _count_contract_anchor(extracted, asset_label, new_anchor)
-        old_count = sum(int(item["count"]) for item in old_locations)
-        new_count = sum(int(item["count"]) for item in new_locations)
-        if old_count == 1:
+    for name, reference_asset, observed_asset, reference_anchor, observed_anchor, semantic_basis in surfaces:
+        reference_locations = _locations(reference_asset, reference_anchor)
+        observed_locations = _locations(observed_asset, observed_anchor)
+        reference_count = sum(int(item["count"]) for item in reference_locations)
+        observed_count = sum(int(item["count"]) for item in observed_locations)
+        if reference_count > 1 or observed_count > 1:
+            status = "AMBIGUOUS"
+        elif reference_count == 1 and observed_anchor == reference_anchor:
             status = "UNCHANGED"
             exact_replacements.append(
-                {"name": name, "asset": asset_label, "anchor": old_anchor, "count": old_count}
+                {"name": name, "asset": reference_asset, "count": reference_count}
             )
-        elif old_count > 1:
-            status = "AMBIGUOUS"
-        elif new_count == 1:
-            status = {
-                "renamed": "RENAMED",
-                "semantically_changed": "SEMANTICALLY_CHANGED",
-                "asset_moved": "MOVED",
-                "unchanged": "UNCHANGED",
-            }[changed_kind]
-        elif new_count > 1:
-            status = "AMBIGUOUS"
+        elif observed_count == 1 and observed_values is not None:
+            # A minifier can reuse the old byte sequence for an unrelated
+            # helper.  Once the observed binding is exact, the selected
+            # surface anchor is authoritative for this comparison; a single
+            # incidental reference match does not turn a known rename into a
+            # semantic change.
+            status = "RENAMED_BUT_SEMANTICALLY_EQUIVALENT"
+        elif reference_count == 1 and observed_count == 0:
+            status = "CHANGED" if observed_values is not None else "UNCHANGED"
+            if status == "UNCHANGED":
+                exact_replacements.append(
+                    {"name": name, "asset": reference_asset, "count": reference_count}
+                )
+        elif observed_count == 0 and observed_values is not None:
+            status = "CHANGED"
         else:
             status = "MISSING"
         entry = {
             "name": name,
-            "asset": asset_label,
+            "reference_asset": reference_asset,
+            "observed_asset": observed_asset,
             "status": status,
-            "reference_anchor": old_anchor,
-            "observed_anchor": new_anchor if new_count else None,
-            "reference_count": old_count,
-            "observed_count": new_count,
-            "observed_assets": new_locations,
+            "semantic_basis": semantic_basis,
+            "reference_anchor_present": reference_count == 1,
+            "observed_anchor_present": observed_count == 1,
+            "reference_count": reference_count,
+            "observed_count": observed_count,
+            "observed_assets": observed_locations,
         }
         surface_status.append(entry)
         if status == "MISSING":
             missing = result["missing_anchors"]
             assert isinstance(missing, list)
-            missing.append(entry)
+            missing.append({"name": name, "asset": observed_asset, "count": observed_count})
         elif status == "AMBIGUOUS":
             ambiguous = result["ambiguous_anchors"]
             assert isinstance(ambiguous, list)
-            ambiguous.append(entry)
-        elif status == "SEMANTICALLY_CHANGED":
-            semantic_changes = result["semantic_changes"]
-            assert isinstance(semantic_changes, list)
-            semantic_changes.append(entry)
-        elif status == "MOVED":
-            asset_moves = result["asset_moves"]
-            assert isinstance(asset_moves, list)
-            asset_moves.append(entry)
+            ambiguous.append({"name": name, "asset": observed_asset, "count": observed_count})
+        elif status == "CHANGED":
+            changes = result["semantic_changes"]
+            assert isinstance(changes, list)
+            changes.append({"name": name, "semantic_basis": semantic_basis})
     result["exact_replacement_anchor_matches"] = exact_replacements
     result["surface_status"] = surface_status
+    result["surfaces"] = {str(item["name"]): item["status"] for item in surface_status}
+    result["compatible"] = bool(
+        observed is not None
+        and not result["missing_anchors"]
+        and not result["ambiguous_anchors"]
+        and not result["semantic_changes"]
+    )
     host_scoped = next(
         (item for item in surface_status if item["name"] == "app-server request bridge"),
         None,
     )
     result["host_scoped_rpc"] = {
-        "reference": str(reference["app_server_anchor"]),
-        "observed": str(current["app_server_anchor"]),
+        "surface": "app-server request bridge",
         "status": host_scoped["status"] if host_scoped is not None else "MISSING",
+        "semantic_basis": "same host-scoped AppServerManager.forHost(hostId) bridge",
         "read_only": True,
     }
     return result
@@ -1975,7 +2528,13 @@ def _patch_windows_26_825_renderer(
     _require_unique(bundle, profile_query_anchor, "could not find the native profile stats request")
     bundle = bundle.replace(
         profile_query_anchor,
-        "async function Mbc(){let e=await codexMuxProfileData(globalThis.__codexMuxSelectedProfileAccountId??null)",
+        str(
+            values.get(
+                "profile_query_replacement",
+                "async function Mbc(){let e=await "
+                "codexMuxProfileData(globalThis.__codexMuxSelectedProfileAccountId??null)",
+            )
+        ),
         1,
     )
 
@@ -2243,6 +2802,7 @@ def patch_renderer(
     extracted: Path,
     token: str,
     *,
+    renderer_variant: str | None = None,
     package_name: str | None = None,
     package_version: str | None = None,
     app_asar_sha256: str | None = None,
@@ -2250,6 +2810,7 @@ def patch_renderer(
     """Patch renderer account/routing surfaces after exact semantic validation."""
     audit = audit_renderer_anchors(
         extracted,
+        renderer_variant=renderer_variant,
         package_name=package_name,
         package_version=package_version,
         app_asar_sha256=app_asar_sha256,
@@ -2257,7 +2818,7 @@ def patch_renderer(
     failed_audit = [
         item
         for item in audit
-        if item.status in {"MISSING", "SEMANTICALLY_CHANGED", "AMBIGUOUS"}
+        if item.status in {"MISSING", "SEMANTICALLY_CHANGED", "CHANGED", "AMBIGUOUS"}
     ]
     if failed_audit:
         details = "; ".join(
@@ -2269,11 +2830,15 @@ def patch_renderer(
     if len(initial_bundles) != 1:
         raise RuntimeError(f"expected one ChatGPT initial renderer bundle, found {len(initial_bundles)}")
     bundle = initial_bundles[0].read_text(encoding="utf-8")
-    variant = select_renderer_variant(
-        bundle,
-        package_name=package_name,
-        package_version=package_version,
-        app_asar_sha256=app_asar_sha256,
+    variant = (
+        select_renderer_contract(bundle, renderer_variant)
+        if renderer_variant is not None
+        else select_renderer_variant(
+            bundle,
+            package_name=package_name,
+            package_version=package_version,
+            app_asar_sha256=app_asar_sha256,
+        )
     )
     if variant.variant_id == "windows-26.820":
         return _patch_windows_26_820_renderer(extracted, token, variant, audit)

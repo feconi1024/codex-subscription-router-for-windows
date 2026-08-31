@@ -21,11 +21,12 @@ try:
         PROJECT_ROOT,
         audit_renderer_anchors,
         compare_renderer_contract,
+        detect_renderer_contract,
         ensure_asar_tool,
         load_or_create_token,
-        patch_renderer,
-        select_renderer_variant,
-        validate_patched_javascript_syntax,
+       patch_renderer,
+       select_renderer_contract,
+       validate_patched_javascript_syntax,
     )
     from .windows.bootstrap import BootstrapPatchReport, audit_bootstrap, patch_bootstrap
     from .windows.compatibility import (
@@ -109,11 +110,12 @@ except ImportError:
         PROJECT_ROOT,
         audit_renderer_anchors,
         compare_renderer_contract,
+        detect_renderer_contract,
         ensure_asar_tool,
         load_or_create_token,
-        patch_renderer,
-        select_renderer_variant,
-        validate_patched_javascript_syntax,
+       patch_renderer,
+       select_renderer_contract,
+       validate_patched_javascript_syntax,
     )
     from windows.bootstrap import BootstrapPatchReport, audit_bootstrap, patch_bootstrap
     from windows.compatibility import (
@@ -199,11 +201,21 @@ DEFAULT_DESTINATION = Path(
     os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")
 ) / "Codex Subscription Router"
 COMPATIBILITY_DOCUMENT = PROJECT_ROOT / "docs" / "WINDOWS-COMPATIBILITY.md"
-PHASE2A6_SOURCE_REVIEW_PASS = "FULL PHASE 2A.6 SOURCE REVIEW PASS"
-PHASE2A6_RENDERER_ADAPTATION_REQUIRED = "PHASE 2A.6 RENDERER ADAPTATION REQUIRED"
-PHASE2A6_BOOTSTRAP_BLOCKED = "PHASE 2A.6 BOOTSTRAP BLOCKED"
-PHASE2A6_INTEGRITY_BLOCKED = "PHASE 2A.6 INTEGRITY BLOCKED"
-PHASE2A6_FAIL = "PHASE 2A.6 FAIL"
+PHASE2A5_SOURCE_REVIEW_PASS = "FULL PHASE 2A.5 SOURCE REVIEW PASS"
+PHASE2A5_RENDERER_ADAPTATION_REQUIRED = "PHASE 2A.5 RENDERER ADAPTATION REQUIRED"
+PHASE2A5_BOOTSTRAP_BLOCKED = "PHASE 2A.5 BOOTSTRAP BLOCKED"
+PHASE2A5_INTEGRITY_BLOCKED = "PHASE 2A.5 INTEGRITY BLOCKED"
+PHASE2A5_FAIL = "PHASE 2A.5 FAIL"
+PHASE2A5_SOURCE_CHANGED_DURING_REVIEW = "PHASE 2A.5 SOURCE CHANGED DURING REVIEW"
+
+# Keep the old Python names as compatibility aliases for callers that imported
+# them during the earlier source-refresh round.  The values and all user-facing
+# output remain explicitly in the Phase 2A.5 vocabulary.
+PHASE2A6_SOURCE_REVIEW_PASS = PHASE2A5_SOURCE_REVIEW_PASS
+PHASE2A6_RENDERER_ADAPTATION_REQUIRED = PHASE2A5_RENDERER_ADAPTATION_REQUIRED
+PHASE2A6_BOOTSTRAP_BLOCKED = PHASE2A5_BOOTSTRAP_BLOCKED
+PHASE2A6_INTEGRITY_BLOCKED = PHASE2A5_INTEGRITY_BLOCKED
+PHASE2A6_FAIL = PHASE2A5_FAIL
 
 
 class InstallPolicy(str, Enum):
@@ -476,10 +488,13 @@ def _fuse_summary(snapshot: FuseSnapshot | None, error: str | None = None) -> di
 
 
 def _audit_has_failure(audit: list[object]) -> bool:
-    return any(item.status in {"MISSING", "SEMANTICALLY_CHANGED", "AMBIGUOUS"} for item in audit)
+    return any(
+        item.status in {"MISSING", "SEMANTICALLY_CHANGED", "CHANGED", "AMBIGUOUS"}
+        for item in audit
+    )
 
 
-def _phase2a6_verdict(
+def _phase2a5_verdict(
     *,
     renderer_variant: str,
     renderer_audit_pass: bool,
@@ -489,14 +504,106 @@ def _phase2a6_verdict(
     authoritative_shell_proven: bool,
 ) -> str:
     if not renderer_audit_pass or renderer_variant == "UNRESOLVED":
-        return PHASE2A6_RENDERER_ADAPTATION_REQUIRED
+        return PHASE2A5_RENDERER_ADAPTATION_REQUIRED
     if not bootstrap_pass:
-        return PHASE2A6_BOOTSTRAP_BLOCKED
+        return PHASE2A5_BOOTSTRAP_BLOCKED
     if not integrity_resolved:
-        return PHASE2A6_INTEGRITY_BLOCKED
+        return PHASE2A5_INTEGRITY_BLOCKED
     if not reviewed_source_pass or not authoritative_shell_proven:
-        return PHASE2A6_FAIL
-    return PHASE2A6_SOURCE_REVIEW_PASS
+        return PHASE2A5_FAIL
+    return PHASE2A5_SOURCE_REVIEW_PASS
+
+
+def _phase2a6_verdict(**kwargs: object) -> str:
+    """Compatibility wrapper for callers from the earlier source-refresh round."""
+
+    return _phase2a5_verdict(**kwargs)
+
+
+def _bounded_audit_error(error: BaseException) -> str:
+    message = " ".join(str(error).replace("\r", " ").replace("\n", " ").split())
+    return message[:300] or type(error).__name__
+
+
+def _source_review_identity(source: DesktopSource) -> dict[str, object]:
+    """Capture the immutable source fields used by the Phase 2A.5 gate."""
+
+    versions = read_file_versions(source.executable)
+    return {
+        "source_root": str(source.source_root.resolve(strict=False)),
+        "executable": str(source.executable.resolve(strict=False)),
+        "app_asar": str(source.app_asar.resolve(strict=False)),
+        "package_name": source.package.name,
+        "package_full_name": source.package.package_full_name,
+        "package_version": source.package.version,
+        "architecture": source.package.architecture,
+        "app_file_version": versions.get("FileVersion") or source.file_version,
+        "product_version": versions.get("ProductVersion") or "unknown",
+        "chatgpt_exe_sha256": sha256_file(source.executable),
+        "app_asar_sha256": sha256_file(source.app_asar),
+        "app_asar_header_sha256": asar_header_digest(source.app_asar).hash,
+    }
+
+
+def _source_stability_result(
+    initial: Mapping[str, object],
+    final: Mapping[str, object],
+    *,
+    recheck_error: str | None = None,
+) -> dict[str, object]:
+    fields = (
+        "source_root",
+        "executable",
+        "app_asar",
+        "package_name",
+        "package_full_name",
+        "package_version",
+        "architecture",
+        "app_file_version",
+        "product_version",
+        "chatgpt_exe_sha256",
+        "app_asar_sha256",
+        "app_asar_header_sha256",
+    )
+    changed_fields = [field for field in fields if initial.get(field) != final.get(field)]
+    stable = not changed_fields and recheck_error is None
+    result: dict[str, object] = {
+        "status": "STABLE" if stable else "CHANGED",
+        "stable": stable,
+        "checked_fields": list(fields),
+        "changed_fields": changed_fields,
+        "initial": dict(initial),
+        "final": dict(final),
+    }
+    if recheck_error is not None:
+        result["recheck_error"] = recheck_error
+    return result
+
+
+def _real_codex_review() -> dict[str, object]:
+    """Re-discover the current per-user native Codex only after source review."""
+
+    try:
+        selected, candidates = discover_real_codex()
+    except (OSError, RuntimeError) as error:
+        return {
+            "status": "UNAVAILABLE",
+            "candidate_count": 0,
+            "error": _bounded_audit_error(error),
+        }
+    return {
+        "status": "PASS",
+        "candidate_count": len(candidates),
+        "selected": {
+            "path": str(selected.path),
+            "version": selected.version,
+            "sha256": selected.sha256,
+            "authenticode": {
+                "status": selected.authenticode.status,
+                "signer": selected.authenticode.signer,
+            },
+        },
+    }
 
 
 def _carrier_paths_from_scan(mirrored_root: Path, fuse_scan: dict[str, object]) -> tuple[Path, ...]:
@@ -516,9 +623,9 @@ def _carrier_paths_from_scan(mirrored_root: Path, fuse_scan: dict[str, object]) 
 def audit_windows_source(source: DesktopSource) -> dict[str, object]:
     """Audit the real source without changing its executable or ASAR."""
     asar = ensure_asar_tool()
-    versions = read_file_versions(source.executable)
-    source_hash = sha256_file(source.app_asar)
-    source_header = asar_header_digest(source.app_asar)
+    frozen_identity = _source_review_identity(source)
+    source_hash = str(frozen_identity["app_asar_sha256"])
+    source_header_hash = str(frozen_identity["app_asar_header_sha256"])
     signature = read_authenticode(source.executable)
     block_map_path = source.source_root / "AppxBlockMap.xml"
     try:
@@ -542,35 +649,60 @@ def audit_windows_source(source: DesktopSource) -> dict[str, object]:
         extracted = temporary_root / "asar"
         run([str(asar), "extract", str(source.app_asar), str(extracted)])
         initial_bundles = list((extracted / "webview" / "assets").glob("app-initial-*.js"))
+        reviewed_source = find_reviewed_source(frozen_identity)
+        renderer_variant_id = "UNRESOLVED"
         try:
             if len(initial_bundles) != 1:
                 raise RuntimeError(f"expected one initial renderer bundle, found {len(initial_bundles)}")
-            renderer_variant_id = select_renderer_variant(
-                initial_bundles[0].read_text(encoding="utf-8"),
+            bundle_text = initial_bundles[0].read_text(encoding="utf-8")
+            reviewed_contract = (
+                reviewed_source.get("renderer_variant")
+                if isinstance(reviewed_source, Mapping)
+                else None
+            )
+            selected_contract = (
+                select_renderer_contract(bundle_text, reviewed_contract)
+                if isinstance(reviewed_contract, str) and reviewed_contract
+                else detect_renderer_contract(bundle_text)
+            )
+            renderer_variant_id = selected_contract.variant_id
+        except (RuntimeError, ValueError):
+            renderer_variant_id = "UNRESOLVED"
+        try:
+            renderer_audit = audit_renderer_anchors(
+                extracted,
+                renderer_variant=(renderer_variant_id if renderer_variant_id != "UNRESOLVED" else None),
                 package_name=source.package.name,
                 package_version=source.package.version,
                 app_asar_sha256=source_hash,
-            ).variant_id
-        except RuntimeError:
-            renderer_variant_id = "UNRESOLVED"
-        renderer_audit = audit_renderer_anchors(
+            )
+            renderer_audit_error = None
+        except (RuntimeError, ValueError) as error:
+            renderer_audit = []
+            renderer_audit_error = _bounded_audit_error(error)
+        renderer_comparison = compare_renderer_contract(
             extracted,
-            package_name=source.package.name,
-            package_version=source.package.version,
-            app_asar_sha256=source_hash,
+            reference_variant=(
+                "windows-26.825" if renderer_variant_id == "windows-26.825" else "windows-26.820"
+            ),
+            observed_variant=(renderer_variant_id if renderer_variant_id != "UNRESOLVED" else None),
         )
-        renderer_comparison = compare_renderer_contract(extracted, reference_variant="windows-26.820")
         bootstrap_audit = audit_bootstrap(extracted, PROJECT_ROOT)
+    try:
+        final_identity = _source_review_identity(source)
+        stability_error = None
+    except (OSError, RuntimeError, ValueError) as error:
+        final_identity = {"capture_status": "UNAVAILABLE"}
+        stability_error = _bounded_audit_error(error)
+    source_stability = _source_stability_result(
+        frozen_identity,
+        final_identity,
+        recheck_error=stability_error,
+    )
     fuse_summary = _fuse_summary(integrity_plan.fuse, integrity_plan.fuse_error)
-    audited_file_version = versions.get("FileVersion") or source.file_version
-    source_identity = {
-        "package_name": source.package.name,
-        "package_version": source.package.version,
-        "architecture": source.package.architecture,
-        "app_file_version": audited_file_version,
-        "app_asar_sha256": source_hash,
-        "app_asar_header_sha256": source_header.hash,
-    }
+    audited_file_version = str(frozen_identity["app_file_version"])
+    product_version = str(frozen_identity["product_version"])
+    source_identity = dict(frozen_identity)
     reviewed_source = find_reviewed_source(source_identity)
     reviewed_source_pass, reviewed_source_reason = reviewed_source_is_patchable(
         source_identity,
@@ -585,8 +717,19 @@ def audit_windows_source(source: DesktopSource) -> dict[str, object]:
     if not authoritative_shell_proven:
         reviewed_source_pass = False
         reviewed_source_reason = "app\\ChatGPT.exe was not proven as the present AppX-declared shell"
-    renderer_variant_pass = renderer_variant_id != "UNRESOLVED" and not _audit_has_failure(renderer_audit)
-    phase2a6_verdict = _phase2a6_verdict(
+    comparison_statuses = renderer_comparison.get("surface_status")
+    comparison_failed = isinstance(comparison_statuses, list) and any(
+        isinstance(item, Mapping)
+        and item.get("status") in {"MISSING", "CHANGED", "AMBIGUOUS"}
+        for item in comparison_statuses
+    )
+    renderer_variant_pass = (
+        renderer_variant_id != "UNRESOLVED"
+        and renderer_audit_error is None
+        and not _audit_has_failure(renderer_audit)
+        and not comparison_failed
+    )
+    phase2a5_verdict = _phase2a5_verdict(
         renderer_variant=renderer_variant_id,
         renderer_audit_pass=renderer_variant_pass,
         bootstrap_pass=bool(bootstrap_audit.get("audit_pass")),
@@ -594,7 +737,28 @@ def audit_windows_source(source: DesktopSource) -> dict[str, object]:
         reviewed_source_pass=reviewed_source_pass,
         authoritative_shell_proven=authoritative_shell_proven,
     )
+    if source_stability["status"] != "STABLE":
+        phase2a5_verdict = PHASE2A5_SOURCE_CHANGED_DURING_REVIEW
+        reviewed_source_pass = False
+        reviewed_source_reason = "source identity changed or could not be re-read after the read-only audit"
+    real_codex_review = (
+        _real_codex_review()
+        if (
+            source_stability["status"] == "STABLE"
+            and reviewed_source_pass
+            and renderer_variant_pass
+            and bool(bootstrap_audit.get("audit_pass"))
+            and integrity_plan.resolved
+            and authoritative_shell_proven
+        )
+        else {
+            "status": "NOT RUN",
+            "reason": "real Codex discovery is deferred until the exact source review gate passes",
+        }
+    )
     return {
+        "source_identity": source_identity,
+        "source_stability": source_stability,
         "source": {
             "package": package_to_dict(source.package),
             "source_kind": source.source_kind,
@@ -602,11 +766,12 @@ def audit_windows_source(source: DesktopSource) -> dict[str, object]:
             "app_dir": str(source.app_dir),
             "executable": str(source.executable),
             "file_version": audited_file_version,
-            "product_version": versions.get("ProductVersion") or "unknown",
+            "product_version": product_version,
             "authenticode": {"status": signature.status, "signer": signature.signer},
+            "chatgpt_exe_sha256": frozen_identity["chatgpt_exe_sha256"],
             "app_asar": str(source.app_asar),
             "app_asar_sha256": source_hash,
-            "app_asar_header_sha256": source_header.hash,
+            "app_asar_header_sha256": source_header_hash,
         },
         "access": [probe.to_dict() for probe in source_access_probes(source)],
         "appx_block_map": {
@@ -631,6 +796,8 @@ def audit_windows_source(source: DesktopSource) -> dict[str, object]:
         ],
         "renderer_variant": renderer_variant_id,
         "renderer_contract_comparison": renderer_comparison,
+        "renderer_audit_error": renderer_audit_error,
+        "real_codex_review": real_codex_review,
         "electron_fuses": fuse_summary,
         "renderer_audit_pass": renderer_variant_pass,
         "fuse_audit_pass": True,
@@ -640,10 +807,9 @@ def audit_windows_source(source: DesktopSource) -> dict[str, object]:
             "record": reviewed_source,
         },
         "authoritative_shell_proven": authoritative_shell_proven,
-        "phase2a6_verdict": phase2a6_verdict,
-        "audit_pass": (
-            phase2a6_verdict == PHASE2A6_SOURCE_REVIEW_PASS
-        ),
+        "phase2a5_verdict": phase2a5_verdict,
+        "phase2a6_verdict": phase2a5_verdict,
+        "audit_pass": phase2a5_verdict == PHASE2A5_SOURCE_REVIEW_PASS,
     }
 
 
@@ -695,12 +861,13 @@ def _run_source_audit(args: argparse.Namespace) -> int:
     _write_json(args.diagnostics_json, payload)
     print(format_source_diagnostics(diagnostics))
     print(f"Source app.asar SHA-256: {audit['source']['app_asar_sha256']}")
+    print(f"ChatGPT.exe SHA-256: {audit['source']['chatgpt_exe_sha256']}")
     print(f"ChatGPT.exe FileVersion: {audit['source']['file_version']}")
     print(f"ChatGPT.exe ProductVersion: {audit['source']['product_version']}")
     print(f"Authenticode: {audit['source']['authenticode']}")
     print(f"ASAR header SHA-256: {audit['source']['app_asar_header_sha256']}")
     print(f"Renderer variant: {audit['renderer_variant']}")
-    print(f"Phase 2A.6 verdict: {audit['phase2a6_verdict']}")
+    print(f"Phase 2A.5 verdict: {audit['phase2a5_verdict']}")
     print(f"AppxBlockMap files: {audit['appx_block_map']['file_count']}")
     print(f"Electron fuses: {json.dumps(audit['electron_fuses'], sort_keys=True)}")
     print(f"Windows ASAR integrity: {json.dumps(audit['windows_asar_integrity'], sort_keys=True)}")
@@ -1590,6 +1757,7 @@ def build_windows_desktop(
     source_header_hash = asar_header_digest(source.app_asar).hash
     source_identity = {
         "package_name": source.package.name,
+       "package_full_name": source.package.package_full_name,
         "package_version": source.package.version,
         "architecture": source.package.architecture,
         "app_file_version": source.file_version,
@@ -1725,6 +1893,11 @@ def build_windows_desktop(
         run([str(asar), "extract", str(staged_resources / "app.asar"), str(extracted)])
         audit = audit_renderer_anchors(
             extracted,
+            renderer_variant=(
+                str(reviewed_record["renderer_variant"])
+                if reviewed_ok and isinstance(reviewed_record, Mapping)
+                else None
+            ),
             package_name=source.package.name,
             package_version=source.package.version,
             app_asar_sha256=source_hash,
@@ -1733,7 +1906,7 @@ def build_windows_desktop(
         failed = [
             item
             for item in audit
-            if item.status in {"MISSING", "SEMANTICALLY_CHANGED", "AMBIGUOUS"}
+            if item.status in {"MISSING", "SEMANTICALLY_CHANGED", "CHANGED", "AMBIGUOUS"}
         ]
         if failed:
             raise RuntimeError("Windows renderer anchor audit failed; no loose replacement was attempted")
@@ -1741,16 +1914,17 @@ def build_windows_desktop(
             renderer_bundles = list((extracted / "webview" / "assets").glob("app-initial-*.js"))
             if len(renderer_bundles) != 1:
                 raise RuntimeError("reviewed-source renderer variant could not be resolved uniquely")
-            selected_renderer_variant = select_renderer_variant(
+            reviewed_contract_id = reviewed_record.get("renderer_variant")
+            if not isinstance(reviewed_contract_id, str) or not reviewed_contract_id:
+                raise RuntimeError("reviewed-source renderer contract ID is missing")
+            selected_renderer_variant = select_renderer_contract(
                 renderer_bundles[0].read_text(encoding="utf-8"),
-                package_name=source.package.name,
-                package_version=source.package.version,
-                app_asar_sha256=source_hash,
+                reviewed_contract_id,
             )
-            if reviewed_record.get("renderer_variant") != selected_renderer_variant.variant_id:
+            if reviewed_contract_id != selected_renderer_variant.variant_id:
                 raise RuntimeError(
                     "reviewed-source renderer variant does not match the exact extracted renderer: "
-                    f"{reviewed_record.get('renderer_variant')} != {selected_renderer_variant.variant_id}"
+                    f"{reviewed_contract_id} != {selected_renderer_variant.variant_id}"
                 )
         bootstrap_report = patch_bootstrap(
             extracted,
@@ -1762,6 +1936,11 @@ def build_windows_desktop(
         patch_renderer(
             extracted,
             token,
+            renderer_variant=(
+                str(reviewed_record["renderer_variant"])
+                if reviewed_ok and isinstance(reviewed_record, Mapping)
+                else None
+            ),
             package_name=source.package.name,
             package_version=source.package.version,
             app_asar_sha256=source_hash,

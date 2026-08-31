@@ -10,9 +10,18 @@ from typing import Any, Mapping
 
 REVIEWED_SOURCES_DOCUMENT = Path(__file__).with_name("reviewed_sources.json")
 PATCHABLE_REVIEW_STATUS = "PATCHABLE"
+_KNOWN_RENDERER_CONTRACTS = frozenset(
+    {
+        "windows-26.820",
+        "windows-26.825",
+        "electron-6662",
+        "electron-original",
+    }
+)
 
 _REQUIRED_FIELDS = (
     "package_name",
+    "package_full_name",
     "package_version",
     "architecture",
     "app_file_version",
@@ -58,9 +67,10 @@ def load_reviewed_sources(
     return records
 
 
-def _record_identity(record: Mapping[str, Any]) -> tuple[str, str, str, str, str, str]:
+def _record_identity(record: Mapping[str, Any]) -> tuple[str, str, str, str, str, str, str]:
     return (
         str(record.get("package_name", "")).casefold(),
+        str(record.get("package_full_name", "")).casefold(),
         str(record.get("package_version", "")),
         str(record.get("architecture", "")).casefold(),
         str(record.get("app_file_version", "")),
@@ -84,6 +94,7 @@ def reviewed_source_matches_identity(
 
     comparisons = (
         ("package_name", _identity_value(identity, "package_name", "package"), record.get("package_name")),
+        ("package_full_name", _identity_value(identity, "package_full_name"), record.get("package_full_name")),
         ("package_version", _identity_value(identity, "package_version"), record.get("package_version")),
         ("architecture", _identity_value(identity, "architecture"), record.get("architecture")),
         ("app_file_version", _identity_value(identity, "app_file_version", "file_version"), record.get("app_file_version")),
@@ -97,7 +108,7 @@ def reviewed_source_matches_identity(
     for field, observed, expected in comparisons:
         if observed is None or expected is None:
             return False
-        if field in {"package_name", "architecture"}:
+        if field in {"package_name", "package_full_name", "architecture"}:
             if str(observed).casefold() != str(expected).casefold():
                 return False
         elif str(observed).casefold() != str(expected).casefold():
@@ -136,6 +147,8 @@ def reviewed_source_is_patchable(
         return False, "reviewed-source fingerprint does not match the discovered source"
     if record.get("review_status") != PATCHABLE_REVIEW_STATUS:
         return False, f"reviewed-source status is {record.get('review_status')!r}, not PATCHABLE"
+    if record.get("renderer_variant") not in _KNOWN_RENDERER_CONTRACTS:
+        return False, f"reviewed source references an unknown renderer contract: {record.get('renderer_variant')!r}"
     if str(record.get("authoritative_shell", "")).replace("/", "\\").casefold() != "app\\chatgpt.exe":
         return False, "reviewed source does not prove app\\ChatGPT.exe as the authoritative shell"
     return True, "exact source is reviewed and PATCHABLE"

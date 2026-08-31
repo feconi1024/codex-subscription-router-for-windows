@@ -15,9 +15,12 @@ from unittest.mock import patch
 
 from scripts.patch_common import (
     RENDERER_SYNTAX_BLOCKED,
+    _require_usage_value_anchor,
+    _windows_26_825_6671_renderer_values,
     _plugin_mapping_anchors,
     audit_renderer_anchors,
     compare_renderer_contract,
+    detect_renderer_contract,
     ensure_asar_tool,
     patch_renderer,
     renderer_variant_template,
@@ -26,6 +29,8 @@ from scripts.patch_common import (
 )
 from scripts.patch_app_windows import (
     InstallPolicy,
+    PHASE2A5_RENDERER_ADAPTATION_REQUIRED,
+    _phase2a5_verdict,
     _patched_javascript_assets,
     _atomic_install,
     _payload_acl_for_strategy,
@@ -151,6 +156,7 @@ from scripts.windows.phase2a5_host_validation import (
 from scripts.windows.reviewed_sources import (
     find_reviewed_source,
     load_reviewed_sources,
+    reviewed_source_is_patchable,
 )
 from scripts.windows.acl import (
     ALL_APPLICATION_PACKAGES_SID,
@@ -292,6 +298,80 @@ def write_exact_26_825_renderer_fixture(root: Path) -> dict[str, object]:
         encoding="utf-8",
     )
     return values
+
+
+def exact_renderer_binding_bundle(values: dict[str, object]) -> str:
+    """Return the eight exact fingerprints used for contract selection tests."""
+
+    return "\n".join(
+        [
+            str(values["component_anchor"]),
+            str(values["app_server_anchor"]),
+            str(values["profile_query"]),
+            str(values["usage_modal"]),
+            str(values["reset_query"]),
+            str(values["reset_mutation"]),
+            str(values["usage_slot"]),
+            str(values["open_change"][0]),
+        ]
+    )
+
+
+def write_renderer_contract_fixture(
+    root: Path,
+    values: dict[str, object],
+    *,
+    bundle_name: str = "app-initial-candidate.js",
+) -> None:
+    """Create a bounded extracted renderer fixture for a selected binding."""
+
+    webview = root / "webview"
+    assets = webview / "assets"
+    assets.mkdir(parents=True)
+    tick = chr(96)
+    bundle_parts = [
+        str(values["component_anchor"]),
+        str(values["open_change"][0]),
+        str(values["open_preserved"]),
+        "let y=v;if(g!=null){",
+        str(values["usage_slot"]),
+    ]
+    for key in (
+        "app_server_anchor",
+        "profile_query",
+        "usage_modal",
+        "reset_query",
+        "reset_mutation",
+        "usage_header",
+    ):
+        bundle_parts.append(str(values[key]))
+    for spec in values["plugin_mappings"]:
+        if spec["name"] == "mcpServerStatus/list RPC call":
+            continue
+        bundle_parts.append(str(spec["current"]))
+    for message in (
+        f"defaultMessage:{tick}You’re out of Codex and Work usage{tick}",
+        f"defaultMessage:{tick}You’ve used all Codex and Work usage{tick}",
+        f"defaultMessage:{tick}You’ve reached your usage limit{tick}",
+    ):
+        bundle_parts.append(message)
+    (webview / "index.html").write_text("connect-src &#39;self&#39;", encoding="utf-8")
+    (assets / bundle_name).write_text("\n".join(bundle_parts), encoding="utf-8")
+    (assets / "profile-candidate.js").write_text(
+        " ".join(
+            str(values[key])
+            for key in ("profile_avatar", "profile_name", "profile_identity")
+        ),
+        encoding="utf-8",
+    )
+    (assets / "plugins-page-candidate.js").write_text(
+        str(values["plugin_anchor"]),
+        encoding="utf-8",
+    )
+    (assets / "local-conversation-thread-candidate.js").write_text(
+        f"{values['thread_anchor']} {values['thread_summary_anchor']}",
+        encoding="utf-8",
+    )
 
 
 @contextmanager
@@ -2990,10 +3070,22 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
 
     def test_reviewed_source_registry_matches_old_and_new_and_rejects_hash_drift(self) -> None:
         records = load_reviewed_sources()
-        self.assertEqual({record["renderer_variant"] for record in records}, {"windows-26.820", "windows-26.825"})
+        self.assertEqual(
+            {record["renderer_variant"] for record in records},
+            {"windows-26.820", "windows-26.825"},
+        )
+        self.assertEqual(
+            {
+                record["package_version"]
+                for record in records
+                if record["renderer_variant"] == "windows-26.825"
+            },
+            {"26.825.5331.0", "26.825.6671.0"},
+        )
         for record in records:
             identity = {
                 "package_name": record["package_name"],
+                "package_full_name": record["package_full_name"],
                 "package_version": record["package_version"],
                 "architecture": record["architecture"],
                 "app_file_version": record["app_file_version"],
@@ -3011,6 +3103,7 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         )
         identity = {
             "package_name": old["package_name"],
+            "package_full_name": old["package_full_name"],
             "package_version": old["package_version"],
             "architecture": old["architecture"],
             "app_file_version": old["app_file_version"],
@@ -3018,6 +3111,127 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             "app_asar_header_sha256": changed_same_version["app_asar_header_sha256"],
         }
         self.assertIsNone(find_reviewed_source(identity, records))
+
+    def test_exact_26_825_6671_review_gate_rejects_every_identity_drift(self) -> None:
+        records = load_reviewed_sources()
+        record = next(
+            item for item in records if item["package_version"] == "26.825.6671.0"
+        )
+        identity = {
+            field: record[field]
+            for field in (
+                "package_name",
+                "package_full_name",
+                "package_version",
+                "architecture",
+                "app_file_version",
+                "app_asar_sha256",
+                "app_asar_header_sha256",
+            )
+        }
+        self.assertIsNone(
+            find_reviewed_source(
+                identity,
+                [item for item in records if item["package_version"] != "26.825.6671.0"],
+            )
+        )
+        self.assertTrue(reviewed_source_is_patchable(identity, record)[0])
+        self.assertFalse(
+            reviewed_source_is_patchable(
+                identity,
+                dict(record, renderer_variant="windows-26.999"),
+            )[0]
+        )
+        for field in (
+            "package_version",
+            "architecture",
+            "app_file_version",
+            "app_asar_sha256",
+            "app_asar_header_sha256",
+        ):
+            drifted = dict(identity)
+            if field.endswith("sha256"):
+                drifted[field] = "0" * 64
+            elif field == "app_file_version":
+                drifted[field] = "151.0.7922.173"
+            elif field == "architecture":
+                drifted[field] = "Arm64"
+            elif field == "package_full_name":
+                drifted[field] = "OpenAI.Codex_26.825.6671.0_x64__differentpublisher"
+            else:
+                drifted[field] = "26.825.6671.1"
+            self.assertIsNone(find_reviewed_source(drifted, records), field)
+            self.assertFalse(reviewed_source_is_patchable(drifted, record)[0], field)
+
+    def test_reviewed_source_contract_selection_fails_closed_for_unknown_contract(self) -> None:
+        values = renderer_variant_template("windows-26.825")
+        with self.assertRaises(ValueError):
+            from scripts.patch_common import select_renderer_contract
+
+            select_renderer_contract(exact_renderer_binding_bundle(values), "windows-26.999")
+
+    def test_5331_and_6671_use_one_windows_26_825_semantic_contract(self) -> None:
+        old_values = renderer_variant_template("windows-26.825")
+        new_values = _windows_26_825_6671_renderer_values()
+        old = select_renderer_variant(exact_renderer_binding_bundle(old_values))
+        new = select_renderer_variant(exact_renderer_binding_bundle(new_values))
+        self.assertEqual(old.variant_id, "windows-26.825")
+        self.assertEqual(new.variant_id, "windows-26.825")
+        self.assertEqual(new_values["source_binding"], "26.825.6671.0")
+        self.assertEqual(
+            detect_renderer_contract(exact_renderer_binding_bundle(new_values)).variant_id,
+            old.variant_id,
+        )
+
+    def test_candidate_renderer_anchor_drift_requires_adaptation(self) -> None:
+        values = _windows_26_825_6671_renderer_values()
+        bundle = exact_renderer_binding_bundle(values).replace(
+            str(values["reset_query"]),
+            "reset-query-anchor-drift",
+            1,
+        )
+        with self.assertRaises(RuntimeError):
+            detect_renderer_contract(bundle)
+        self.assertEqual(
+            _phase2a5_verdict(
+                renderer_variant="UNRESOLVED",
+                renderer_audit_pass=False,
+                bootstrap_pass=True,
+                integrity_resolved=True,
+                reviewed_source_pass=True,
+                authoritative_shell_proven=True,
+            ),
+            PHASE2A5_RENDERER_ADAPTATION_REQUIRED,
+        )
+
+    def test_6671_usage_hook_is_value_site_and_not_destructuring_binding(self) -> None:
+        values = _windows_26_825_6671_renderer_values()
+        bundle = exact_renderer_binding_bundle(values)
+        self.assertEqual(_require_usage_value_anchor(bundle, values), "usageItems:wt")
+        invalid = dict(values, usage_slot="usageItems:h")
+        with self.assertRaises(RuntimeError):
+            _require_usage_value_anchor(bundle, invalid)
+
+    def test_6671_renderer_comparison_reports_bounded_semantic_statuses(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            extracted = Path(temporary)
+            values = _windows_26_825_6671_renderer_values()
+            write_renderer_contract_fixture(extracted, values)
+            comparison = compare_renderer_contract(
+                extracted,
+                reference_variant="windows-26.825",
+                observed_variant="windows-26.825",
+            )
+        self.assertEqual(comparison["reference_contract"], "windows-26.825")
+        self.assertEqual(comparison["candidate_source"], "26.825.6671.0")
+        self.assertTrue(comparison["compatible"])
+        self.assertFalse(comparison["patch_permission_granted"])
+        self.assertEqual(len(comparison["surface_status"]), 28)
+        self.assertTrue(
+            set(comparison["surfaces"].values())
+            <= {"UNCHANGED", "RENAMED_BUT_SEMANTICALLY_EQUIVALENT"}
+        )
+        self.assertFalse(comparison["semantic_changes"])
 
     def test_renderer_contract_comparison_is_read_only_and_never_patch_permission(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
