@@ -25,7 +25,14 @@ try:
         sha256_file,
     )
     from .host_context import detect_windows_host_context, run_localappdata_canary
-    from .mirror import PackagingBlockedError
+    from .mirror import (
+        PHASE2A5_STORAGE_BLOCKED,
+        PackagingBlockedError,
+        StorageBlockedError,
+        inventory_generated_validation_roots,
+        inventory_router_backups,
+        is_storage_exhaustion,
+    )
     from .smoke import (
         PHASE2A5_ACL_FIX_CONFIRMED,
         PHASE2A5_DIRECT_HOST_PASS,
@@ -64,7 +71,14 @@ except ImportError:
         sha256_file,
     )
     from windows.host_context import detect_windows_host_context, run_localappdata_canary
-    from windows.mirror import PackagingBlockedError
+    from windows.mirror import (
+        PHASE2A5_STORAGE_BLOCKED,
+        PackagingBlockedError,
+        StorageBlockedError,
+        inventory_generated_validation_roots,
+        inventory_router_backups,
+        is_storage_exhaustion,
+    )
     from windows.smoke import (
         PHASE2A5_ACL_FIX_CONFIRMED,
         PHASE2A5_DIRECT_HOST_PASS,
@@ -98,12 +112,28 @@ PHASE2A5_SOURCE_REVIEW_REQUIRED = "PHASE 2A.5 SOURCE REVIEW REQUIRED"
 PHASE2A5_SOURCE_CHANGED_DURING_VALIDATION = "PHASE 2A.5 SOURCE CHANGED DURING VALIDATION"
 PHASE2A5_PATCHED_SHELL_TOOLCHAIN_BLOCKED = "PATCHED SHELL TOOLCHAIN BLOCKED"
 PHASE2A5_DESKTOP_AUTH_REQUIRED = "PHASE 2A.5 DESKTOP AUTH REQUIRED"
+PHASE2A5_SOURCE_READ_BLOCKED = "PHASE 2A.5 SOURCE READ BLOCKED"
+PHASE2A5_PACKAGE_PROTECTION_BLOCKED = "PHASE 2A.5 PACKAGE PROTECTION BLOCKED"
+PHASE2A5_RENDERER_BLOCKED = "PHASE 2A.5 RENDERER BLOCKED"
 
 
 def _safe_error(error: BaseException | str) -> str:
     value = str(error) if not isinstance(error, str) else error
     value = " ".join(value.replace("\r", " ").replace("\n", " ").split())
     return value[:500] or type(error).__name__
+
+
+def _phase2a5_failure_status(error: BaseException, default: str) -> str:
+    """Map typed mirror/renderer failures to stable public gate statuses."""
+
+    message = _safe_error(error).casefold()
+    if "phase 2a source read blocked" in message or "source read blocked" in message:
+        return PHASE2A5_SOURCE_READ_BLOCKED
+    if "phase 2 packaging blocked" in message:
+        return PHASE2A5_PACKAGE_PROTECTION_BLOCKED
+    if "renderer" in message or "syntax blocked" in message:
+        return PHASE2A5_RENDERER_BLOCKED
+    return default
 
 
 def _command_version(command: str, arguments: tuple[str, ...]) -> str:
@@ -343,6 +373,140 @@ def _public_button_diagnostics(buttons: object) -> list[dict[str, object]]:
     return output
 
 
+_PUBLIC_STORAGE_INTEGER_FIELDS = {
+    "free_bytes",
+    "estimated_required_bytes",
+    "planned_mirror_bytes",
+    "planned_mirror_file_count",
+    "existing_validation_shell_bytes",
+    "asar_bytes",
+    "asar_extracted_estimate_bytes",
+    "asar_working_set_bytes",
+    "temporary_repacked_asar_bytes",
+    "generated_unpacked_bytes",
+    "safety_headroom_bytes",
+    "router_backup_count",
+    "router_backup_bytes",
+    "validation_orphan_count",
+    "validation_orphan_bytes",
+}
+_PUBLIC_STORAGE_BOOLEAN_FIELDS = {
+    "pass",
+    "capacity_query_ok",
+    "existing_destination_size_known",
+    "asar_size_known",
+    "router_backup_scan_complete",
+    "validation_orphan_scan_complete",
+}
+
+
+def _public_mirror_plan(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, object] = {}
+    strategy = value.get("strategy")
+    if isinstance(strategy, str) and strategy in {"walk", "appx-block-map"}:
+        output["strategy"] = strategy
+    for key in (
+        "planned_file_count",
+        "planned_mirror_bytes",
+        "excluded_file_count",
+        "excluded_bytes",
+    ):
+        item = value.get(key)
+        if type(item) is int and 0 <= item <= 2**63 - 1:
+            output[key] = item
+    warning = value.get("planning_warning")
+    if warning == "normal walk unavailable":
+        output["planning_warning"] = warning
+    return output
+
+
+def _public_backup_inventory(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, object] = {}
+    for key in ("windows_desktop_backup_count", "windows_desktop_backup_bytes", "reparse_points_skipped"):
+        item = value.get(key)
+        if type(item) is int and 0 <= item <= 2**63 - 1:
+            output[key] = item
+    if isinstance(value.get("scan_complete"), bool):
+        output["scan_complete"] = value["scan_complete"]
+    return output
+
+
+def _public_validation_orphans(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, object] = {}
+    for key in ("candidate_count", "candidate_bytes", "reparse_points_skipped"):
+        item = value.get(key)
+        if type(item) is int and 0 <= item <= 2**63 - 1:
+            output[key] = item
+    if isinstance(value.get("scan_complete"), bool):
+        output["scan_complete"] = value["scan_complete"]
+    paths = value.get("candidate_paths")
+    if isinstance(paths, list):
+        safe_paths: list[str] = []
+        for item in paths:
+            if not isinstance(item, str) or len(item) > 300:
+                continue
+            normalized = item.replace("\\", "/")
+            if (
+                not normalized
+                or normalized.startswith("/")
+                or re.match(r"^[A-Za-z]:", normalized)
+                or any(part in {"", ".", ".."} for part in normalized.split("/"))
+                or re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", normalized) is None
+            ):
+                continue
+            safe_paths.append(normalized)
+        output["candidate_paths"] = safe_paths[:100]
+    return output
+
+
+def _public_storage_preflight(value: object, *, depth: int = 0) -> dict[str, object]:
+    """Expose capacity evidence without exporting arbitrary filesystem paths."""
+
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, object] = {}
+    operation = value.get("operation")
+    if isinstance(operation, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", operation):
+        output["operation"] = operation
+    volume = value.get("volume")
+    if isinstance(volume, str) and (
+        volume == "/"
+        or re.fullmatch(r"[A-Za-z]:", volume) is not None
+        or re.fullmatch(r"\\\\[^\\/:]{1,80}\\[^\\/:]{1,80}", volume) is not None
+    ):
+        output["volume"] = volume
+    for key in _PUBLIC_STORAGE_INTEGER_FIELDS:
+        item = value.get(key)
+        if type(item) is int and 0 <= item <= 2**63 - 1:
+            output[key] = item
+    for key in _PUBLIC_STORAGE_BOOLEAN_FIELDS:
+        item = value.get(key)
+        if isinstance(item, bool):
+            output[key] = item
+    mirror_plan = _public_mirror_plan(value.get("mirror_plan"))
+    if mirror_plan:
+        output["mirror_plan"] = mirror_plan
+    if depth == 0:
+        probes = value.get("probes")
+        if isinstance(probes, dict):
+            safe_probes: dict[str, object] = {}
+            for label, probe in list(probes.items())[:50]:
+                if not isinstance(label, str) or re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", label) is None:
+                    continue
+                safe_probe = _public_storage_preflight(probe, depth=1)
+                if safe_probe:
+                    safe_probes[label] = safe_probe
+            if safe_probes:
+                output["probes"] = safe_probes
+    return output
+
+
 def _public_build_metadata_summary(value: object) -> dict[str, object]:
     """Keep build metadata bounded when copying it into the public artifact."""
 
@@ -353,6 +517,15 @@ def _public_build_metadata_summary(value: object) -> dict[str, object]:
         item = value.get(key)
         if isinstance(item, str) and len(item) <= 500:
             output[key] = item
+    install_policy = value.get("install_policy")
+    if install_policy in {"RECOVERABLE_BACKUP", "EPHEMERAL_ROLLBACK"}:
+        output["install_policy"] = install_policy
+    storage = _public_storage_preflight(value.get("storage_preflight"))
+    if storage:
+        output["storage_preflight"] = storage
+    mirror_plan = _public_mirror_plan(value.get("mirror_plan"))
+    if mirror_plan:
+        output["mirror_plan"] = mirror_plan
     syntax = value.get("renderer_syntax_validation")
     if isinstance(syntax, dict):
         safe_syntax: dict[str, object] = {}
@@ -693,12 +866,24 @@ def _public_probe(result: object) -> object:
         "development_only",
         "build_metadata_summary",
         "go_toolchain",
+        "storage_preflight",
+        "mirror_plan",
+        "backup_inventory",
+        "validation_orphans",
     )
     output = {key: result[key] for key in allowed if key in result}
     if "build_metadata_summary" in result:
         output["build_metadata_summary"] = _public_build_metadata_summary(
             result.get("build_metadata_summary")
         )
+    if "storage_preflight" in result:
+        output["storage_preflight"] = _public_storage_preflight(result.get("storage_preflight"))
+    if "mirror_plan" in result:
+        output["mirror_plan"] = _public_mirror_plan(result.get("mirror_plan"))
+    if "backup_inventory" in result:
+        output["backup_inventory"] = _public_backup_inventory(result.get("backup_inventory"))
+    if "validation_orphans" in result:
+        output["validation_orphans"] = _public_validation_orphans(result.get("validation_orphans"))
     if "desktop_auth" in result:
         output["desktop_auth"] = _public_desktop_auth(result.get("desktop_auth"))
     if "renderer_runtime" in result:
@@ -907,6 +1092,14 @@ def _public_sandbox(result: dict[str, object]) -> dict[str, object]:
             output[key] = result[key]
     if "smoke_root_cleanup" in result:
         output["smoke_root_cleanup"] = _public_cleanup(result.get("smoke_root_cleanup"))
+    if "storage_preflight" in result:
+        output["storage_preflight"] = _public_storage_preflight(result.get("storage_preflight"))
+    if "mirror_plan" in result:
+        output["mirror_plan"] = _public_mirror_plan(result.get("mirror_plan"))
+    if "backup_inventory" in result:
+        output["backup_inventory"] = _public_backup_inventory(result.get("backup_inventory"))
+    if "validation_orphans" in result:
+        output["validation_orphans"] = _public_validation_orphans(result.get("validation_orphans"))
     for key in ("probe_a_normal", "probe_b_disable_gpu_sandbox", "probe_c_acl_normal_sandbox"):
         if key in result:
             output[key] = _public_probe(result[key])
@@ -1039,10 +1232,34 @@ def _run_external_patched_shell(
                     "payload_acl_strategy": metadata.get("payload_acl_strategy"),
                     "source_app_asar_sha256": metadata.get("source_app_asar_sha256"),
                     "renderer_syntax_validation": metadata.get("renderer_syntax_validation"),
+                    "storage_preflight": metadata.get("storage_preflight"),
+                    "install_policy": metadata.get("install_policy"),
+                    "mirror_plan": metadata.get("mirror_plan"),
                 }
-    except (PackagingBlockedError, OSError, RuntimeError, subprocess.SubprocessError) as error:
+    except StorageBlockedError as error:
         result = {
-            "status": PHASE2A5_PATCHED_SHELL_BLOCKED,
+            "status": PHASE2A5_STORAGE_BLOCKED,
+            "reason": _safe_error(error),
+            "storage_preflight": getattr(error, "evidence", {}),
+            "manual_operation_required": True,
+        }
+    except OSError as error:
+        if is_storage_exhaustion(error):
+            result = {
+                "status": PHASE2A5_STORAGE_BLOCKED,
+                "reason": f"{PHASE2A5_STORAGE_BLOCKED}: {_safe_error(error)}",
+                "storage_preflight": {},
+                "manual_operation_required": True,
+            }
+        else:
+            result = {
+                "status": PHASE2A5_PATCHED_SHELL_BLOCKED,
+                "reason": _safe_error(error),
+                "manual_operation_required": True,
+            }
+    except (PackagingBlockedError, RuntimeError, subprocess.SubprocessError) as error:
+        result = {
+            "status": _phase2a5_failure_status(error, PHASE2A5_PATCHED_SHELL_BLOCKED),
             "reason": _safe_error(error),
             "manual_operation_required": True,
         }
@@ -1146,6 +1363,10 @@ def prepare_desktop_auth(
             "post_rebuild_check": {"status": "NOT_RUN", "graceful_shutdown": "NOT_RUN"},
         },
         "rebuild": None,
+        "storage_preflight": None,
+        "backup_inventory": None,
+        "validation_orphans": None,
+        "mirror_plan": None,
         "manual_operation_required": True,
     }
 
@@ -1241,6 +1462,11 @@ def prepare_desktop_auth(
             exists=_persistent_profile_state_is_intact(layout),
             preserved=True,
         )
+        result["backup_inventory"] = inventory_router_backups()
+        result["validation_orphans"] = inventory_generated_validation_roots(
+            local_appdata,
+            layout.root,
+        )
 
         destination = layout.patched_shell
 
@@ -1263,6 +1489,9 @@ def prepare_desktop_auth(
                 "payload_acl_strategy": metadata.get("payload_acl_strategy"),
                 "source_app_asar_sha256": metadata.get("source_app_asar_sha256"),
                 "renderer_syntax_validation": metadata.get("renderer_syntax_validation"),
+                "storage_preflight": metadata.get("storage_preflight"),
+                "install_policy": metadata.get("install_policy"),
+                "mirror_plan": metadata.get("mirror_plan"),
             }
 
         def boot(*, fail_if_auth_required: bool) -> dict[str, object]:
@@ -1376,8 +1605,35 @@ def prepare_desktop_auth(
                 "manual_operation_required": False,
             }
         )
-    except (PackagingBlockedError, OSError, RuntimeError, subprocess.SubprocessError) as error:
-        result.update({"status": PHASE2A5_FAIL, "reason": _safe_error(error), "manual_operation_required": True})
+    except StorageBlockedError as error:
+        result.update(
+            {
+                "status": PHASE2A5_STORAGE_BLOCKED,
+                "reason": _safe_error(error),
+                "storage_preflight": getattr(error, "evidence", {}),
+                "manual_operation_required": True,
+            }
+        )
+    except OSError as error:
+        if is_storage_exhaustion(error):
+            result.update(
+                {
+                    "status": PHASE2A5_STORAGE_BLOCKED,
+                    "reason": f"{PHASE2A5_STORAGE_BLOCKED}: {_safe_error(error)}",
+                    "storage_preflight": {},
+                    "manual_operation_required": True,
+                }
+            )
+        else:
+            result.update({"status": PHASE2A5_FAIL, "reason": _safe_error(error), "manual_operation_required": True})
+    except (PackagingBlockedError, RuntimeError, subprocess.SubprocessError) as error:
+        result.update(
+            {
+                "status": _phase2a5_failure_status(error, PHASE2A5_FAIL),
+                "reason": _safe_error(error),
+                "manual_operation_required": True,
+            }
+        )
     return finish()
 
 
@@ -1402,6 +1658,10 @@ def _artifact_result(result: dict[str, object]) -> dict[str, object]:
         "acl_strategy_verdict",
         "patched_shell",
         "validation_profile",
+        "storage_preflight",
+        "backup_inventory",
+        "validation_orphans",
+        "mirror_plan",
         "auth_boots",
         "auth_persistence",
         "rebuild",
@@ -1424,6 +1684,14 @@ def _artifact_result(result: dict[str, object]) -> dict[str, object]:
             output[key] = _public_auth_persistence(result[key])
         elif key == "rebuild":
             output[key] = _public_build_metadata_summary(result[key])
+        elif key == "storage_preflight":
+            output[key] = _public_storage_preflight(result[key])
+        elif key == "backup_inventory":
+            output[key] = _public_backup_inventory(result[key])
+        elif key == "validation_orphans":
+            output[key] = _public_validation_orphans(result[key])
+        elif key == "mirror_plan":
+            output[key] = _public_mirror_plan(result[key])
         else:
             output[key] = result[key]
     return output
@@ -1462,6 +1730,10 @@ def run_phase2a5_host_validation(
         "host_context": host_context,
         "physical_localappdata": None,
         "validation_profile": None,
+        "storage_preflight": None,
+        "backup_inventory": None,
+        "validation_orphans": None,
+        "mirror_plan": None,
         "source_identity": None,
         "source_review": None,
         "source_stability": None,
@@ -1543,6 +1815,11 @@ def run_phase2a5_host_validation(
             write_artifact(artifact_path, result)
         return result
     result["validation_profile"] = _validation_profile_summary(profile_root, local_appdata)
+    result["backup_inventory"] = inventory_router_backups()
+    result["validation_orphans"] = inventory_generated_validation_roots(
+        local_appdata,
+        profile_root,
+    )
 
     try:
         source, diagnostics = discover_desktop_source(source_override)
@@ -1675,6 +1952,11 @@ def run_phase2a5_host_validation(
                         result["reason"] = (
                             "the persistent Router Desktop validation profile requires normal interactive ChatGPT login"
                         )
+                    elif patched.get("status") == PHASE2A5_STORAGE_BLOCKED:
+                        result["status"] = PHASE2A5_STORAGE_BLOCKED
+                        result["reason"] = patched.get("reason")
+                        result["storage_preflight"] = patched.get("storage_preflight")
+                        result["manual_operation_required"] = True
                     elif patched.get("status") == PHASE2A5_PATCHED_SHELL_TOOLCHAIN_BLOCKED:
                         result["status"] = PHASE2A5_PATCHED_SHELL_TOOLCHAIN_BLOCKED
                         result["reason"] = patched.get("reason")
@@ -1692,10 +1974,37 @@ def run_phase2a5_host_validation(
                         and result["patched_shell"].get("manual_operation_required")
                     )
                 )
-    except (PackagingBlockedError, OSError, RuntimeError, subprocess.SubprocessError) as error:
+    except StorageBlockedError as error:
         result.update(
             {
-                "status": PHASE2A5_FAIL,
+                "status": PHASE2A5_STORAGE_BLOCKED,
+                "reason": _safe_error(error),
+                "storage_preflight": getattr(error, "evidence", {}),
+                "manual_operation_required": True,
+            }
+        )
+    except OSError as error:
+        if is_storage_exhaustion(error):
+            result.update(
+                {
+                    "status": PHASE2A5_STORAGE_BLOCKED,
+                    "reason": f"{PHASE2A5_STORAGE_BLOCKED}: {_safe_error(error)}",
+                    "storage_preflight": {},
+                    "manual_operation_required": True,
+                }
+            )
+        else:
+            result.update(
+                {
+                    "status": PHASE2A5_FAIL,
+                    "reason": _safe_error(error),
+                    "manual_operation_required": False,
+                }
+            )
+    except (PackagingBlockedError, RuntimeError, subprocess.SubprocessError) as error:
+        result.update(
+            {
+                "status": _phase2a5_failure_status(error, PHASE2A5_FAIL),
                 "reason": _safe_error(error),
                 "manual_operation_required": False,
             }
@@ -1771,7 +2080,13 @@ def main() -> int:
             validation_profile=args.validation_profile,
         )
         if result.get("manual_operation_required"):
-            if result.get("status") == ROUTER_DESKTOP_AUTH_REQUIRED:
+            if result.get("status") == PHASE2A5_STORAGE_BLOCKED:
+                print(
+                    "Manual operation required: inspect/free space on the reported validation "
+                    "volume and review Router-owned backups/orphan roots; persistent auth state "
+                    "must be preserved."
+                )
+            elif result.get("status") == ROUTER_DESKTOP_AUTH_REQUIRED:
                 print(
                     "Manual operation required: complete normal ChatGPT login in the opened "
                     "Router validation window; credentials are never read by this workflow."
@@ -1795,10 +2110,16 @@ def main() -> int:
         validation_profile=args.validation_profile,
     )
     if result.get("manual_operation_required"):
-        print(
-            "Manual operation required: start this runner from an independently opened "
-            "Windows Terminal/PowerShell process; no official WindowsApps path was modified."
-        )
+        if result.get("status") == PHASE2A5_STORAGE_BLOCKED:
+            print(
+                "Manual operation required: inspect/free space on the reported validation "
+                "volume and review Router-owned backups/orphan roots; do not delete WindowsApps."
+            )
+        else:
+            print(
+                "Manual operation required: start this runner from an independently opened "
+                "Windows Terminal/PowerShell process; no official WindowsApps path was modified."
+            )
     print(f"Phase 2A.5 verdict: {result.get('status')}")
     print(json.dumps(_artifact_result(result), indent=2, ensure_ascii=False))
     if result.get("status") in {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import errno
 import hashlib
 import inspect
 import json
@@ -24,6 +25,7 @@ from scripts.patch_common import (
     validate_patched_javascript_syntax,
 )
 from scripts.patch_app_windows import (
+    InstallPolicy,
     _patched_javascript_assets,
     _atomic_install,
     _payload_acl_for_strategy,
@@ -127,12 +129,16 @@ from scripts.windows.host_context import (
 )
 from scripts.windows.phase2a5_host_validation import (
     PHASE2A5_PATCHED_SHELL_TOOLCHAIN_BLOCKED,
+    PHASE2A5_PACKAGE_PROTECTION_BLOCKED,
+    PHASE2A5_RENDERER_BLOCKED,
+    PHASE2A5_SOURCE_READ_BLOCKED,
     PHASE2A5_SOURCE_CHANGED_DURING_VALIDATION,
     PHASE2A5_SOURCE_REVIEW_REQUIRED,
     PHASE2A5_DESKTOP_AUTH_REQUIRED,
     PHASE2A5_DIRECT_HOST_PASS,
     DESKTOP_AUTH_PREPARED,
     _go_toolchain_report,
+    _phase2a5_failure_status,
     _artifact_result,
     _public_probe,
     _run_external_patched_shell,
@@ -160,12 +166,22 @@ from scripts.windows.acl import (
 )
 from scripts.windows.mirror import (
     DirectoryEnumerationBlockedError,
+    PHASE2A5_STORAGE_BLOCKED,
+    StorageBlockedError,
+    UNKNOWN_REQUIRED,
     PackagingBlockedError,
+    classify_source_path,
     derive_unpack_directories,
     derive_unpack_files,
+    inventory_generated_validation_roots,
+    inventory_router_backups,
+    is_storage_exhaustion,
     mirror_directory,
     mirror_desktop_source,
+    plan_mirror_directory,
+    require_storage_capacity,
     should_exclude,
+    storage_preflight,
 )
 
 
@@ -1275,6 +1291,109 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         self.assertNotIn("control-token-secret", encoded)
         self.assertNotIn("user@example.com", encoded)
 
+    def test_public_artifact_contains_safe_storage_failure_evidence(self) -> None:
+        raw = {
+            "status": PHASE2A5_STORAGE_BLOCKED,
+            "reason": "free space is below the planned mirror requirement",
+            "storage_preflight": {
+                "operation": "validation-patched-shell-build",
+                "volume": "E:",
+                "free_bytes": 10,
+                "estimated_required_bytes": 100,
+                "planned_mirror_bytes": 50,
+                "planned_mirror_file_count": 4,
+                "existing_validation_shell_bytes": 20,
+                "asar_working_set_bytes": 20,
+                "temporary_repacked_asar_bytes": 5,
+                "safety_headroom_bytes": 5,
+                "capacity_query_ok": True,
+                "existing_destination_size_known": True,
+                "asar_size_known": True,
+                "pass": False,
+                "mirror_plan": {
+                    "strategy": "walk",
+                    "planned_file_count": 4,
+                    "planned_mirror_bytes": 50,
+                    "excluded_file_count": 1,
+                    "excluded_bytes": 7,
+                    "planning_warning": "normal walk unavailable",
+                },
+                "secret_path": r"C:\Users\test\cookies.sqlite",
+                "probes": {
+                    "A": {
+                        "operation": "sandbox-mirror",
+                        "volume": "E:",
+                        "free_bytes": 10,
+                        "estimated_required_bytes": 60,
+                        "pass": False,
+                        "root": r"C:\Users\test\secret-root",
+                    }
+                },
+            },
+            "backup_inventory": {
+                "root": r"C:\Users\test\.codex-mux\backups",
+                "windows_desktop_backup_count": 3,
+                "windows_desktop_backup_bytes": 999,
+                "scan_complete": True,
+            },
+            "validation_orphans": {
+                "candidate_count": 2,
+                "candidate_bytes": 123,
+                "candidate_paths": [
+                    "_host-validation/phase2a5-left",
+                    r"C:\Users\test\secret-root",
+                    "../outside",
+                ],
+                "scan_complete": True,
+            },
+            "mirror_plan": {
+                "strategy": "walk",
+                "planned_file_count": 4,
+                "planned_mirror_bytes": 50,
+            },
+        }
+
+        artifact = _artifact_result(raw)
+        encoded = json.dumps(artifact, sort_keys=True)
+
+        self.assertEqual(artifact["status"], PHASE2A5_STORAGE_BLOCKED)
+        self.assertEqual(artifact["storage_preflight"]["free_bytes"], 10)
+        self.assertEqual(artifact["storage_preflight"]["probes"]["A"]["operation"], "sandbox-mirror")
+        self.assertEqual(
+            artifact["validation_orphans"]["candidate_paths"],
+            ["_host-validation/phase2a5-left"],
+        )
+        self.assertNotIn("secret_path", encoded)
+        self.assertNotIn("secret-root", encoded)
+        self.assertNotIn("cookies.sqlite", encoded)
+
+    def test_phase2a5_failure_status_keeps_source_package_renderer_and_default_distinct(self) -> None:
+        self.assertEqual(
+            _phase2a5_failure_status(
+                PackagingBlockedError("PHASE 2A SOURCE READ BLOCKED: AppxBlockMap unavailable"),
+                "PHASE 2A.5 FAIL",
+            ),
+            PHASE2A5_SOURCE_READ_BLOCKED,
+        )
+        self.assertEqual(
+            _phase2a5_failure_status(
+                PackagingBlockedError("PHASE 2 PACKAGING BLOCKED: required copy access denied"),
+                "PHASE 2A.5 FAIL",
+            ),
+            PHASE2A5_PACKAGE_PROTECTION_BLOCKED,
+        )
+        self.assertEqual(
+            _phase2a5_failure_status(
+                RuntimeError("PHASE 2A.5 RENDERER SYNTAX BLOCKED"),
+                "PHASE 2A.5 FAIL",
+            ),
+            PHASE2A5_RENDERER_BLOCKED,
+        )
+        self.assertEqual(
+            _phase2a5_failure_status(RuntimeError("mux process failed"), "PHASE 2A.5 FAIL"),
+            "PHASE 2A.5 FAIL",
+        )
+
     def test_router_runtime_markers_are_exposed_by_bridge_and_account_menu(self) -> None:
         account_menu = (Path(__file__).resolve().parents[2] / "ui" / "account-menu.js").read_text(
             encoding="utf-8"
@@ -1443,6 +1562,80 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         self.assertIn("independently from an unpackaged Windows process", result["reason"])
         canary.assert_not_called()
         discover.assert_not_called()
+
+    def test_phase2a5_host_propagates_storage_block_with_sanitized_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            local_appdata = root / "local"
+            artifact = root / "result.json"
+            source = SimpleNamespace(
+                source_root=root / "WindowsApps",
+                app_dir=root / "WindowsApps" / "app",
+                executable=root / "WindowsApps" / "app" / "ChatGPT.exe",
+            )
+            selected = SimpleNamespace(
+                path=root / "codex.exe",
+                version="codex-cli test",
+                sha256="b" * 64,
+                authenticode=SimpleNamespace(status="Valid", signer="CN=OpenAI"),
+            )
+            storage_error = StorageBlockedError(
+                f"{PHASE2A5_STORAGE_BLOCKED}: insufficient free space",
+                evidence={
+                    "operation": "sandbox-mirror",
+                    "volume": "E:",
+                    "free_bytes": 1,
+                    "estimated_required_bytes": 2,
+                    "pass": False,
+                    "secret_path": r"C:\Users\test\cookies.sqlite",
+                },
+            )
+            with patch(
+                "scripts.windows.phase2a5_host_validation.collect_startup_runtime",
+                return_value={"go_toolchain": {"selected": "go.exe", "usable": True, "probes": []}},
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.detect_windows_host_context",
+                return_value={"has_package_identity": False, "LOCALAPPDATA": str(local_appdata)},
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.run_localappdata_canary",
+                return_value={"filesystem_virtualized": False},
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.discover_desktop_source",
+                return_value=(source, SourceDiagnostics()),
+            ), patch(
+                "scripts.windows.phase2a5_host_validation._source_identity",
+                return_value={
+                    "package_name": "OpenAI.Codex",
+                    "package_version": "26.825.5331.0",
+                    "architecture": "X64",
+                    "app_file_version": "151.0.7922.174",
+                    "app_asar_sha256": "c" * 64,
+                    "app_asar_header_sha256": "d" * 64,
+                },
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.find_reviewed_source",
+                return_value={"renderer_variant": "windows-26.825"},
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.reviewed_source_is_patchable",
+                return_value=(True, "exact reviewed source"),
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.discover_real_codex",
+                return_value=(selected, [selected]),
+            ), patch(
+                "scripts.windows.phase2a5_host_validation.run_phase2a5_sandbox_validation",
+                side_effect=storage_error,
+            ), patch(
+                "scripts.windows.phase2a5_host_validation._source_stability",
+                return_value={"stable": True, "changed_fields": []},
+            ):
+                result = run_phase2a5_host_validation(repo_root=root, artifact_path=artifact)
+
+            self.assertEqual(result["status"], PHASE2A5_STORAGE_BLOCKED)
+            self.assertTrue(result["manual_operation_required"])
+            self.assertEqual(result["storage_preflight"]["free_bytes"], 1)
+            artifact_text = artifact.read_text(encoding="utf-8")
+            self.assertIn("estimated_required_bytes", artifact_text)
+            self.assertNotIn("cookies.sqlite", artifact_text)
 
     def test_phase2a5_powershell_runner_forwards_python_flags(self) -> None:
         runner = (Path(__file__).resolve().parents[2] / "scripts" / "windows" / "run_phase2a5_host_validation.ps1").read_text(
@@ -1702,6 +1895,127 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             self.assertTrue((destination / "new-marker").is_file())
             self.assertFalse((destination / "old-marker").exists())
             self.assertTrue((userprofile / ".codex-mux" / "backups").is_dir())
+
+    def test_ephemeral_validation_install_removes_rollback_without_touching_persistent_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profile = root / "_validation-profile"
+            destination = profile / "patched-shell"
+            staged = root / "staged"
+            destination.mkdir(parents=True)
+            staged.mkdir()
+            (destination / "old-marker").write_text("old", encoding="utf-8")
+            (staged / "new-marker").write_text("new", encoding="utf-8")
+            persistent_roots = {
+                "User Data": "session",
+                "codex-home": "home",
+                "mux-home": "mux",
+            }
+            for name, marker in persistent_roots.items():
+                state_root = profile / name
+                state_root.mkdir()
+                (state_root / "marker").write_text(marker, encoding="utf-8")
+
+            backup = _atomic_install(
+                staged,
+                destination,
+                force=True,
+                policy=InstallPolicy.EPHEMERAL_ROLLBACK,
+                router_root=profile,
+            )
+
+            self.assertIsNone(backup)
+            self.assertEqual((destination / "new-marker").read_text(encoding="utf-8"), "new")
+            self.assertFalse((destination / "old-marker").exists())
+            self.assertEqual(list(profile.glob(".codex-router-windows-*")), [])
+            for name, marker in persistent_roots.items():
+                self.assertEqual((profile / name / "marker").read_text(encoding="utf-8"), marker)
+            self.assertFalse((root / ".codex-mux" / "backups").exists())
+
+    def test_ephemeral_validation_install_restores_previous_shell_after_final_rename_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profile = root / "_validation-profile"
+            destination = profile / "patched-shell"
+            staged = root / "staged"
+            destination.mkdir(parents=True)
+            staged.mkdir()
+            (destination / "old-marker").write_text("old", encoding="utf-8")
+            (staged / "new-marker").write_text("new", encoding="utf-8")
+            original_rename = Path.rename
+
+            def fail_staged_rename(path: Path, target: Path) -> Path:
+                if path == staged:
+                    raise OSError("simulated final rename failure")
+                return original_rename(path, target)
+
+            with patch.object(Path, "rename", new=fail_staged_rename), self.assertRaisesRegex(
+                OSError,
+                "simulated final rename failure",
+            ):
+                _atomic_install(
+                    staged,
+                    destination,
+                    force=True,
+                    policy=InstallPolicy.EPHEMERAL_ROLLBACK,
+                    router_root=profile,
+                )
+
+            self.assertTrue((destination / "old-marker").is_file())
+            self.assertTrue((staged / "new-marker").is_file())
+            self.assertEqual(list(profile.glob(".codex-router-windows-*")), [])
+
+    def test_router_backup_inventory_counts_only_windows_desktop_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            backup_root = root / "userprofile" / ".codex-mux" / "backups"
+            first = backup_root / "windows-desktop-20260831-010101"
+            second = backup_root / "windows-desktop-20260831-010102"
+            first.mkdir(parents=True)
+            second.mkdir(parents=True)
+            (first / "app.bin").write_bytes(b"123")
+            (second / "nested").mkdir()
+            (second / "nested" / "app.bin").write_bytes(b"12345")
+            (backup_root / "unrelated").mkdir()
+            (backup_root / "unrelated" / "secret.bin").write_bytes(b"not counted")
+            (backup_root / "windows-desktop-file").write_bytes(b"not a directory")
+            (root / "persistent-profile" / "mux-home").mkdir(parents=True)
+            (root / "persistent-profile" / "mux-home" / "state.json").write_text("state", encoding="utf-8")
+
+            inventory = inventory_router_backups(root / "userprofile")
+
+            self.assertEqual(inventory["windows_desktop_backup_count"], 2)
+            self.assertEqual(inventory["windows_desktop_backup_bytes"], 8)
+            self.assertTrue(inventory["scan_complete"])
+
+    def test_validation_orphan_inventory_is_limited_to_router_owned_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            local_appdata = Path(temporary) / "local"
+            owner = local_appdata / "Codex Subscription Router"
+            (owner / "_host-validation" / "phase2a5-left").mkdir(parents=True)
+            (owner / "_host-validation" / "phase2a5-left" / "partial.bin").write_bytes(b"one")
+            (owner / "_host-validation" / "unrelated").mkdir(parents=True)
+            (owner / "_host-validation" / "unrelated" / "ignored.bin").write_bytes(b"ignored")
+            (owner / "_smoke" / "phase2a4-left").mkdir(parents=True)
+            (owner / "_smoke" / "phase2a4-left" / "partial.bin").write_bytes(b"two")
+            profile = owner / "_validation-profile"
+            (profile / ".codex-router-windows-left").mkdir(parents=True)
+            (profile / ".codex-router-windows-left" / "partial.bin").write_bytes(b"three")
+            (profile / "ordinary-state").mkdir(parents=True)
+            (profile / "ordinary-state" / "ignored.bin").write_bytes(b"ignored")
+
+            inventory = inventory_generated_validation_roots(local_appdata, profile)
+
+            self.assertEqual(inventory["candidate_count"], 3)
+            self.assertEqual(inventory["candidate_bytes"], 11)
+            self.assertEqual(
+                set(inventory["candidate_paths"]),
+                {
+                    "_host-validation/phase2a5-left",
+                    "_smoke/phase2a4-left",
+                    "_validation-profile/.codex-router-windows-left",
+                },
+            )
 
     def test_persistent_external_shell_uses_auth_profile_without_disposable_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2360,6 +2674,121 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             ):
                 with self.assertRaises(PackagingBlockedError):
                     mirror_directory(source, root / "destination")
+
+    def test_disk_full_mirror_failure_is_storage_blocked_not_package_protection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "ChatGPT.exe").write_bytes(b"desktop")
+            full = OSError(errno.ENOSPC, "No space left on device")
+            with patch("scripts.windows.mirror.shutil.copy2", side_effect=full):
+                with self.assertRaises(StorageBlockedError) as raised:
+                    mirror_directory(source, root / "destination")
+            self.assertNotIsInstance(raised.exception, PackagingBlockedError)
+            self.assertTrue(str(raised.exception).startswith(PHASE2A5_STORAGE_BLOCKED))
+            self.assertEqual(raised.exception.evidence["failed_relative"], "ChatGPT.exe")
+
+    def test_disk_full_errno_and_win32_errors_are_recognized(self) -> None:
+        self.assertTrue(is_storage_exhaustion(OSError(errno.ENOSPC, "disk full")))
+        for winerror in (39, 112):
+            error = OSError("disk full")
+            error.winerror = winerror
+            self.assertTrue(is_storage_exhaustion(error))
+        self.assertFalse(is_storage_exhaustion(OSError(errno.EACCES, "access denied")))
+
+    def test_storage_preflight_uses_planned_bytes_and_actual_volume_capacity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            (source / "resources").mkdir(parents=True)
+            (source / "ChatGPT.exe").write_bytes(b"desktop")
+            asar = source / "resources" / "app.asar"
+            asar.write_bytes(b"asar" * 10)
+            (source / "resources" / "app.asar.unpacked").mkdir()
+            (source / "resources" / "app.asar.unpacked" / "native.node").write_bytes(b"native")
+            plan = plan_mirror_directory(source)
+            destination = root / "destination"
+            userprofile = root / "userprofile"
+            local_appdata = root / "local"
+
+            with patch(
+                "scripts.windows.mirror.shutil.disk_usage",
+                return_value=SimpleNamespace(free=0),
+            ):
+                blocked = storage_preflight(
+                    plan,
+                    destination,
+                    operation="patched-shell-build",
+                    asar_path=asar,
+                    userprofile=userprofile,
+                    local_appdata=local_appdata,
+                )
+            self.assertFalse(blocked["pass"])
+            self.assertEqual(blocked["planned_mirror_bytes"], plan.required_bytes)
+            self.assertEqual(blocked["planned_mirror_file_count"], len(plan.files))
+            self.assertGreater(blocked["asar_working_set_bytes"], 0)
+            with self.assertRaises(StorageBlockedError):
+                require_storage_capacity(blocked)
+
+            with patch(
+                "scripts.windows.mirror.shutil.disk_usage",
+                return_value=SimpleNamespace(free=blocked["estimated_required_bytes"] + 1),
+            ):
+                sufficient = storage_preflight(
+                    plan,
+                    destination,
+                    operation="patched-shell-build",
+                    asar_path=asar,
+                    userprofile=userprofile,
+                    local_appdata=local_appdata,
+                )
+            self.assertTrue(sufficient["pass"])
+
+    def test_code_mode_host_remains_required_until_optional_evidence_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            code_mode_host = source / "resources" / "codex-code-mode-host"
+            code_mode_host.mkdir(parents=True)
+            (code_mode_host / "host.node").write_bytes(b"required native host")
+            (source / "resources").mkdir(exist_ok=True)
+            (source / "resources" / "app.asar").write_bytes(b"asar")
+            (source / "ChatGPT.exe").write_bytes(b"desktop")
+
+            relative = Path("resources") / "codex-code-mode-host" / "host.node"
+            plan = plan_mirror_directory(source)
+
+            self.assertEqual(classify_source_path(relative), UNKNOWN_REQUIRED)
+            self.assertFalse(should_exclude(relative))
+            self.assertIn(relative, [entry.relative for entry in plan.files])
+            report = mirror_directory(source, root / "destination")
+            self.assertTrue((root / "destination" / relative).is_file())
+            self.assertNotIn(relative.as_posix(), report.excluded)
+
+    def test_enospc_partial_mirror_is_cleaned_by_exact_disposable_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "ChatGPT.exe").write_bytes(b"desktop")
+            (source / "resources.pak").write_bytes(b"pak")
+            full = OSError(errno.ENOSPC, "No space left on device")
+            cleanup: dict[str, object] = {}
+            with patch("scripts.windows.smoke.os.name", "nt"), patch(
+                "scripts.windows.smoke.os.environ",
+                {"LOCALAPPDATA": str(root / "local")},
+            ):
+                with final_layout_smoke_root(cleanup) as smoke_root:
+                    with patch(
+                        "scripts.windows.mirror.shutil.copy2",
+                        side_effect=[None, full],
+                    ):
+                        with self.assertRaises(StorageBlockedError):
+                            mirror_directory(source, smoke_root / "app" / "partial")
+                    self.assertTrue(smoke_root.exists())
+            self.assertTrue(cleanup["removed"])
+            self.assertFalse(Path(cleanup["resolved_path"]).exists())
 
     def test_source_probe_output_is_structured_and_non_sensitive(self) -> None:
         diagnostics = SourceDiagnostics(

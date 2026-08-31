@@ -27,6 +27,16 @@ This round adds:
   graceful Desktop quit action;
 - external OAuth-browser observation without treating an unowned browser as a
   cleanup target;
+- one shared mirror plan used by storage preflight and the actual copy, with
+  required/optional source classification preserved for `resources\codex-code-mode-host`;
+- actual-volume capacity preflight for Phase 2A.5 mirrors and patched-shell
+  builds, including planned mirror bytes, current validation-shell bytes,
+  ASAR working-set estimates, bounded headroom, and Router-owned backup/orphan
+  inventory;
+- disk-full classification that reports `PHASE 2A.5 STORAGE BLOCKED` instead
+  of misreporting `ENOSPC` as package protection;
+- `EPHEMERAL_ROLLBACK` replacement for the persistent validation shell, while
+  ordinary user builds retain recoverable `windows-desktop-*` backups;
 - an ignored `docs/generated/WINDOWS-PHASE2A5-HOST-RESULT.json` artifact path.
 
 Phase 2A.6 adds a second fail-closed gate before the native probes: the
@@ -36,6 +46,19 @@ executable-version, ASAR-hash, or ASAR-header-hash mismatch stops with
 `PHASE 2A.5 SOURCE REVIEW REQUIRED`; the identity and source diagnostics are
 still retained in the artifact.  The old compatibility markdown remains a
 release list and is not widened by this registry refresh.
+
+## Storage-failure source classification
+
+The failed native copy named `resources\codex-code-mode-host`.  The repository
+does not contain the unpacked `OpenAI.Codex 26.825.5331.0` source needed to
+prove whether that component is separately launched, referenced by the exact
+`app.asar`, or safely replaced by the Router mux architecture.  The reviewed
+source registry records the exact package and ASAR identity, but it is not
+runtime evidence for optionality.  Therefore `resources\codex-code-mode-host`
+remains `UNKNOWN_REQUIRED`: it is included in the planned mirror and copied by
+the validation build.  The storage-specific error path handles failure while
+copying it without weakening this requirement or reclassifying the failure as
+package protection.
 
 The existing Phase 2A.4 CI baseline was green before this round.  The current
 round must still pass both `checks` and `windows-go-core` before compatibility
@@ -192,6 +215,27 @@ credential-free diagnostic artifact under `docs/generated/`, which is ignored
 by Git.  It never logs in, adds an account, sends a chat, consumes reset
 credits, or modifies the official WindowsApps installation.
 
+Before rerunning after a storage failure, inspect the actual validation volume
+and the artifact's `storage_preflight` object.  The preflight reports the
+planned mirror size, current validation shell size, ASAR working-set estimate,
+bounded safety headroom, and the exact Router-owned backup/orphan counts.  The
+inventory is diagnostic-only: the validator never deletes existing permanent
+backups or guesses at cleanup targets.  If manual cleanup is necessary, limit
+it to positively identified Router-owned entries such as:
+
+```text
+%USERPROFILE%\.codex-mux\backups\windows-desktop-*
+%LOCALAPPDATA%\Codex Subscription Router\_host-validation\phase2a5-*
+%LOCALAPPDATA%\Codex Subscription Router\_smoke\phase2a2-*, phase2a3-*, phase2a4-*, phase2a5-*
+%LOCALAPPDATA%\Codex Subscription Router\_validation-profile\.codex-router-windows-*
+```
+
+Do not delete or alter anything under `WindowsApps`.  A storage failure is a
+capacity/cleanup prerequisite; it is not evidence of a renderer, auth, mux, or
+Chromium-sandbox regression.  If the persistent profile is already present,
+do not run the manual login preparation command again just to retry a storage
+failure.
+
 The artifact must be reviewed for, in order:
 
 1. `has_package_identity = false` from the native API;
@@ -294,6 +338,10 @@ PHASE 2A.5 GPU SANDBOX REGRESSION
 PHASE 2A.5 PATCHED SHELL BLOCKED
 PHASE 2A.5 SOURCE REVIEW REQUIRED
 PHASE 2A.5 SOURCE CHANGED DURING VALIDATION
+PHASE 2A.5 STORAGE BLOCKED
+PHASE 2A.5 SOURCE READ BLOCKED
+PHASE 2A.5 PACKAGE PROTECTION BLOCKED
+PHASE 2A.5 RENDERER BLOCKED
 PATCHED SHELL TOOLCHAIN BLOCKED
 ROUTER_DESKTOP_AUTH_NOT_PERSISTED
 ROUTER_DESKTOP_AUTH_LOST_AFTER_REBUILD
@@ -304,22 +352,28 @@ PHASE 2A.5 FAIL
 
 ## Next manual operation
 
-Both CI gates are now green.  From an independently opened ordinary
-PowerShell, run the one-time Desktop authentication preparation first:
-
-```powershell
-Set-Location -LiteralPath 'E:\Projects\codex-subscription-router-for-windows'
-.\scripts\windows\prepare_phase2a5_desktop_auth.ps1
-```
-
-Complete normal ChatGPT login only in the visible validation window.  After it
-reports `DESKTOP_AUTH_PREPARED`, run the native validation with the explicit CI
-gate:
+Both CI gates are now green.  First inspect/free sufficient space on the
+validation volume and review the exact Router-owned backup/orphan inventory in
+the previous artifact.  Then, from an independently opened ordinary
+PowerShell, run the native validator directly:
 
 ```powershell
 Set-Location -LiteralPath 'E:\Projects\codex-subscription-router-for-windows'
 .\scripts\windows\run_phase2a5_host_validation.ps1 --ci-verified
 ```
 
-Do not add a second account, send a real chat, or begin Phase 2B.  Do not
-launch this external-host validation automatically from Codex.
+If the persistent profile is still valid, the validator reuses it.  Only if it
+reports `PHASE 2A.5 DESKTOP AUTH REQUIRED` should you run the one-time
+preparation workflow and complete normal ChatGPT login in the visible
+Router-owned validation window:
+
+```powershell
+.\scripts\windows\prepare_phase2a5_desktop_auth.ps1
+```
+
+After it reports `DESKTOP_AUTH_PREPARED`, rerun the validator with
+`--ci-verified`.  If the validator reports `PHASE 2A.5 STORAGE BLOCKED`, stop
+and use the artifact's sanitized preflight evidence to guide the next manual
+capacity review.  Do not add a second account, send a real chat, begin Phase
+2B, delete WindowsApps content, or launch this external-host validation
+automatically from Codex.

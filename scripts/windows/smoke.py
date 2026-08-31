@@ -34,7 +34,15 @@ try:
     )
     from .acl import audit_acl_scope, prepare_windows_electron_payload_acl
     from .host_context import detect_windows_host_context, run_localappdata_canary
-    from .mirror import mirror_desktop_source, verify_desktop_mirror
+    from .mirror import (
+        PHASE2A5_STORAGE_BLOCKED as MIRROR_STORAGE_BLOCKED,
+        StorageBlockedError,
+        mirror_desktop_source,
+        plan_mirror_source,
+        require_storage_capacity,
+        storage_preflight,
+        verify_desktop_mirror,
+    )
 except ImportError:
     from discovery import (
         DesktopExecutableCandidate,
@@ -53,7 +61,15 @@ except ImportError:
     )
     from acl import audit_acl_scope, prepare_windows_electron_payload_acl
     from host_context import detect_windows_host_context, run_localappdata_canary
-    from mirror import mirror_desktop_source, verify_desktop_mirror
+    from mirror import (
+        PHASE2A5_STORAGE_BLOCKED as MIRROR_STORAGE_BLOCKED,
+        StorageBlockedError,
+        mirror_desktop_source,
+        plan_mirror_source,
+        require_storage_capacity,
+        storage_preflight,
+        verify_desktop_mirror,
+    )
 
 
 BLOCKED_UPDATER_IDENTITY = "BLOCKED_UPDATER_IDENTITY"
@@ -90,6 +106,7 @@ PHASE2A5_DIRECT_HOST_PASS = "PHASE 2A.5 DIRECT HOST PASS"
 PHASE2A5_ACL_FIX_CONFIRMED = "PHASE 2A.5 ACL FIX CONFIRMED"
 PHASE2A5_GPU_SANDBOX_REGRESSION = "PHASE 2A.5 GPU SANDBOX REGRESSION"
 PHASE2A5_PATCHED_SHELL_BLOCKED = "PHASE 2A.5 PATCHED SHELL BLOCKED"
+PHASE2A5_STORAGE_BLOCKED = MIRROR_STORAGE_BLOCKED
 PHASE2A5_FAIL = "PHASE 2A.5 FAIL"
 
 DIRECT_LAUNCH_PASS = "DIRECT_LAUNCH_PASS"
@@ -2192,7 +2209,15 @@ def run_phase2a5_sandbox_validation(
     acl_remediation: dict[str, object] = _phase2a5_not_run("Probe C was not required")
     mirror_reports: dict[str, object] = {}
     probe_root_paths: dict[str, object] = {}
+    storage_preflights: dict[str, dict[str, object]] = {}
     production_acl_strategy = "UNRESOLVED"
+    mirror_plan = plan_mirror_source(source)
+    raw_local_appdata = os.environ.get("LOCALAPPDATA")
+    local_appdata = (
+        Path(raw_local_appdata)
+        if raw_local_appdata
+        else Path.home() / "AppData" / "Local"
+    )
 
     with final_layout_smoke_root(
         cleanup_status,
@@ -2202,9 +2227,21 @@ def run_phase2a5_sandbox_validation(
         if cleanup_status.get("path_virtualized") is not True:
             def create_mirror(label: str) -> tuple[Path, Path, object]:
                 workspace = root / label
-                workspace.mkdir(parents=True, exist_ok=True)
                 mirror_root = workspace / "app"
-                report = mirror_desktop_source(source, mirror_root)
+                preflight = storage_preflight(
+                    mirror_plan,
+                    mirror_root,
+                    operation="sandbox-mirror",
+                    local_appdata=local_appdata,
+                )
+                storage_preflights[label] = preflight
+                require_storage_capacity(preflight)
+                workspace.mkdir(parents=True, exist_ok=True)
+                try:
+                    report = mirror_desktop_source(source, mirror_root, plan=mirror_plan)
+                except StorageBlockedError as error:
+                    error.evidence = {**preflight, **getattr(error, "evidence", {})}
+                    raise
                 verify_desktop_mirror(source.app_dir, mirror_root)
                 mirror_reports[label] = report.to_dict()
                 probe_root_paths[label] = {
@@ -2347,6 +2384,17 @@ def run_phase2a5_sandbox_validation(
             "probe_roots": probe_root_paths,
         },
         "mirror": mirror_reports,
+        "mirror_plan": mirror_plan.to_dict(),
+        "storage_preflight": (
+            {
+                "operation": "sandbox-mirror",
+                "pass": bool(storage_preflights)
+                and all(item.get("pass") is True for item in storage_preflights.values()),
+                "probes": storage_preflights,
+            }
+            if storage_preflights
+            else None
+        ),
         "acl_before": acl_before,
         "acl_remediation": acl_remediation,
         "acl_after": acl_after,

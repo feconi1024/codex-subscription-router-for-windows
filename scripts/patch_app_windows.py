@@ -11,6 +11,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
+from enum import Enum
 from pathlib import Path, PureWindowsPath
 from typing import Mapping
 
@@ -53,6 +55,7 @@ try:
         source_access_probes,
         is_windowsapps_path,
         inventory_desktop_executables,
+        path_is_within,
         select_authoritative_desktop_candidate,
     )
     from .windows.fuses import FuseSnapshot
@@ -88,13 +91,18 @@ try:
         validation_profile_layout,
     )
     from .windows.mirror import (
-        MirrorReport,
+        PHASE2A5_STORAGE_BLOCKED,
         PackagingBlockedError,
+        StorageBlockedError,
         copy_unpacked_tree,
         derive_unpack_directories,
         derive_unpack_files,
         mirror_desktop_source,
+        plan_mirror_source,
+        require_storage_capacity,
+        storage_preflight,
         verify_desktop_mirror,
+        is_storage_exhaustion,
     )
     from .windows.reviewed_sources import find_reviewed_source, reviewed_source_is_patchable
 except ImportError:
@@ -136,6 +144,7 @@ except ImportError:
         source_access_probes,
         is_windowsapps_path,
         inventory_desktop_executables,
+        path_is_within,
         select_authoritative_desktop_candidate,
     )
     from windows.fuses import FuseSnapshot
@@ -171,13 +180,18 @@ except ImportError:
         validation_profile_layout,
     )
     from windows.mirror import (
-        MirrorReport,
+        PHASE2A5_STORAGE_BLOCKED,
         PackagingBlockedError,
+        StorageBlockedError,
         copy_unpacked_tree,
         derive_unpack_directories,
         derive_unpack_files,
         mirror_desktop_source,
+        plan_mirror_source,
+        require_storage_capacity,
+        storage_preflight,
         verify_desktop_mirror,
+        is_storage_exhaustion,
     )
     from windows.reviewed_sources import find_reviewed_source, reviewed_source_is_patchable
 
@@ -192,6 +206,13 @@ PHASE2A6_RENDERER_ADAPTATION_REQUIRED = "PHASE 2A.6 RENDERER ADAPTATION REQUIRED
 PHASE2A6_BOOTSTRAP_BLOCKED = "PHASE 2A.6 BOOTSTRAP BLOCKED"
 PHASE2A6_INTEGRITY_BLOCKED = "PHASE 2A.6 INTEGRITY BLOCKED"
 PHASE2A6_FAIL = "PHASE 2A.6 FAIL"
+
+
+class InstallPolicy(str, Enum):
+    """Choose whether a replacement keeps or discards the old validation shell."""
+
+    RECOVERABLE_BACKUP = "RECOVERABLE_BACKUP"
+    EPHEMERAL_ROLLBACK = "EPHEMERAL_ROLLBACK"
 
 
 def parse_args() -> argparse.Namespace:
@@ -1280,7 +1301,10 @@ def _metadata(
         "mirror": {
             "strategy": mirror_report.strategy,
             "copied_count": len(mirror_report.copied),
+            "planned_file_count": mirror_report.planned_file_count,
+            "planned_mirror_bytes": mirror_report.planned_mirror_bytes,
             "excluded": mirror_report.excluded,
+            "excluded_bytes": mirror_report.excluded_bytes,
             "copy_failures": mirror_report.copy_failures,
             "required_failures": mirror_report.required_failures,
         },
@@ -1288,26 +1312,84 @@ def _metadata(
     }
 
 
-def _atomic_install(staged: Path, destination: Path, force: bool) -> Path | None:
+def _atomic_install(
+    staged: Path,
+    destination: Path,
+    force: bool,
+    *,
+    policy: InstallPolicy = InstallPolicy.RECOVERABLE_BACKUP,
+    router_root: Path | None = None,
+) -> Path | None:
+    """Atomically install a build with an explicit rollback/retention policy."""
+
+    try:
+        policy = InstallPolicy(policy)
+    except ValueError as error:
+        raise RuntimeError(f"unknown Windows Desktop install policy: {policy}") from error
+    if policy == InstallPolicy.EPHEMERAL_ROLLBACK:
+        destination_parent = destination.parent.resolve(strict=False)
+        if router_root is None:
+            raise RuntimeError("ephemeral rollback requires an explicit Router-owned root")
+        router_root = router_root.expanduser().resolve(strict=False)
+        if (
+            is_windowsapps_path(destination_parent)
+            or is_windowsapps_path(router_root)
+            or destination_parent != router_root
+            or not path_is_within(destination, router_root)
+        ):
+            raise RuntimeError("ephemeral rollback must remain in the Router-owned destination directory")
     if destination.exists() and not force:
         raise RuntimeError(f"destination exists: {destination} (pass --force to replace it)")
     backup: Path | None = None
+    rollback: Path | None = None
     if destination.exists():
-        backup_root = Path(os.environ.get("USERPROFILE", Path.home())) / ".codex-mux" / "backups"
-        backup_root.mkdir(parents=True, exist_ok=True)
-        backup = backup_root / f"windows-desktop-{time.strftime('%Y%m%d-%H%M%S')}"
-        suffix = 1
-        while backup.exists():
-            backup = backup_root / f"windows-desktop-{time.strftime('%Y%m%d-%H%M%S')}-{suffix}"
-            suffix += 1
-        backup.parent.mkdir(parents=True, exist_ok=True)
-        destination.rename(backup)
+        if policy == InstallPolicy.RECOVERABLE_BACKUP:
+            backup_root = Path(os.environ.get("USERPROFILE", Path.home())) / ".codex-mux" / "backups"
+            backup_root.mkdir(parents=True, exist_ok=True)
+            backup = backup_root / f"windows-desktop-{time.strftime('%Y%m%d-%H%M%S')}"
+            suffix = 1
+            while backup.exists():
+                backup = backup_root / f"windows-desktop-{time.strftime('%Y%m%d-%H%M%S')}-{suffix}"
+                suffix += 1
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            destination.rename(backup)
+        else:
+            for _attempt in range(10):
+                candidate = destination_parent / (
+                    f".codex-router-windows-{destination.name}-rollback-"
+                    f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{uuid.uuid4().hex}"
+                )
+                if not candidate.exists():
+                    rollback = candidate
+                    break
+            if rollback is None:
+                raise RuntimeError("could not allocate a unique ephemeral rollback path")
+            destination.rename(rollback)
     try:
         staged.rename(destination)
-    except OSError:
-        if backup is not None and not destination.exists() and backup.exists():
-            backup.rename(destination)
-        raise
+    except OSError as install_error:
+        if rollback is not None and not destination.exists() and rollback.exists():
+            try:
+                rollback.rename(destination)
+            except OSError as restore_error:
+                raise RuntimeError(
+                    "validation shell replacement failed and the previous shell could not be restored"
+                ) from restore_error
+        elif backup is not None and not destination.exists() and backup.exists():
+            try:
+                backup.rename(destination)
+            except OSError as restore_error:
+                raise RuntimeError(
+                    "Desktop replacement failed and the previous build could not be restored"
+                ) from restore_error
+        raise install_error
+    if rollback is not None:
+        try:
+            shutil.rmtree(rollback)
+        except OSError as error:
+            raise RuntimeError(
+                "validation shell installed but its ephemeral rollback could not be removed"
+            ) from error
     return backup
 
 
@@ -1536,8 +1618,32 @@ def build_windows_desktop(
         if persistent_mux_home == destination or persistent_mux_home.is_relative_to(destination):
             raise RuntimeError("persistent CODEX_MUX_HOME must remain outside patched-shell")
         persistent_mux_home.mkdir(parents=True, exist_ok=True)
+    token: str
+    mirror_plan = plan_mirror_source(source)
+    storage_check = storage_preflight(
+        mirror_plan,
+        destination,
+        operation=(
+            "validation-patched-shell-build"
+            if persistent_mux_home is not None
+            else "patched-shell-build"
+        ),
+        current_destination=destination if destination.exists() else None,
+        asar_path=source.app_asar,
+        validation_profile_root=(profile_layout.root if persistent_mux_home is not None else None),
+        local_appdata=validation_profile_local_appdata,
+    )
+    require_storage_capacity(storage_check)
     token = load_or_create_token(persistent_mux_home)
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        if is_storage_exhaustion(error):
+            raise StorageBlockedError(
+                f"{PHASE2A5_STORAGE_BLOCKED}: patched-shell destination could not be created",
+                evidence=storage_check,
+            ) from error
+        raise
     with tempfile.TemporaryDirectory(prefix=".codex-router-windows-", dir=destination.parent) as temporary:
         temporary_root = Path(temporary)
         staged = temporary_root / destination.name
@@ -1546,7 +1652,11 @@ def build_windows_desktop(
         staged_runtime = staged / "runtime"
         extracted = temporary_root / "asar"
         staged.mkdir(parents=True, exist_ok=True)
-        mirror_report = mirror_desktop_source(source, staged_app)
+        try:
+            mirror_report = mirror_desktop_source(source, staged_app, plan=mirror_plan)
+        except StorageBlockedError as error:
+            error.evidence = {**storage_check, **getattr(error, "evidence", {})}
+            raise
         verify_desktop_mirror(source.app_dir, staged_app)
         payload_acl = _payload_acl_for_strategy(
             staged_app,
@@ -1633,7 +1743,15 @@ def build_windows_desktop(
         repacked_asar = temporary_root / "app.asar"
         listing = pack_asar(asar, extracted, repacked_asar, unpack_directories, unpack_files)
         verify_asar_listing(listing, unpacked_source, unpack_directories, unpack_files)
-        shutil.copy2(repacked_asar, staged_resources / "app.asar")
+        try:
+            shutil.copy2(repacked_asar, staged_resources / "app.asar")
+        except OSError as error:
+            if is_storage_exhaustion(error):
+                raise StorageBlockedError(
+                    f"{PHASE2A5_STORAGE_BLOCKED}: repacked app.asar could not be staged",
+                    evidence=storage_check,
+                ) from error
+            raise
         integrity_result = apply_windows_asar_integrity(
             staged_source_executable,
             staged_resources / "app.asar",
@@ -1641,7 +1759,11 @@ def build_windows_desktop(
         )
         generated_unpacked = temporary_root / "app.asar.unpacked"
         if generated_unpacked.is_dir():
-            copy_unpacked_tree(generated_unpacked, staged_resources / "app.asar.unpacked")
+            try:
+                copy_unpacked_tree(generated_unpacked, staged_resources / "app.asar.unpacked")
+            except StorageBlockedError as error:
+                error.evidence = {**storage_check, **getattr(error, "evidence", {})}
+                raise
 
         staged_runtime.mkdir(parents=True, exist_ok=True)
         staged_mux_home = None
@@ -1696,6 +1818,14 @@ def build_windows_desktop(
             "status": "PATCHABLE" if reviewed_ok else "GENERIC_TEST_ESCAPE_HATCH",
             "reason": reviewed_reason,
         }
+        metadata["storage_preflight"] = storage_check
+        metadata["mirror_plan"] = mirror_plan.to_dict()
+        install_policy = (
+            InstallPolicy.EPHEMERAL_ROLLBACK
+            if persistent_mux_home is not None
+            else InstallPolicy.RECOVERABLE_BACKUP
+        )
+        metadata["install_policy"] = install_policy.value
         metadata["state_boundary"] = {
             "persistent": persistent_mux_home is not None,
             "user_data": (
@@ -1728,7 +1858,13 @@ def build_windows_desktop(
             "control_token": staged_control_token,
         }
         validate_staged_layout(required_layout)
-        backup = _atomic_install(staged, destination, force)
+        backup = _atomic_install(
+            staged,
+            destination,
+            force,
+            policy=install_policy,
+            router_root=(profile_layout.root if persistent_mux_home is not None else None),
+        )
     print(f"Windows Desktop staged at {destination}")
     if backup is not None:
         print(f"Previous local build moved to {backup}")
@@ -1785,6 +1921,9 @@ def main() -> int:
             bootstrap_disable_updater=args.bootstrap_disable_updater,
             payload_acl_strategy=args.payload_acl_strategy,
         )
+    except StorageBlockedError as error:
+        print(f"{PHASE2A5_STORAGE_BLOCKED}: {error}", file=sys.stderr)
+        return 1
     except (PackagingBlockedError, RuntimeError, OSError, subprocess.CalledProcessError) as error:
         print(f"Windows patch failed: {error}", file=sys.stderr)
         return 1
