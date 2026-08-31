@@ -6,9 +6,11 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -89,6 +91,7 @@ APP_CONTAINER_ACCESS_FIX_CONFIRMED = "APP_CONTAINER_ACCESS_FIX_CONFIRMED"
 BROADER_CHROMIUM_SANDBOX_BLOCKED = "BROADER_CHROMIUM_SANDBOX_BLOCKED"
 PATCHED_SHELL_PASS = "PATCHED_SHELL_PASS"
 PATCHED_SHELL_BLOCKED = "PATCHED_SHELL_BLOCKED"
+UI_BRIDGE_FOCUSED_PASS = "UI_BRIDGE_FOCUSED_PASS"
 DEVELOPMENT_ONLY_SANDBOX_BYPASS = "DEVELOPMENT_ONLY_SANDBOX_BYPASS"
 
 PHASE2A4_FULL_PASS = "FULL PHASE 2A.4 PASS"
@@ -821,6 +824,9 @@ def validation_profile_layout(
 ROUTER_RENDERER_NOT_LOADED = "ROUTER_RENDERER_NOT_LOADED"
 ROUTER_RENDERER_RUNTIME_ERROR = "ROUTER_RENDERER_RUNTIME_ERROR"
 ROUTER_UI_NOT_READY = "ROUTER_UI_NOT_READY"
+ROUTER_UI_BRIDGE_NOT_STARTED = "ROUTER_UI_BRIDGE_NOT_STARTED"
+ROUTER_UI_BRIDGE_HTTP_FAILED = "ROUTER_UI_BRIDGE_HTTP_FAILED"
+ROUTER_UI_BRIDGE_PORT_UNAVAILABLE = "ROUTER_UI_BRIDGE_PORT_UNAVAILABLE"
 ROUTER_DESKTOP_AUTH_REQUIRED = "ROUTER_DESKTOP_AUTH_REQUIRED"
 ROUTER_DESKTOP_AUTH_UNKNOWN = "ROUTER_DESKTOP_AUTH_UNKNOWN"
 ROUTER_PROFILE_CONTROLLER_NOT_READY = "ROUTER_PROFILE_CONTROLLER_NOT_READY"
@@ -837,6 +843,194 @@ VALIDATION_CODEX_HOME_DIRNAME = "codex-home"
 VALIDATION_MUX_HOME_DIRNAME = "mux-home"
 VALIDATION_PATCHED_SHELL_DIRNAME = "patched-shell"
 AUTH_PERSISTENCE_QUIESCENCE_SECONDS = 2.0
+
+UI_BRIDGE_HOST = "127.0.0.1"
+UI_BRIDGE_PORT = 48124
+UI_BRIDGE_TRANSPORT_READY = "READY"
+_UI_BRIDGE_STARTUP_STAGES = {
+    "NOT_STARTED",
+    "LOADER_REACHED",
+    "TEST_MODE_CONFIRMED",
+    "MODULE_LOAD_STARTED",
+    "MODULE_LOADED",
+    "START_CALLED",
+    "LISTENING",
+    "FAILED",
+}
+_UI_BRIDGE_FAILED_STAGES = {"MODULE_LOAD", "START", "CONTROL_TOKEN_READ", "LISTEN"}
+_UI_BRIDGE_ERROR_NAMES = {
+    "Error",
+    "EvalError",
+    "RangeError",
+    "ReferenceError",
+    "SyntaxError",
+    "TypeError",
+    "URIError",
+}
+_UI_BRIDGE_ERROR_CODES = {
+    "BRIDGE_EXPORT_INVALID",
+    "CONTROL_TOKEN_MISSING",
+    "EADDRINUSE",
+    "EACCES",
+    "ENOENT",
+    "EEXIST",
+    "ERR_MODULE_NOT_FOUND",
+    "ERR_REQUIRE_ESM",
+    "MODULE_NOT_FOUND",
+    "TOKEN_INVALID_FORMAT",
+}
+
+
+def _ui_bridge_error_code(error: BaseException | None) -> str | None:
+    if error is None:
+        return None
+    code = getattr(error, "code", None)
+    if code in _UI_BRIDGE_ERROR_CODES:
+        return str(code)
+    winerror = getattr(error, "winerror", None)
+    if winerror == 10048:
+        return "EADDRINUSE"
+    if winerror == 10013:
+        return "EACCES"
+    return None
+
+
+def preflight_ui_bridge_port(host: str = UI_BRIDGE_HOST, port: int = UI_BRIDGE_PORT) -> dict[str, object]:
+    """Check the bridge port without touching an existing listener."""
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        exclusive_addr_use = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        if exclusive_addr_use is not None:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, exclusive_addr_use, 1)
+            except OSError:
+                pass
+        sock.bind((host, port))
+        return {
+            "pass": True,
+            "host": host,
+            "port": port,
+            "status": UI_BRIDGE_TRANSPORT_READY,
+            "error_code": None,
+        }
+    except OSError as error:
+        return {
+            "pass": False,
+            "host": host,
+            "port": port,
+            "status": ROUTER_UI_BRIDGE_PORT_UNAVAILABLE,
+            "error_code": _ui_bridge_error_code(error),
+        }
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _seed_ui_bridge_status(path: Path) -> None:
+    """Create a fresh, non-sensitive status baseline for this launch only."""
+
+    path.write_text(
+        json.dumps({"schema_version": 1, "stage": "NOT_STARTED"}, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _read_ui_bridge_status(path: Path) -> dict[str, object]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {"stage": "NOT_STARTED", "observed": False}
+    if not isinstance(raw, dict):
+        return {"stage": "NOT_STARTED", "observed": False}
+    stage = raw.get("stage")
+    if not isinstance(stage, str) or stage not in _UI_BRIDGE_STARTUP_STAGES:
+        return {"stage": "NOT_STARTED", "observed": False}
+    result: dict[str, object] = {"stage": stage, "observed": True}
+    if stage == "FAILED":
+        failed_stage = raw.get("failed_stage")
+        if isinstance(failed_stage, str) and failed_stage in _UI_BRIDGE_FAILED_STAGES:
+            result["failed_stage"] = failed_stage
+        error_name = raw.get("error_name")
+        if isinstance(error_name, str) and error_name in _UI_BRIDGE_ERROR_NAMES:
+            result["error_name"] = error_name
+        error_code = raw.get("error_code")
+        if isinstance(error_code, str) and error_code in _UI_BRIDGE_ERROR_CODES:
+            result["error_code"] = error_code
+        token = raw.get("control_token")
+        if isinstance(token, dict):
+            result["control_token"] = {
+                "exists": token.get("exists") is True,
+                "readable": token.get("readable") is True,
+                "valid_format": token.get("valid_format") is True,
+            }
+    return result
+
+
+def _renderer_marker_readable(ui_body: object) -> bool:
+    if not isinstance(ui_body, dict):
+        return False
+    debug = ui_body.get("debug")
+    router = debug.get("router") if isinstance(debug, dict) else None
+    return isinstance(router, dict) and isinstance(router.get("rendererPatchLoaded"), bool)
+
+
+def _ui_bridge_transport(
+    *,
+    port_preflight: dict[str, object],
+    startup: dict[str, object],
+    status_code: int | None,
+    body: object,
+) -> dict[str, object]:
+    if port_preflight.get("pass") is not True:
+        state = ROUTER_UI_BRIDGE_PORT_UNAVAILABLE
+    elif startup.get("stage") != "LISTENING":
+        failed_stage = startup.get("failed_stage")
+        error_code = startup.get("error_code")
+        state = (
+            ROUTER_UI_BRIDGE_PORT_UNAVAILABLE
+            if failed_stage == "LISTEN" and error_code == "EADDRINUSE"
+            else ROUTER_UI_BRIDGE_NOT_STARTED
+        )
+    elif status_code != 200 or not isinstance(body, dict):
+        state = ROUTER_UI_BRIDGE_HTTP_FAILED
+    else:
+        state = UI_BRIDGE_TRANSPORT_READY
+    return {
+        "state": state,
+        "pass": state == UI_BRIDGE_TRANSPORT_READY,
+        "status_code": status_code,
+        "startup": startup,
+        "renderer_marker_readable": _renderer_marker_readable(body) if state == UI_BRIDGE_TRANSPORT_READY else False,
+    }
+
+
+def focused_ui_bridge_diagnostic(
+    *,
+    launcher_running: bool,
+    mux_health: bool,
+    transport: dict[str, object],
+) -> dict[str, object]:
+    """Evaluate the bounded startup proof without requiring account-menu PASS."""
+
+    checks = {
+        "launcher_alive": bool(launcher_running),
+        "mux_health_200": bool(mux_health),
+        "ui_bridge_listening": transport.get("startup", {}).get("stage") == "LISTENING"
+        if isinstance(transport.get("startup"), dict)
+        else False,
+        "ui_bridge_http_200": transport.get("status_code") == 200 and transport.get("pass") is True,
+        "renderer_marker_readable": transport.get("renderer_marker_readable") is True,
+    }
+    return {
+        "pass": all(checks.values()),
+        "checks": checks,
+        "transport_state": transport.get("state"),
+        "status_code": transport.get("status_code"),
+        "startup": transport.get("startup", {}),
+    }
 
 _DESKTOP_AUTH_STATES = {"AUTHENTICATED", "AUTH_REQUIRED", "UNKNOWN"}
 
@@ -943,6 +1137,7 @@ def router_account_menu_gate(
     mounting_expected: bool = True,
     activation_attempted: bool = False,
     activation_succeeded: bool = False,
+    transport_state: str | None = None,
 ) -> dict[str, object]:
     """Evaluate only Router-owned account-menu runtime evidence.
 
@@ -951,6 +1146,20 @@ def router_account_menu_gate(
     component was injected, mounted, or able to load account state.
     """
     evidence = _router_account_menu_evidence(ui_body)
+    if transport_state is not None and transport_state != UI_BRIDGE_TRANSPORT_READY:
+        status = transport_state if transport_state in {
+            ROUTER_UI_BRIDGE_NOT_STARTED,
+            ROUTER_UI_BRIDGE_HTTP_FAILED,
+            ROUTER_UI_BRIDGE_PORT_UNAVAILABLE,
+        } else ROUTER_UI_BRIDGE_NOT_STARTED
+        return {
+            **evidence,
+            "activation_attempted": activation_attempted,
+            "activation_succeeded": activation_succeeded,
+            "transport_state": status,
+            "status": status,
+            "pass": False,
+        }
     runtime = evidence["renderer_runtime"]
     controller = evidence["profile_controller"]
     auth = evidence["desktop_auth"]["state"]
@@ -982,7 +1191,7 @@ def router_account_menu_gate(
             status = ROUTER_MENU_ACCOUNTS_LOADING
         else:
             status = PASS
-        return {**evidence, "activation_attempted": activation_attempted, "activation_succeeded": activation_succeeded, "status": status, "pass": status == PASS}
+        return {**evidence, "activation_attempted": activation_attempted, "activation_succeeded": activation_succeeded, "transport_state": transport_state, "status": status, "pass": status == PASS}
     if not evidence["renderer_loaded"]:
         status = ROUTER_RENDERER_NOT_LOADED
     elif auth == "AUTH_REQUIRED":
@@ -1005,7 +1214,7 @@ def router_account_menu_gate(
         status = ROUTER_MENU_ACCOUNTS_LOADING
     else:
         status = PASS
-    return {**evidence, "activation_attempted": activation_attempted, "activation_succeeded": activation_succeeded, "status": status, "pass": status == PASS}
+    return {**evidence, "activation_attempted": activation_attempted, "activation_succeeded": activation_succeeded, "transport_state": transport_state, "status": status, "pass": status == PASS}
 
 
 def _native_profile_trigger_diagnostic(ui_body: object) -> str:
@@ -1068,6 +1277,7 @@ def run_patched_shell_smoke(
     fail_if_auth_required: bool = False,
     validation_profile_root_override: Path | None = None,
     validation_profile_local_appdata: Path | None = None,
+    focused_bridge_diagnostic_only: bool = False,
 ) -> dict[str, object]:
     """Launch a built Router and verify the production path contract.
 
@@ -1076,6 +1286,8 @@ def run_patched_shell_smoke(
     accidentally point the probe at a user's existing Router installation.
     Persistent authenticated validation must provide the complete
     ``ValidationProfileLayout`` boundary through the three override paths.
+    ``focused_bridge_diagnostic_only`` stops after the bounded launcher/mux/
+    bridge/renderer-marker startup proof and does not require account-menu PASS.
     """
     if os.name != "nt":
         return {
@@ -1306,6 +1518,43 @@ def run_patched_shell_smoke(
             "manual_operation_required": False,
         }
 
+    port_preflight = preflight_ui_bridge_port()
+    if port_preflight.get("pass") is not True:
+        transport_state = ROUTER_UI_BRIDGE_PORT_UNAVAILABLE
+        return {
+            "status": PATCHED_SHELL_BLOCKED,
+            "reason": "UI test bridge port preflight found an occupied or unavailable listener; no unrelated process was terminated",
+            "installation_root": str(root),
+            "production_ready": False,
+            "router_account_menu": router_account_menu_gate({}, transport_state=transport_state),
+            "ui_bridge": {
+                "pass": False,
+                "status_code": None,
+                "transport_state": transport_state,
+                "startup": {"stage": "NOT_STARTED", "observed": False},
+                "port_preflight": port_preflight,
+            },
+            "manual_operation_required": True,
+        }
+
+    bridge_status_path = root / f".ui-test-bridge-status-{uuid.uuid4().hex}.json"
+    try:
+        _seed_ui_bridge_status(bridge_status_path)
+    except OSError as error:
+        return {
+            "status": PATCHED_SHELL_BLOCKED,
+            "reason": "could not create the Router-owned UI bridge startup status file",
+            "installation_root": str(root),
+            "ui_bridge": {
+                "pass": False,
+                "status_code": None,
+                "transport_state": ROUTER_UI_BRIDGE_NOT_STARTED,
+                "startup": {"stage": "NOT_STARTED", "observed": False},
+                "port_preflight": port_preflight,
+            },
+            "manual_operation_required": False,
+        }
+
     environment = os.environ.copy()
     environment.update(
         {
@@ -1318,6 +1567,7 @@ def run_patched_shell_smoke(
             "CODEX_SPARKLE_ENABLED": "false",
             "CODEX_MUX_UI_TESTS": "1",
             "CODEX_MUX_CONTROL_TOKEN": token,
+            "CODEX_MUX_UI_BRIDGE_STATUS_PATH": str(bridge_status_path),
             "ELECTRON_ENABLE_LOGGING": "1",
             "ELECTRON_ENABLE_STACK_DUMPING": "1",
         }
@@ -1365,8 +1615,22 @@ def run_patched_shell_smoke(
         ui_status: int | None = None
         ui_body: object | None = None
         ui_error: str | None = None
+        ui_bridge_startup: dict[str, object] = {"stage": "NOT_STARTED", "observed": False}
+        ui_bridge_transport = _ui_bridge_transport(
+            port_preflight=port_preflight,
+            startup=ui_bridge_startup,
+            status_code=ui_status,
+            body=ui_body,
+        )
+        focused_bridge = focused_ui_bridge_diagnostic(
+            launcher_running=False,
+            mux_health=False,
+            transport=ui_bridge_transport,
+        )
         launcher_observed_running = False
-        router_account_menu = router_account_menu_gate({})
+        router_account_menu = router_account_menu_gate(
+            {}, transport_state=ui_bridge_transport["state"]
+        )
         activation_attempted = False
         activation_succeeded = False
         authentication_confirmed = False
@@ -1405,15 +1669,42 @@ def run_patched_shell_smoke(
                 health_status, health_body, health_error = _http_json_get(
                     "http://127.0.0.1:48123/v1/health"
                 )
-            if ui_status != 200 or not router_account_menu["pass"]:
+            health_ready = (
+                health_status == 200
+                and isinstance(health_body, dict)
+                and health_body.get("ok") is True
+            )
+            if health_ready and (ui_status != 200 or not router_account_menu["pass"]):
                 ui_status, ui_body, ui_error = _http_json_get(
-                    "http://127.0.0.1:48124/v1/test/app-state?debug=1",
+                    f"http://{UI_BRIDGE_HOST}:{UI_BRIDGE_PORT}/v1/test/app-state?debug=1",
                     headers={"x-codex-mux-token": token},
                 )
+            ui_bridge_startup = _read_ui_bridge_status(bridge_status_path)
+            if health_ready:
+                ui_bridge_transport = _ui_bridge_transport(
+                    port_preflight=port_preflight,
+                    startup=ui_bridge_startup,
+                    status_code=ui_status,
+                    body=ui_body,
+                )
+            else:
+                ui_bridge_transport = {
+                    "state": ROUTER_UI_BRIDGE_NOT_STARTED,
+                    "pass": False,
+                    "status_code": None,
+                    "startup": ui_bridge_startup,
+                    "renderer_marker_readable": False,
+                }
+            focused_bridge = focused_ui_bridge_diagnostic(
+                launcher_running=launcher_observed_running,
+                mux_health=health_ready,
+                transport=ui_bridge_transport,
+            )
             router_account_menu = router_account_menu_gate(
                 ui_body,
                 activation_attempted=activation_attempted,
                 activation_succeeded=activation_succeeded,
+                transport_state=ui_bridge_transport["state"],
             )
             if (
                 fail_if_auth_required
@@ -1431,9 +1722,9 @@ def run_patched_shell_smoke(
                 and authentication_confirmed
                 and router_account_menu.get("profile_controller", {}).get("ready") is True
                 and not activation_attempted
-                and ui_status == 200
+                and ui_bridge_transport["state"] == UI_BRIDGE_TRANSPORT_READY
             ):
-                action_url = "http://127.0.0.1:48124/v1/test/app-state?action=profile-router-open&debug=1&delayMs=400"
+                action_url = f"http://{UI_BRIDGE_HOST}:{UI_BRIDGE_PORT}/v1/test/app-state?action=profile-router-open&debug=1&delayMs=400"
                 action_status, action_body, action_error = _http_json_get(
                     action_url,
                     headers={"x-codex-mux-token": token},
@@ -1448,6 +1739,7 @@ def run_patched_shell_smoke(
                     ui_body,
                     activation_attempted=activation_attempted,
                     activation_succeeded=activation_succeeded,
+                    transport_state=ui_bridge_transport["state"],
                 )
             if (
                 authentication_preparation
@@ -1455,12 +1747,12 @@ def run_patched_shell_smoke(
                 and authentication_confirmed_at is not None
                 and not graceful_shutdown_attempted
                 and time.monotonic() - authentication_confirmed_at >= AUTH_PERSISTENCE_QUIESCENCE_SECONDS
-                and ui_status == 200
+                and ui_bridge_transport["state"] == UI_BRIDGE_TRANSPORT_READY
             ):
                 graceful_shutdown_attempted = True
                 graceful_shutdown_status = "REQUESTED"
                 action_url = (
-                    "http://127.0.0.1:48124/v1/test/app-state?"
+                    f"http://{UI_BRIDGE_HOST}:{UI_BRIDGE_PORT}/v1/test/app-state?"
                     "action=desktop-auth-graceful-quit&debug=0&delayMs=0"
                 )
                 action_status, action_body, action_error = _http_json_get(
@@ -1477,6 +1769,8 @@ def run_patched_shell_smoke(
             if graceful_shutdown_requested and process.poll() is not None:
                 graceful_shutdown_succeeded = True
                 graceful_shutdown_status = "EXITED"
+                break
+            if focused_bridge_diagnostic_only and focused_bridge["pass"]:
                 break
             mux_observed = any(
                 _process_path_matches(row, mux)
@@ -1550,6 +1844,11 @@ def run_patched_shell_smoke(
             temporary_log_path.unlink()
         except OSError:
             pass
+    ui_bridge_startup = _read_ui_bridge_status(bridge_status_path)
+    try:
+        bridge_status_path.unlink()
+    except OSError:
+        pass
     classification = (
         classify_probe_output(
             log_text,
@@ -1561,10 +1860,23 @@ def run_patched_shell_smoke(
         else {"status": CRASHED, "reason": f"could not launch patched shell: {launch_error}", "relevant_log_lines": {}}
     )
     debug = ui_body.get("debug") if isinstance(ui_body, dict) else None
+    health_pass = health_status == 200 and isinstance(health_body, dict) and health_body.get("ok") is True
+    ui_bridge_transport = _ui_bridge_transport(
+        port_preflight=port_preflight,
+        startup=ui_bridge_startup,
+        status_code=ui_status,
+        body=ui_body,
+    )
+    focused_bridge = focused_ui_bridge_diagnostic(
+        launcher_running=launcher_observed_running,
+        mux_health=health_pass,
+        transport=ui_bridge_transport,
+    )
     router_account_menu = router_account_menu_gate(
         ui_body,
         activation_attempted=activation_attempted,
         activation_succeeded=activation_succeeded,
+        transport_state=ui_bridge_transport["state"],
     )
     native_profile_trigger_observed = _native_profile_trigger_diagnostic(ui_body)
     mux_observed = any(
@@ -1588,8 +1900,7 @@ def run_patched_shell_smoke(
     )
     mux_process_observed = mux_process_observed or mux_observed
     real_codex_process_observed = real_codex_process_observed or real_observed
-    health_pass = health_status == 200 and isinstance(health_body, dict) and health_body.get("ok") is True
-    ui_bridge_pass = ui_status == 200 and isinstance(ui_body, dict)
+    ui_bridge_pass = ui_bridge_transport["pass"] is True
     production_flags_present = any(
         argument.casefold() in {"--no-sandbox", "--disable-gpu-sandbox"}
         or argument.casefold().startswith("--no-sandbox=")
@@ -1608,6 +1919,8 @@ def run_patched_shell_smoke(
         cleanup=not cleanup.get("errors"),
     )
     required_pass = bool(production_gate["pass"])
+    if focused_bridge_diagnostic_only:
+        required_pass = focused_bridge["pass"] is True and not cleanup.get("errors")
     if authentication_preparation:
         required_pass = (
             authentication_confirmed
@@ -1623,6 +1936,8 @@ def run_patched_shell_smoke(
     status = (
         DESKTOP_AUTH_BOOT_AUTHENTICATED
         if authentication_preparation and required_pass
+        else UI_BRIDGE_FOCUSED_PASS
+        if focused_bridge_diagnostic_only and required_pass
         else ROUTER_DESKTOP_AUTH_REQUIRED
         if auth_required and router_account_menu.get("status") == ROUTER_DESKTOP_AUTH_REQUIRED
         else DEVELOPMENT_ONLY_SANDBOX_BYPASS
@@ -1636,8 +1951,12 @@ def run_patched_shell_smoke(
         "reason": (
             "persistent Desktop boot reached authenticated renderer state and exited gracefully"
             if authentication_preparation and required_pass
+            else "focused patched-shell startup diagnostic reached launcher, mux health, bridge listening, HTTP 200, and a readable renderer marker"
+            if focused_bridge_diagnostic_only and required_pass
             else "the persistent Desktop validation profile requires normal interactive ChatGPT login"
             if auth_required and router_account_menu.get("status") == ROUTER_DESKTOP_AUTH_REQUIRED
+            else f"patched shell UI test bridge transport gate failed: {ui_bridge_transport['state']}"
+            if ui_bridge_transport["state"] != UI_BRIDGE_TRANSPORT_READY
             else "development-only sandbox bypass showed the patched Router launcher, UI bridge, mux health, account menu, and mux-to-real-codex chain"
             if required_pass and development_only
             else "patched Router launcher, ChatGPT UI bridge, mux health, account menu, and mux-to-real-codex chain passed"
@@ -1649,6 +1968,8 @@ def run_patched_shell_smoke(
         "diagnostic_arguments": list(diagnostic_arguments),
         "development_only": development_only,
         "production_ready": required_pass and not development_only,
+        "focused_bridge_diagnostic_only": focused_bridge_diagnostic_only,
+        "focused_bridge_diagnostic": focused_bridge,
         "production_sandbox_flags_present": production_flags_present,
         "launcher_observed_running": launcher_observed_running,
         "launcher_return_code": return_code,
@@ -1703,6 +2024,9 @@ def run_patched_shell_smoke(
         "ui_bridge": {
             "pass": ui_bridge_pass,
             "status_code": ui_status,
+            "transport_state": ui_bridge_transport["state"],
+            "startup": ui_bridge_startup,
+            "port_preflight": port_preflight,
             "error": ui_error,
             "debug": debug,
         },

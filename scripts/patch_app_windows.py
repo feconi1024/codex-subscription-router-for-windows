@@ -1430,6 +1430,8 @@ def _metadata(
                 if bootstrap_report.ui_test_bridge is not None
                 else None
             ),
+            "ui_test_bridge_anchor": bootstrap_report.ui_test_bridge_anchor,
+            "ui_test_bridge_module_system": bootstrap_report.ui_test_bridge_module_system,
         },
         "real_codex_source": str(real.path),
         "real_codex_version": real.version,

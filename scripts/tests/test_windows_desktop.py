@@ -5,6 +5,8 @@ import errno
 import hashlib
 import inspect
 import json
+import socket
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -115,6 +117,11 @@ from scripts.windows.smoke import (
     ROUTER_MENU_NOT_INJECTED,
     ROUTER_MENU_NOT_MOUNTED,
     ROUTER_RENDERER_NOT_LOADED,
+    ROUTER_UI_BRIDGE_HTTP_FAILED,
+    ROUTER_UI_BRIDGE_NOT_STARTED,
+    ROUTER_UI_BRIDGE_PORT_UNAVAILABLE,
+    UI_BRIDGE_FOCUSED_PASS,
+    UI_BRIDGE_TRANSPORT_READY,
     build_production_gate,
     _probe_candidate,
     classify_probe_output,
@@ -122,6 +129,8 @@ from scripts.windows.smoke import (
     _phase2a4_display_verdict,
     _phase2a4_verdict,
     native_evidence_is_usable,
+    focused_ui_bridge_diagnostic,
+    preflight_ui_bridge_port,
     router_account_menu_gate,
     run_patched_shell_smoke,
     DESKTOP_AUTH_BOOT_AUTHENTICATED,
@@ -468,17 +477,25 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             (build / "bootstrap-fixture.js").write_text(
                 "e.app.setPath(`userData`,x({appDataPath:e.app.getPath(`appData`),"
                 "buildFlavor:`stable`,env:process.env}))"
-                "await u.initialize();try{let{runMainAppStartup:startup}=x}",
+                "await u.initialize();try{let{runMainAppStartup:startup}=await Promise.resolve().then(()=>require(\"./main-fixture.js\"));await startup()}",
                 encoding="utf-8",
             )
-            (build / "main-fixture.js").write_text("main", encoding="utf-8")
+            (build / "main-fixture.js").write_text(
+                "exports.runMainAppStartup=()=>{}",
+                encoding="utf-8",
+            )
             report = patch_bootstrap(extracted, Path(__file__).resolve().parents[2])
             bootstrap = (build / "bootstrap-fixture.js").read_text(encoding="utf-8")
             main = (build / "main-fixture.js").read_text(encoding="utf-8")
             self.assertTrue(report.updater_disabled)
             self.assertIn("CODEX_MUX_DESKTOP_USER_DATA", bootstrap)
             self.assertNotIn("await u.initialize();", bootstrap)
-            self.assertIn("ui-test-bridge.cjs", main)
+            self.assertIn("ui-test-bridge.cjs", bootstrap)
+            self.assertIn("LOADER_REACHED", bootstrap)
+            self.assertIn("MODULE_LOAD_STARTED", bootstrap)
+            self.assertIn("START_CALLED", bootstrap)
+            self.assertIn("bootstrap-before-runMainAppStartup", report.ui_test_bridge_anchor)
+            self.assertNotIn("ui-test-bridge.cjs", main)
             self.assertNotIn("SKY_CUA_SERVICE_PATH", main)
 
     def test_desktop_source_prefers_chatgpt_over_legacy_codex(self) -> None:
@@ -966,6 +983,110 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         self.assertFalse(result["pass"])
         self.assertEqual(result["status"], ROUTER_MENU_NOT_INJECTED)
 
+    def test_router_account_menu_gate_requires_bridge_transport_before_renderer(self) -> None:
+        renderer_like = {
+            "debug": {
+                "router": {
+                    "rendererPatchLoaded": False,
+                    "accountMenuInjected": False,
+                    "accountMenuMounted": False,
+                    "accountsLoaded": False,
+                    "accountCount": 0,
+                    "requestFailed": False,
+                },
+                "desktop_auth": {"state": "UNKNOWN"},
+                "renderer_runtime": {"readyState": "complete", "rootPresent": True},
+            }
+        }
+        not_started = router_account_menu_gate(
+            renderer_like,
+            transport_state=ROUTER_UI_BRIDGE_NOT_STARTED,
+        )
+        self.assertFalse(not_started["pass"])
+        self.assertEqual(not_started["status"], ROUTER_UI_BRIDGE_NOT_STARTED)
+        http_failed = router_account_menu_gate(
+            renderer_like,
+            transport_state=ROUTER_UI_BRIDGE_HTTP_FAILED,
+        )
+        self.assertEqual(http_failed["status"], ROUTER_UI_BRIDGE_HTTP_FAILED)
+        port_unavailable = router_account_menu_gate(
+            renderer_like,
+            transport_state=ROUTER_UI_BRIDGE_PORT_UNAVAILABLE,
+        )
+        self.assertEqual(port_unavailable["status"], ROUTER_UI_BRIDGE_PORT_UNAVAILABLE)
+
+    def test_focused_ui_bridge_diagnostic_does_not_require_account_menu(self) -> None:
+        diagnostic = focused_ui_bridge_diagnostic(
+            launcher_running=True,
+            mux_health=True,
+            transport={
+                "state": UI_BRIDGE_TRANSPORT_READY,
+                "pass": True,
+                "status_code": 200,
+                "renderer_marker_readable": True,
+                "startup": {"stage": "LISTENING", "observed": True},
+            },
+        )
+        self.assertTrue(diagnostic["pass"])
+        self.assertEqual(
+            set(diagnostic["checks"]),
+            {
+                "launcher_alive",
+                "mux_health_200",
+                "ui_bridge_listening",
+                "ui_bridge_http_200",
+                "renderer_marker_readable",
+            },
+        )
+
+    def test_bridge_port_preflight_does_not_terminate_an_occupied_listener(self) -> None:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            port = listener.getsockname()[1]
+            result = preflight_ui_bridge_port(port=port)
+            self.assertFalse(result["pass"])
+            self.assertEqual(result["status"], ROUTER_UI_BRIDGE_PORT_UNAVAILABLE)
+            self.assertEqual(listener.getsockname()[1], port)
+        finally:
+            listener.close()
+
+    def test_ui_bridge_node_runtime_reports_listening_without_sensitive_data(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is unavailable")
+        if not preflight_ui_bridge_port().get("pass"):
+            self.skipTest("UI bridge port is already occupied by an external process")
+        script = (
+            'const fs=require("node:fs"),os=require("node:os"),path=require("node:path"),'
+            'Module=require("node:module"),EventEmitter=require("node:events");'
+            'const tmp=fs.mkdtempSync(path.join(os.tmpdir(),"codex-bridge-test-"));'
+            'const mux=path.join(tmp,"mux");fs.mkdirSync(mux);'
+            'fs.writeFileSync(path.join(mux,"control-token"),"a".repeat(64));'
+            'const status=path.join(tmp,"status.json");const app=new EventEmitter();'
+            'const load=Module._load;Module._load=(request,parent,isMain)=>'
+            'request==="electron"?{app,BrowserWindow:{getAllWindows:()=>[]}}:load(request,parent,isMain);'
+            'process.env.CODEX_MUX_UI_TESTS="1";process.env.CODEX_MUX_HOME=mux;'
+            'process.env.CODEX_MUX_UI_BRIDGE_STATUS_PATH=status;'
+            'require("./ui/ui-test-bridge.cjs").start().then(()=>{'
+            'const value=JSON.parse(fs.readFileSync(status,"utf8"));'
+            'if(value.stage!=="LISTENING"||Object.keys(value).some(key=>key.includes("token")))process.exit(1);'
+            'process.exit(0)}).catch(()=>process.exit(1));'
+        )
+        result = subprocess.run(
+            [node, "-e", script],
+            cwd=Path(__file__).resolve().parents[2],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
     def test_router_account_menu_gate_reports_specific_runtime_failures(self) -> None:
         base = {
             "debug": {
@@ -1187,6 +1308,13 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
                     "validated_assets": ["webview/assets/app-initial-fixture.js"],
                     "source_text": "must not be exported",
                 },
+                "bootstrap_patch": {
+                    "bootstrap_bundle": "bootstrap-C8huRvHE.js",
+                    "main_bundle": "main-BP8-d4nf.js",
+                    "ui_test_bridge_anchor": "bootstrap-before-runMainAppStartup",
+                    "ui_test_bridge_module_system": "commonjs",
+                    "secret": "token-secret",
+                },
             },
             "chatgpt_classification": {
                 "status": PASS,
@@ -1223,6 +1351,18 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             "ui_bridge": {
                 "pass": True,
                 "status_code": 200,
+                "transport_state": "READY",
+                "startup": {
+                    "stage": "LISTENING",
+                    "observed": True,
+                    "message": "token-secret",
+                },
+                "port_preflight": {
+                    "pass": True,
+                    "host": "127.0.0.1",
+                    "port": 48124,
+                    "status": "READY",
+                },
                 "debug": {
                     "buttons": [
                         {
@@ -1249,6 +1389,13 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         self.assertIn("production_gate", public)
         self.assertIn("chatgpt_classification", public)
         self.assertIn("native_button_diagnostics", public["ui_bridge"])
+        self.assertEqual(public["ui_bridge"]["transport_state"], "READY")
+        self.assertEqual(public["ui_bridge"]["startup"]["stage"], "LISTENING")
+        self.assertEqual(
+            public["build_metadata_summary"]["bootstrap_patch"]["ui_test_bridge_module_system"],
+            "commonjs",
+        )
+        self.assertNotIn("message", json.dumps(public["ui_bridge"], sort_keys=True))
         self.assertNotIn("user@example.com", encoded)
         self.assertNotIn("control-token-secret", encoded)
         self.assertNotIn("token-secret", encoded)
@@ -1500,12 +1647,19 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
         self.assertIn("__codexMuxAccountMenuInjected", bridge)
         self.assertIn("profile-router-open", bridge)
         self.assertIn("desktop-auth-graceful-quit", bridge)
+        self.assertIn("CODEX_MUX_UI_BRIDGE_STATUS_PATH", bridge)
+        self.assertIn('"LISTENING"', bridge)
+        self.assertIn('"CONTROL_TOKEN_READ"', bridge)
+        self.assertIn("valid_format", bridge)
+        self.assertIn('server.once("listening"', bridge)
+        self.assertIn('server.listen(PORT, HOST)', bridge)
         self.assertIn("app.quit()", bridge)
         self.assertIn("render-process-gone", bridge)
         self.assertIn("unhandledrejection", account_menu)
         self.assertNotIn("text:element.textContent.trim().slice(0,80)", bridge)
         self.assertNotIn("bodyText", bridge)
         self.assertNotIn("rootHtml", bridge)
+        self.assertNotIn("error.message", bridge)
 
     def test_phase2a4_final_layout_root_uses_localappdata_and_is_disposable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2491,7 +2645,7 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             bootstrap_path.write_text(
                 "e.app.setPath(`userData`,x({appDataPath:e.app.getPath(`appData`),"
                 "buildFlavor:`stable`,env:process.env}))"
-                "await u.initialize();try{let{runMainAppStartup:startup}=x}",
+                "await u.initialize();try{let{runMainAppStartup:startup}=await Promise.resolve().then(()=>require(\"./main-fixture.js\"));await startup()}",
                 encoding="utf-8",
             )
             main_path.write_text("renderer sentinel", encoding="utf-8")
@@ -3002,13 +3156,32 @@ class WindowsDesktopHelpersTests(unittest.TestCase):
             (build / "bootstrap-fixture.js").write_text(
                 "e.app.setPath(`userData`,x({appDataPath:e.app.getPath(`appData`),"
                 "buildFlavor:`stable`,env:process.env}))"
-                "await u.initialize();try{let{runMainAppStartup:startup}=x}",
+                "await u.initialize();try{let{runMainAppStartup:startup}=await Promise.resolve().then(()=>require(\"./main-fixture.js\"));await startup()}",
                 encoding="utf-8",
             )
-            (build / "main-fixture.js").write_text("main", encoding="utf-8")
+            (build / "main-fixture.js").write_text(
+                "exports.runMainAppStartup=()=>{}",
+                encoding="utf-8",
+            )
+            (build / "early-bootstrap.js").write_text(
+                'require("./bootstrap-fixture.js");',
+                encoding="utf-8",
+            )
+            (extracted / "package.json").write_text(
+                '{"main":".vite/build/early-bootstrap.js"}',
+                encoding="utf-8",
+            )
             report = audit_bootstrap(extracted, Path(__file__).resolve().parents[2])
             self.assertTrue(report["audit_pass"], report)
             self.assertEqual(report["updater_hook"]["initializer_count"], 1)
+            self.assertEqual(report["startup_chain"]["status"], "PASS")
+            self.assertEqual(report["ui_test_bridge_static_hook"], "PASS")
+            self.assertTrue(report["native_runtime_validation_required"])
+            self.assertFalse(report["native_bootstrap_runtime_proven"])
+            self.assertEqual(report["ui_test_bridge"]["static_hook"], "PASS")
+            self.assertEqual(report["ui_test_bridge"]["status"], "STATIC_BOOTSTRAP_COMPATIBLE")
+            self.assertTrue(report["ui_test_bridge"]["native_runtime_validation_required"])
+            self.assertEqual(report["ui_test_bridge"]["module_system"], "commonjs")
 
     def test_exact_26_820_variant_requires_multiple_fingerprints(self) -> None:
         values = renderer_variant_template("windows-26.820")

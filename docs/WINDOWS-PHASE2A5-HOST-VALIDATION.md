@@ -86,6 +86,47 @@ profile trigger, an upstream trigger without Router markers fails, each
 Router runtime failure has an explicit status, and public artifacts do not
 leak identity or token data.
 
+## UI test bridge bootstrap/runtime fix
+
+The reviewed Windows `26.825.6671.0` source was audited read-only before this
+change.  Its exact startup chain is:
+
+```text
+package.json main
+  -> .vite/build/early-bootstrap.js
+  -> require bootstrap-C8huRvHE.js
+  -> require main-BP8-d4nf.js
+  -> exports.runMainAppStartup
+```
+
+The bootstrap and main bundles are CommonJS-compatible at this boundary, and
+the `runMainAppStartup` import/export pair is unique.  The bridge is now
+injected at the unique semantic pre-main boundary in the bootstrap.  It is
+not appended to the physical end of the main bundle, and the reviewed
+renderer/profile/auth contracts are unchanged.  Static source review reports
+`ui_test_bridge.static_hook = PASS` as
+`STATIC_BOOTSTRAP_COMPATIBLE`; it also reports
+`native_runtime_validation_required = true`, so source presence is never
+treated as native runtime proof.
+
+When `CODEX_MUX_UI_TESTS=1`, the loader writes only bounded startup telemetry
+to a unique Router-owned per-launch status path supplied by the harness.  The
+stages are `NOT_STARTED`, `LOADER_REACHED`, `TEST_MODE_CONFIRMED`,
+`MODULE_LOAD_STARTED`, `MODULE_LOADED`, `START_CALLED`, `LISTENING`, and
+`FAILED`.  Failure records contain only a stage, failed stage, allowlisted
+error name/code, and (for `CONTROL_TOKEN_READ`) the booleans
+`exists`, `readable`, and `valid_format`.  The status path is removed after
+the probe.
+
+The native smoke ordering is now launcher alive, mux health, bridge transport,
+renderer marker, authentication/profile state, and account-menu state.  A
+missing bridge returns `ROUTER_UI_BRIDGE_NOT_STARTED`; a non-200 bridge
+request returns `ROUTER_UI_BRIDGE_HTTP_FAILED`; and an occupied
+`127.0.0.1:48124` returns `ROUTER_UI_BRIDGE_PORT_UNAVAILABLE` without terminating the
+unrelated listener.  A focused startup diagnostic can stop after launcher,
+mux health 200, bridge `LISTENING`, bridge HTTP 200, and a readable renderer
+marker; it does not require account-menu PASS.
+
 The implementation result for commit
 `692796b32cf4e95d67e7fa3488f6e2fe3a8c887d` is:
 

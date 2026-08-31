@@ -74,7 +74,21 @@
     "user_data_path_support": "PASS",
     "cli_path_support": "PASS",
     "sparkle_disabled_behavior": "PASS",
-    "ui_test_bridge_injection": "PASS",
+    "ui_test_bridge_injection": "STATIC_BOOTSTRAP_COMPATIBLE",
+    "ui_test_bridge_static_hook": "PASS",
+    "ui_test_bridge_module_system": "commonjs",
+    "ui_test_bridge_startup_anchor": "bootstrap-before-runMainAppStartup",
+    "ui_test_bridge_native_runtime": "NOT_PROVEN",
+    "native_runtime_validation_required": true,
+    "native_bootstrap_runtime_proven": false,
+    "entrypoint_chain": {
+      "package_main": ".vite/build/early-bootstrap.js",
+      "early_bootstrap": "early-bootstrap.js",
+      "bootstrap": "bootstrap-C8huRvHE.js",
+      "main": "main-BP8-d4nf.js",
+      "main_export": "runMainAppStartup",
+      "status": "PASS"
+    },
     "mandatory_package_identity_dependency": false
   },
   "integrity_review": {

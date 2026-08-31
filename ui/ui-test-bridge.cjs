@@ -9,6 +9,86 @@ const { app, BrowserWindow } = require("electron");
 const HOST = "127.0.0.1";
 const PORT = 48124;
 const diagnostics = [];
+const STARTUP_STAGES = new Set([
+  "NOT_STARTED",
+  "LOADER_REACHED",
+  "TEST_MODE_CONFIRMED",
+  "MODULE_LOAD_STARTED",
+  "MODULE_LOADED",
+  "START_CALLED",
+  "LISTENING",
+  "FAILED",
+]);
+const STARTUP_FAILED_STAGES = new Set(["MODULE_LOAD", "START", "CONTROL_TOKEN_READ", "LISTEN"]);
+const STARTUP_ERROR_NAMES = new Set([
+  "Error",
+  "EvalError",
+  "RangeError",
+  "ReferenceError",
+  "SyntaxError",
+  "TypeError",
+  "URIError",
+]);
+const STARTUP_ERROR_CODES = new Set([
+  "BRIDGE_EXPORT_INVALID",
+  "CONTROL_TOKEN_MISSING",
+  "EADDRINUSE",
+  "EACCES",
+  "ENOENT",
+  "EEXIST",
+  "ERR_MODULE_NOT_FOUND",
+  "ERR_REQUIRE_ESM",
+  "MODULE_NOT_FOUND",
+  "TOKEN_INVALID_FORMAT",
+]);
+let startupPromise = null;
+
+function startupStatusPath() {
+  const value = process.env.CODEX_MUX_UI_BRIDGE_STATUS_PATH;
+  if (typeof value !== "string" || value.length === 0 || value.length > 1000) return null;
+  if (!path.isAbsolute(value)) return null;
+  const resolved = path.resolve(value);
+  const normalized = resolved.replaceAll("/", "\\").toLowerCase();
+  if (normalized.includes("\\windowsapps\\") || normalized.endsWith("\\windowsapps")) return null;
+  return resolved;
+}
+
+function safeStartupErrorName(error) {
+  const name = typeof error === "string" ? error : typeof error?.name === "string" ? error.name : null;
+  return STARTUP_ERROR_NAMES.has(name) ? name : "Error";
+}
+
+function safeStartupErrorCode(error) {
+  const code = typeof error?.code === "string" ? error.code : null;
+  return STARTUP_ERROR_CODES.has(code) ? code : null;
+}
+
+function writeStartupStatus(stage, details = {}) {
+  const statusPath = startupStatusPath();
+  if (!statusPath || !STARTUP_STAGES.has(stage)) return false;
+  const status = { schema_version: 1, stage };
+  if (stage === "FAILED") {
+    const failedStage = details.failed_stage;
+    if (STARTUP_FAILED_STAGES.has(failedStage)) status.failed_stage = failedStage;
+    status.error_name = safeStartupErrorName(details.error ?? details.error_name);
+    const errorCode = details.error_code ?? safeStartupErrorCode(details.error);
+    if (STARTUP_ERROR_CODES.has(errorCode)) status.error_code = errorCode;
+    const token = details.control_token;
+    if (token && typeof token === "object") {
+      status.control_token = {
+        exists: token.exists === true,
+        readable: token.readable === true,
+        valid_format: token.valid_format === true,
+      };
+    }
+  }
+  try {
+    fs.writeFileSync(statusPath, `${JSON.stringify(status)}\n`, "utf8");
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function safeInteger(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : null;
@@ -691,8 +771,41 @@ async function capture(action, delayMs, includeDebug) {
   return result;
 }
 
+function readControlToken(muxHome) {
+  const result = { exists: false, readable: false, valid_format: false };
+  const tokenPath = path.join(muxHome, "control-token");
+  try {
+    result.exists = fs.existsSync(tokenPath);
+    if (!result.exists) {
+      const error = new Error("control token is missing");
+      error.code = "CONTROL_TOKEN_MISSING";
+      throw error;
+    }
+    const token = fs.readFileSync(tokenPath, "utf8").trim();
+    result.readable = true;
+    result.valid_format = /^[0-9a-f]{64}$/i.test(token);
+    if (!result.valid_format) {
+      const error = new Error("control token format is invalid");
+      error.code = "TOKEN_INVALID_FORMAT";
+      throw error;
+    }
+    return { token, result };
+  } catch (error) {
+    writeStartupStatus("FAILED", {
+      failed_stage: "CONTROL_TOKEN_READ",
+      error,
+      control_token: result,
+    });
+    throw error;
+  }
+}
+
 function start() {
-  if (process.env.CODEX_MUX_UI_TESTS !== "1") return;
+  if (process.env.CODEX_MUX_UI_TESTS !== "1") {
+    writeStartupStatus("NOT_STARTED");
+    return Promise.resolve({ stage: "NOT_STARTED" });
+  }
+  if (startupPromise !== null) return startupPromise;
   app.on("web-contents-created", (_event, contents) => {
     contents.on("console-message", (_consoleEvent, level, message, line, sourceId) => {
       recordDiagnostic("console", { level, line, sourceId });
@@ -705,9 +818,12 @@ function start() {
     });
   });
   const muxHome = process.env.CODEX_MUX_HOME ?? path.join(os.homedir(), ".codex-mux");
-  const token = fs
-    .readFileSync(path.join(muxHome, "control-token"), "utf8")
-    .trim();
+  let token;
+  try {
+    token = readControlToken(muxHome).token;
+  } catch (error) {
+    return Promise.reject(error);
+  }
   const server = http.createServer(async (request, response) => {
     if (request.headers["x-codex-mux-token"] !== token) {
       writeJson(response, 401, { error: "unauthorized" });
@@ -771,11 +887,33 @@ function start() {
         return;
       }
       writeJson(response, 200, await capture(action, delayMs, includeDebug));
-    } catch (error) {
-      writeJson(response, 500, { error: error.message });
+    } catch {
+      writeJson(response, 500, { error: "internal error" });
     }
   });
-  server.listen(PORT, HOST);
+  startupPromise = new Promise((resolve, reject) => {
+    let settled = false;
+    server.once("listening", () => {
+      writeStartupStatus("LISTENING");
+      settled = true;
+      resolve({ stage: "LISTENING" });
+    });
+    server.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      writeStartupStatus("FAILED", { failed_stage: "LISTEN", error });
+      reject(error);
+    });
+    try {
+      server.listen(PORT, HOST);
+    } catch (error) {
+      if (settled) return;
+      settled = true;
+      writeStartupStatus("FAILED", { failed_stage: "LISTEN", error });
+      reject(error);
+    }
+  });
+  return startupPromise;
 }
 
 module.exports = { start };

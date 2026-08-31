@@ -526,6 +526,26 @@ def _public_build_metadata_summary(value: object) -> dict[str, object]:
     mirror_plan = _public_mirror_plan(value.get("mirror_plan"))
     if mirror_plan:
         output["mirror_plan"] = mirror_plan
+    bootstrap_patch = value.get("bootstrap_patch")
+    if isinstance(bootstrap_patch, dict):
+        safe_bootstrap: dict[str, object] = {}
+        for key in (
+            "bootstrap_bundle",
+            "main_bundle",
+            "profile_anchor",
+            "strategy",
+            "ui_test_bridge",
+            "ui_test_bridge_anchor",
+            "ui_test_bridge_module_system",
+        ):
+            item = bootstrap_patch.get(key)
+            if isinstance(item, str) and len(item) <= 300:
+                safe_bootstrap[key] = item
+        for key in ("user_data_patched", "updater_disabled"):
+            if isinstance(bootstrap_patch.get(key), bool):
+                safe_bootstrap[key] = bootstrap_patch[key]
+        if safe_bootstrap:
+            output["bootstrap_patch"] = safe_bootstrap
     syntax = value.get("renderer_syntax_validation")
     if isinstance(syntax, dict):
         safe_syntax: dict[str, object] = {}
@@ -569,6 +589,122 @@ _PUBLIC_RENDER_PROCESS_REASONS = {
     "launch-failed",
     "unknown",
 }
+
+_PUBLIC_UI_BRIDGE_STARTUP_STAGES = {
+    "NOT_STARTED",
+    "LOADER_REACHED",
+    "TEST_MODE_CONFIRMED",
+    "MODULE_LOAD_STARTED",
+    "MODULE_LOADED",
+    "START_CALLED",
+    "LISTENING",
+    "FAILED",
+}
+_PUBLIC_UI_BRIDGE_FAILED_STAGES = {"MODULE_LOAD", "START", "CONTROL_TOKEN_READ", "LISTEN"}
+_PUBLIC_UI_BRIDGE_ERROR_NAMES = {
+    "Error",
+    "EvalError",
+    "RangeError",
+    "ReferenceError",
+    "SyntaxError",
+    "TypeError",
+    "URIError",
+}
+_PUBLIC_UI_BRIDGE_ERROR_CODES = {
+    "BRIDGE_EXPORT_INVALID",
+    "CONTROL_TOKEN_MISSING",
+    "EADDRINUSE",
+    "EACCES",
+    "ENOENT",
+    "EEXIST",
+    "ERR_MODULE_NOT_FOUND",
+    "ERR_REQUIRE_ESM",
+    "MODULE_NOT_FOUND",
+    "TOKEN_INVALID_FORMAT",
+}
+
+
+def _public_ui_bridge_startup(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, object] = {}
+    stage = value.get("stage")
+    if isinstance(stage, str) and stage in _PUBLIC_UI_BRIDGE_STARTUP_STAGES:
+        output["stage"] = stage
+    if isinstance(value.get("observed"), bool):
+        output["observed"] = value["observed"]
+    failed_stage = value.get("failed_stage")
+    if isinstance(failed_stage, str) and failed_stage in _PUBLIC_UI_BRIDGE_FAILED_STAGES:
+        output["failed_stage"] = failed_stage
+    error_name = value.get("error_name")
+    if isinstance(error_name, str) and error_name in _PUBLIC_UI_BRIDGE_ERROR_NAMES:
+        output["error_name"] = error_name
+    error_code = value.get("error_code")
+    if isinstance(error_code, str) and error_code in _PUBLIC_UI_BRIDGE_ERROR_CODES:
+        output["error_code"] = error_code
+    token = value.get("control_token")
+    if isinstance(token, dict):
+        output["control_token"] = {
+            "exists": token.get("exists") is True,
+            "readable": token.get("readable") is True,
+            "valid_format": token.get("valid_format") is True,
+        }
+    return output
+
+
+def _public_ui_bridge_port(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, object] = {}
+    if isinstance(value.get("pass"), bool):
+        output["pass"] = value["pass"]
+    if value.get("host") == "127.0.0.1":
+        output["host"] = value["host"]
+    if value.get("port") == 48124:
+        output["port"] = 48124
+    status = value.get("status")
+    if status in {"READY", "ROUTER_UI_BRIDGE_PORT_UNAVAILABLE"}:
+        output["status"] = status
+    error_code = value.get("error_code")
+    if isinstance(error_code, str) and error_code in _PUBLIC_UI_BRIDGE_ERROR_CODES:
+        output["error_code"] = error_code
+    return output
+
+
+def _public_focused_ui_bridge(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, object] = {}
+    if isinstance(value.get("pass"), bool):
+        output["pass"] = value["pass"]
+    checks = value.get("checks")
+    if isinstance(checks, dict):
+        output["checks"] = {
+            key: checks[key]
+            for key in (
+                "launcher_alive",
+                "mux_health_200",
+                "ui_bridge_listening",
+                "ui_bridge_http_200",
+                "renderer_marker_readable",
+            )
+            if isinstance(checks.get(key), bool)
+        }
+    state = value.get("transport_state")
+    if state in {
+        "READY",
+        "ROUTER_UI_BRIDGE_NOT_STARTED",
+        "ROUTER_UI_BRIDGE_HTTP_FAILED",
+        "ROUTER_UI_BRIDGE_PORT_UNAVAILABLE",
+    }:
+        output["transport_state"] = state
+    status_code = value.get("status_code")
+    if type(status_code) is int:
+        output["status_code"] = status_code
+    startup = _public_ui_bridge_startup(value.get("startup"))
+    if startup:
+        output["startup"] = startup
+    return output
 
 
 def _public_runtime_error(value: object) -> dict[str, object] | None:
@@ -855,6 +991,7 @@ def _public_probe(result: object) -> object:
         "chromium_sandbox",
         "production_sandbox_flags_present",
         "production_ready",
+        "focused_bridge_diagnostic_only",
         "launcher_observed_running",
         "launcher_return_code",
         "health",
@@ -872,6 +1009,8 @@ def _public_probe(result: object) -> object:
         "validation_orphans",
     )
     output = {key: result[key] for key in allowed if key in result}
+    if "focused_bridge_diagnostic_only" in result:
+        output["focused_bridge_diagnostic_only"] = result.get("focused_bridge_diagnostic_only") is True
     if "build_metadata_summary" in result:
         output["build_metadata_summary"] = _public_build_metadata_summary(
             result.get("build_metadata_summary")
@@ -964,12 +1103,23 @@ def _public_probe(result: object) -> object:
             value = router_account_menu.get(key)
             if isinstance(value, bool):
                 safe_router_menu[key] = value
+        transport_state = router_account_menu.get("transport_state")
+        if transport_state in {
+            "READY",
+            "ROUTER_UI_BRIDGE_NOT_STARTED",
+            "ROUTER_UI_BRIDGE_HTTP_FAILED",
+            "ROUTER_UI_BRIDGE_PORT_UNAVAILABLE",
+        }:
+            safe_router_menu["transport_state"] = transport_state
         account_count = router_account_menu.get("account_count")
         if type(account_count) is int and account_count >= 0:
             safe_router_menu["account_count"] = account_count
         status = router_account_menu.get("status")
         if isinstance(status, str) and status in {
             "PASS",
+            "ROUTER_UI_BRIDGE_NOT_STARTED",
+            "ROUTER_UI_BRIDGE_HTTP_FAILED",
+            "ROUTER_UI_BRIDGE_PORT_UNAVAILABLE",
             "ROUTER_RENDERER_RUNTIME_ERROR",
             "ROUTER_UI_NOT_READY",
             "ROUTER_DESKTOP_AUTH_REQUIRED",
@@ -1041,6 +1191,20 @@ def _public_probe(result: object) -> object:
             for key in ("pass", "status_code")
             if key in ui_bridge
         }
+        transport_state = ui_bridge.get("transport_state")
+        if transport_state in {
+            "READY",
+            "ROUTER_UI_BRIDGE_NOT_STARTED",
+            "ROUTER_UI_BRIDGE_HTTP_FAILED",
+            "ROUTER_UI_BRIDGE_PORT_UNAVAILABLE",
+        }:
+            output["ui_bridge"]["transport_state"] = transport_state
+        startup = _public_ui_bridge_startup(ui_bridge.get("startup"))
+        if startup:
+            output["ui_bridge"]["startup"] = startup
+        port_preflight = _public_ui_bridge_port(ui_bridge.get("port_preflight"))
+        if port_preflight:
+            output["ui_bridge"]["port_preflight"] = port_preflight
         router_gate_failed = (
             isinstance(router_account_menu, dict)
             and router_account_menu.get("pass") is not True
@@ -1053,6 +1217,10 @@ def _public_probe(result: object) -> object:
             debug = ui_bridge.get("debug")
             buttons = debug.get("buttons") if isinstance(debug, dict) else None
             output["ui_bridge"]["native_button_diagnostics"] = _public_button_diagnostics(buttons)
+    if "focused_bridge_diagnostic" in result:
+        output["focused_bridge_diagnostic"] = _public_focused_ui_bridge(
+            result.get("focused_bridge_diagnostic")
+        )
     sandbox = output.get("chromium_sandbox")
     if isinstance(sandbox, dict):
         output["chromium_sandbox"] = {
