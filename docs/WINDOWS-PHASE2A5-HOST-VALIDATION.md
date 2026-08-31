@@ -39,10 +39,11 @@ This round adds:
   ordinary user builds retain recoverable `windows-desktop-*` backups;
 - an ignored `docs/generated/WINDOWS-PHASE2A5-HOST-RESULT.json` artifact path.
 
-Phase 2A.6 adds a second fail-closed gate before the native probes: the
-discovered source must match an exact record in
+This Phase 2A.5 source-review round adds a second fail-closed gate before
+the native probes: the discovered source must match an exact record in
 `scripts/windows/reviewed_sources.json`.  A clean version, architecture,
-executable-version, ASAR-hash, or ASAR-header-hash mismatch stops with
+package full name, executable-version, ASAR-hash, or ASAR-header-hash
+mismatch stops with
 `PHASE 2A.5 SOURCE REVIEW REQUIRED`; the identity and source diagnostics are
 still retained in the artifact.  The old compatibility markdown remains a
 release list and is not widened by this registry refresh.
@@ -362,6 +363,11 @@ The credential-free evidence is recorded in
 The result is `PATCHABLE`, but native host validation is still required;
 Phase 2B is not ready.
 
+The implementation and source-review commit is `f1d67d00492692248e04122f4da7a28ba1e116c8`.
+The required `checks` and `windows-go-core` jobs both passed for that exact
+commit in GitHub Actions run `33354718124`.  Native host validation remains
+a separate user-started operation.
+
 ## Verdict policy
 
 The runner uses the following Phase 2A.5 verdicts:
@@ -390,7 +396,7 @@ PHASE 2A.5 FAIL
 
 ## Next manual operation
 
-After the required CI gates are green, first inspect/free sufficient space on the
+The required CI gates are green.  First inspect/free sufficient space on the
 validation volume and review the exact Router-owned backup/orphan inventory in
 the previous artifact.  Then, from an independently opened ordinary
 PowerShell, run the native validator directly:
