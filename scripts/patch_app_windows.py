@@ -1381,6 +1381,7 @@ def _patched_javascript_assets(
         paths.append(bootstrap_report.ui_test_bridge)
     for pattern in (
         "app-initial-*.js",
+        "app-primary-*.js",
         "profile-*.js",
         "plugins-page-*.js",
         "plugins-settings-*.js",

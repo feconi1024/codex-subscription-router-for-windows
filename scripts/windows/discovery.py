@@ -1680,7 +1680,13 @@ def discover_desktop_source(
             source = None
             diagnostics.add(SourceProbeResult("explicit-source", PROBE_FAIL, (str(explicit),), _safe_error(error)))
         else:
-            diagnostics.add(SourceProbeResult("explicit-source", PROBE_PASS, (str(source.source_root),)))
+            if source is None:
+                diagnostics.add(SourceProbeResult(
+                    "explicit-source", PROBE_FAIL, (str(explicit),),
+                    "explicit source no longer contains the required Desktop layout",
+                ))
+            else:
+                diagnostics.add(SourceProbeResult("explicit-source", PROBE_PASS, (str(source.source_root),)))
         if source is not None:
             diagnostics.selected_source = source
             diagnostics.access = source_access_probes(source)

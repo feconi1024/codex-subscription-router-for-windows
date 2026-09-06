@@ -297,12 +297,11 @@ const STATE_CAPTURE_SCRIPT = `(() => {
   }
   const pathname = typeof globalThis.location?.pathname === 'string' ? globalThis.location.pathname.toLowerCase() : '';
   const authRoute = /(^|\\/)(auth|login|signin|sign-in)(\\/|$)/.test(pathname);
-  const controller = globalThis.__codexMuxProfileMenuControllerReady === true || savedRuntime.profileControllerReady === true;
+  const controller = globalThis.__codexMuxProfileMenuControllerReady === true;
   let detected = 'UNKNOWN';
   if (authRoute) detected = 'AUTH_REQUIRED';
-  else if (globalThis.__codexMuxAuthenticatedShellReady === true || (composer && controller)) detected = 'AUTHENTICATED';
-  else if (document.readyState === 'complete' && root && !composer && !controller) detected = 'AUTH_REQUIRED';
-  const savedAuth = safeAuth(globalThis.__codexMuxDesktopAuth);
+  else if (composer && controller) detected = 'AUTHENTICATED';
+  if (typeof globalThis.__codexMuxReadDesktopAuth === 'function') detected = safeAuth(globalThis.__codexMuxReadDesktopAuth());
   const errors = Array.isArray(globalThis.__codexMuxRuntimeErrors) ? globalThis.__codexMuxRuntimeErrors : [];
   const readyState = ['loading','interactive','complete'].includes(document.readyState) ? document.readyState : 'unknown';
   const describe = element => {
@@ -338,7 +337,7 @@ const STATE_CAPTURE_SCRIPT = `(() => {
       accountCount: safeCount(state.accountCount),
       requestFailed: state.requestFailed === true,
     },
-    desktop_auth: { state: detected !== 'UNKNOWN' ? detected : savedAuth },
+    desktop_auth: { state: detected },
     renderer_runtime: runtime,
     profile_controller: {
       ready: globalThis.__codexMuxProfileMenuControllerReady === true,
@@ -415,13 +414,12 @@ async function readDesktopAuth(window) {
       const body=document.body;
       const root=document.querySelector('#root')||body?.firstElementChild||null;
       const composer=document.querySelector('textarea[placeholder],[contenteditable="true"]');
-      const controller=globalThis.__codexMuxProfileMenuControllerReady===true||runtime.profileControllerReady===true;
+      const controller=globalThis.__codexMuxProfileMenuControllerReady===true;
       let detected='UNKNOWN';
       if(authRoute) detected='AUTH_REQUIRED';
-      else if(globalThis.__codexMuxAuthenticatedShellReady===true||(composer&&controller)) detected='AUTHENTICATED';
-      else if(document.readyState==='complete'&&root&&!composer&&!controller) detected='AUTH_REQUIRED';
-      const saved=valid(globalThis.__codexMuxDesktopAuth)?globalThis.__codexMuxDesktopAuth:'UNKNOWN';
-      return {state:detected!=='UNKNOWN'?detected:saved};
+      else if(composer&&controller) detected='AUTHENTICATED';
+      if(typeof globalThis.__codexMuxReadDesktopAuth==='function'){const live=globalThis.__codexMuxReadDesktopAuth();detected=valid(live)?live:'UNKNOWN';}
+      return {state:detected};
     })()`);
     return { state: safeAuthState(state?.state) };
   } catch {

@@ -6,6 +6,40 @@ let codexMuxLoginActive = false;
 
 globalThis.__codexMuxDesktopAuth = "UNKNOWN";
 globalThis.__codexMuxProfileMenuControllerReady = false;
+globalThis.__codexMuxNativeDesktopAuth = "UNKNOWN";
+const codexMuxNativeAuthHosts = new Map();
+
+// Called unconditionally by the reviewed native profile host, before its menu
+// is opened. The host also exists when signed out, so mounting is not evidence.
+function CodexMuxUseNativeAuth(auth, setOpen) {
+  const owner = kXc.useRef(null);
+  if (owner.current === null) owner.current = {};
+  const state = auth?.isLoading === false
+    ? auth.authMethod === "chatgpt"
+      ? "AUTHENTICATED"
+      : auth.requiresAuth === true && auth.authMethod == null && auth.openAIAuth == null
+        ? "AUTH_REQUIRED"
+        : "UNKNOWN"
+    : "UNKNOWN";
+  kXc.useEffect(() => {
+    function publish() {
+      const hosts = [...codexMuxNativeAuthHosts.values()];
+      const ready = hosts.find(host => host.state === "AUTHENTICATED");
+      globalThis.__codexMuxNativeDesktopAuth = ready ? "AUTHENTICATED"
+        : hosts.length > 0 && hosts.every(host => host.state === "AUTH_REQUIRED")
+          ? "AUTH_REQUIRED" : "UNKNOWN";
+      const controller = ready || hosts.at(-1);
+      globalThis.__codexMuxProfileMenuControllerReady = typeof controller?.setOpen === "function";
+      globalThis.__codexMuxOpenProfileMenuForTest = controller
+        ? () => { controller.setOpen(true); return true; } : undefined;
+      codexMuxDetectDesktopAuth();
+    }
+    codexMuxNativeAuthHosts.set(owner.current, { state, setOpen });
+    publish();
+    return () => { codexMuxNativeAuthHosts.delete(owner.current); publish(); };
+  }, [state, setOpen]);
+  return auth;
+}
 
 function codexMuxSafeRuntimeName(value, fallback) {
   const name = typeof value === "string" ? value.trim() : "";
@@ -101,19 +135,13 @@ function codexMuxDetectDesktopAuth() {
   if (/(^|\/)(auth|login|signin|sign-in)(\/|$)/.test(pathname)) {
     return codexMuxSetDesktopAuth("AUTH_REQUIRED");
   }
-  if (
-    globalThis.__codexMuxAuthenticatedShellReady === true ||
-    (runtime.composerPresent && runtime.profileControllerReady)
-  ) {
-    return codexMuxSetDesktopAuth("AUTHENTICATED");
+  if (codexMuxNativeAuthHosts.size > 0) {
+    return codexMuxSetDesktopAuth(globalThis.__codexMuxNativeDesktopAuth);
   }
   if (
-    runtime.readyState === "complete" &&
-    runtime.rootPresent &&
-    !runtime.composerPresent &&
-    !runtime.profileControllerReady
+    runtime.composerPresent && runtime.profileControllerReady
   ) {
-    return codexMuxSetDesktopAuth("AUTH_REQUIRED");
+    return codexMuxSetDesktopAuth("AUTHENTICATED");
   }
   return codexMuxSetDesktopAuth("UNKNOWN");
 }
@@ -157,6 +185,7 @@ function codexMuxInstallRuntimeDiagnostics() {
 
 codexMuxInstallRuntimeDiagnostics();
 codexMuxSetDesktopAuth(codexMuxDetectDesktopAuth());
+globalThis.__codexMuxReadDesktopAuth = codexMuxDetectDesktopAuth;
 
 function CodexMuxProfileMenuOpenChange(setOpen) {
   const controllerReady = typeof setOpen === "function";
@@ -429,7 +458,6 @@ function CodexMuxAccountMenu() {
 
   kXc.useEffect(() => {
     codexMuxInstallRuntimeDiagnostics();
-    globalThis.__codexMuxAuthenticatedShellReady = true;
     codexMuxSetDesktopAuth(codexMuxDetectDesktopAuth());
     codexMuxSetRendererRuntime();
     globalThis.__codexMuxAccountMenuMounted = true;
@@ -441,7 +469,6 @@ function CodexMuxAccountMenu() {
     });
     return () => {
       globalThis.__codexMuxAccountMenuMounted = false;
-      globalThis.__codexMuxAuthenticatedShellReady = false;
       codexMuxSetDesktopAuth(codexMuxDetectDesktopAuth());
       codexMuxSetRendererRuntime();
       codexMuxSetAccountMenuState({

@@ -54,6 +54,7 @@ from scripts.windows.compatibility import (
 )
 from scripts.windows.bootstrap import audit_bootstrap, patch_bootstrap
 from scripts.windows.discovery import (
+    discover_desktop_source,
     AuthenticodeMetadata,
     DesktopExecutableCandidate,
     DesktopSource,
@@ -89,6 +90,7 @@ from scripts.windows.discovery import (
 from scripts.windows.fuses import FUSE_INDEX, FUSE_VALUES, SENTINEL, FuseSnapshot, read_fuses, write_fuse
 from scripts.windows.integrity import (
     FUSE_PRESENT_RESOURCE_MISSING,
+    FUSE_PRESENT_RESOURCE_PRESENT,
     FUSE_PRESENT_ASAR_VALIDATION_DISABLED,
     RESOURCE_ABSENT_NO_VALIDATION_METADATA,
     RESOURCE_PRESENT_UPDATE_REQUIRED,
@@ -495,6 +497,23 @@ def mocked_prepare_desktop_auth(root: Path, boots: list[dict[str, object]]):
 
 
 class WindowsDesktopHelpersTests(unittest.TestCase):
+    def test_missing_explicit_source_returns_diagnostic_instead_of_crashing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source, diagnostics = discover_desktop_source(Path(temporary) / "removed-store-version")
+        self.assertIsNone(source)
+        self.assertIsNone(diagnostics.selected_source)
+        self.assertIn("explicit source no longer contains", str(diagnostics.to_dict()))
+
+    def test_desktop_auth_javascript_behavior(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js unavailable")
+        result = subprocess.run(
+            [node, "--test", str(Path(__file__).with_name("desktop_auth.test.cjs"))],
+            capture_output=True, text=True, encoding="utf-8", timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_windows_bootstrap_isolates_profile_and_disables_updater(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             extracted = Path(temporary)
@@ -2006,7 +2025,7 @@ function request(pathname,timeout=7000){return new Promise((resolve,reject)=>{co
         )
         for marker in (
             "__codexMuxRendererPatchLoaded",
-            "__codexMuxDesktopAuth",
+            "__codexMuxReadDesktopAuth",
             "AUTHENTICATED",
             "AUTH_REQUIRED",
             "__codexMuxRendererRuntime",
@@ -2374,8 +2393,8 @@ function request(pathname,timeout=7000){return new Promise((resolve,reject)=>{co
             class FinishedProcess:
                 pid = 1234
 
-                def poll(self) -> int:
-                    return 0
+                def poll(self) -> int | None:
+                    return 0 if sum("/app-state" in url for url in requested_urls) >= 4 else None
 
                 def terminate(self) -> None:
                     return None
@@ -2389,7 +2408,14 @@ function request(pathname,timeout=7000){return new Promise((resolve,reject)=>{co
                     return 200, {"ok": True}, None
                 if "/ping" in url:
                     return 200, {"ok": True}, None
-                return 200, ui_body, None
+                sample = json.loads(json.dumps(ui_body))
+                count = sum("/app-state" in item for item in requested_urls)
+                if count == 1:
+                    sample["debug"]["desktop_auth"]["state"] = "UNKNOWN"
+                    sample["debug"]["profile_controller"]["ready"] = False
+                if count < 4:
+                    sample["debug"]["router"]["accountsLoaded"] = False
+                return 200, sample, None
 
             with patch("scripts.windows.smoke.os.name", "nt"), patch.dict(
                 "scripts.windows.smoke.os.environ",
@@ -2437,6 +2463,8 @@ function request(pathname,timeout=7000){return new Promise((resolve,reject)=>{co
                 next(index for index, url in enumerate(requested_urls) if "/ping" in url),
                 next(index for index, url in enumerate(requested_urls) if "/app-state" in url),
             )
+            self.assertGreaterEqual(sum("/app-state" in url for url in requested_urls), 4)
+            self.assertEqual(sum("action=profile-router-open" in url for url in requested_urls), 1)
             environment = captured["env"]
             self.assertIsInstance(environment, dict)
             self.assertEqual(environment["CODEX_HOME"], str(layout.codex_home))
@@ -3761,7 +3789,7 @@ function request(pathname,timeout=7000){return new Promise((resolve,reject)=>{co
         records = load_reviewed_sources()
         self.assertEqual(
             {record["renderer_variant"] for record in records},
-            {"windows-26.820", "windows-26.825"},
+            {"windows-26.820", "windows-26.825", "windows-26.901"},
         )
         self.assertEqual(
             {
@@ -4143,19 +4171,25 @@ function request(pathname,timeout=7000){return new Promise((resolve,reject)=>{co
             (extracted / "index.js").write_text("fixture", encoding="utf-8")
             archive = root / "app.asar"
             pack_asar(ensure_asar_tool(), extracted, archive, (), ())
-            plan = WindowsAsarIntegrityPlan(
-                RESOURCE_PRESENT_UPDATE_REQUIRED,
-                True,
-                "fixture",
-                None,
-                None,
-                True,
-                tuple(before["resources"]),
-                None,
-            )
+            # Modern split Electron: the DLL owns the enabled fuse, while
+            # the launch executable owns the ASAR resource to update.
+            carrier = root / "chrome.dll"
+            carrier.write_bytes(b"unchanged fuse carrier")
+            fuse = FuseSnapshot(1, 9, ("on",) * 9, 0)
+            read_resources = read_pe_integrity_resources
+            with patch("scripts.windows.integrity.read_fuses", return_value=fuse), patch(
+                "scripts.windows.integrity.read_pe_integrity_resources",
+                side_effect=lambda path: {"resources": []} if path == carrier else read_resources(path),
+            ):
+                plan = resolve_windows_asar_integrity(executable, carrier_paths=[carrier])
+            self.assertTrue(plan.resolved)
+            self.assertEqual(plan.state, FUSE_PRESENT_RESOURCE_PRESENT)
+            self.assertEqual(plan.carrier_paths, (carrier,))
+            self.assertEqual(plan.resource_paths, (executable,))
             result = apply_windows_asar_integrity(executable, archive, plan)
             expected = asar_header_digest(archive).hash
             self.assertTrue(result["resource_updated"])
+            self.assertEqual(carrier.read_bytes(), b"unchanged fuse carrier")
             self.assertEqual(result["asar_header"]["hash"], expected)
             after = read_pe_integrity_resources(executable)
             self.assertEqual(after["resources"][0]["parsed"][0]["value"], expected)

@@ -1922,7 +1922,10 @@ def run_patched_shell_smoke(
                     startup=ui_bridge_startup,
                     ping=ping_probe,
                 )
-                if ui_bridge_transport["state"] == UI_BRIDGE_TRANSPORT_READY and _app_state_status(state_probe) != "READY":
+                # READY describes a successful observation, not a settled UI.
+                # Refresh on every poll so hydration, login and account loading
+                # can advance after the first successful transport response.
+                if ui_bridge_transport["state"] == UI_BRIDGE_TRANSPORT_READY:
                     state_probe = _coerce_http_probe(
                         _http_json_get(
                             f"http://{UI_BRIDGE_HOST}:{UI_BRIDGE_PORT}/v1/test/app-state?debug=1",

@@ -15,6 +15,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+try:
+    from .windows import renderer_26_901
+except ImportError:
+    from windows import renderer_26_901
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PROJECT_VERSION = (PROJECT_ROOT / "VERSION").read_text(encoding="utf-8").strip()
@@ -1090,6 +1095,10 @@ def select_renderer_contract(bundle: str, contract_id: str) -> RendererVariant:
     contract.  A bundle that matches more than one binding is rejected.
     """
 
+    if contract_id == renderer_26_901.CONTRACT_ID:
+        if not renderer_26_901.matches_initial(bundle):
+            raise RuntimeError("26.901 initial renderer hash does not match reviewed source")
+        return RendererVariant(contract_id, None, None, None, (), {"source_binding": renderer_26_901.contract(bundle=bundle)["package_version"]})
     bindings = _renderer_contract_bindings(contract_id)
     matches: list[dict[str, object]] = []
     for values in bindings:
@@ -1125,7 +1134,7 @@ def detect_renderer_contract(bundle: str) -> RendererVariant:
     """
 
     matches: list[RendererVariant] = []
-    for contract_id in sorted({item.variant_id for item in RENDERER_VARIANTS}):
+    for contract_id in sorted({item.variant_id for item in RENDERER_VARIANTS} | {renderer_26_901.CONTRACT_ID}):
         try:
             matches.append(select_renderer_contract(bundle, contract_id))
         except RuntimeError:
@@ -1476,6 +1485,8 @@ def audit_renderer_anchors(
     registry's contract ID and is authoritative.  Metadata-only selection is
     retained solely for historical fixture callers.
     """
+    if renderer_variant == renderer_26_901.CONTRACT_ID:
+        return [AnchorAudit(**row) for row in renderer_26_901.audit(extracted)]
     webview = extracted / "webview"
     assets = webview / "assets"
     index_path = webview / "index.html"
@@ -1518,6 +1529,8 @@ def audit_renderer_anchors(
                         0,
                     )
                 ]
+    if variant is not None and variant.variant_id == renderer_26_901.CONTRACT_ID:
+        return [AnchorAudit(**row) for row in renderer_26_901.audit(extracted)]
     if variant is not None and variant.variant_id == "windows-26.820":
         return _audit_windows_26_820(extracted, index, bundle_path, bundle, variant.values)
     if variant is not None and variant.variant_id == "windows-26.825":
@@ -1747,6 +1760,19 @@ def compare_renderer_contract(
     semantic basis, never minified source text.
     """
 
+    if observed_variant == renderer_26_901.CONTRACT_ID:
+        rows = renderer_26_901.audit(extracted)
+        return {
+            "reference_variant": reference_variant, "observed_variant": observed_variant,
+            "observed_source_binding": renderer_26_901.contract(extracted=extracted)["package_version"], "read_only": True,
+            "patch_permission_granted": False,
+            "patchable": all(row["status"] == "UNCHANGED" for row in rows),
+            "surface_status": rows,
+            "missing_anchors": [row for row in rows if row["status"] == "MISSING"],
+            "ambiguous_anchors": [row for row in rows if row["status"] == "AMBIGUOUS"],
+            "semantic_changes": ["Native AuthProvider lifecycle supplies authentication evidence"],
+            "asset_moves": ["Profile host and usage UI moved from app-initial to app-primary"],
+        }
     reference = renderer_variant_template(reference_variant)
     webview = extracted / "webview"
     assets = webview / "assets"
@@ -2825,6 +2851,9 @@ def patch_renderer(
             f"{item.name}: {item.status} ({item.asset})" for item in failed_audit
         )
         raise RuntimeError(f"renderer anchor audit failed: {details}")
+    if renderer_variant == renderer_26_901.CONTRACT_ID:
+        renderer_26_901.patch(extracted, token, PROJECT_ROOT, replace_javascript_identifiers)
+        return audit
     webview = extracted / "webview"
     initial_bundles = list((webview / "assets").glob("app-initial-*.js"))
     if len(initial_bundles) != 1:

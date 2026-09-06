@@ -14,6 +14,7 @@ _KNOWN_RENDERER_CONTRACTS = frozenset(
     {
         "windows-26.820",
         "windows-26.825",
+        "windows-26.901",
         "electron-6662",
         "electron-original",
     }

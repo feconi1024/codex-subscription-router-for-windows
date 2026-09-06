@@ -72,6 +72,7 @@ class WindowsAsarIntegrityPlan:
     carrier_paths: tuple[Path, ...] = ()
     carrier_records: tuple[dict[str, object], ...] = ()
     carrier_paths_known: bool = False
+    resource_paths: tuple[Path, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         fuse: dict[str, object] | None
@@ -97,6 +98,7 @@ class WindowsAsarIntegrityPlan:
             "carrier_paths": [str(path) for path in self.carrier_paths],
             "carrier_relative_paths": [path.name for path in self.carrier_paths],
             "carrier_records": list(self.carrier_records),
+            "resource_paths": [str(path) for path in self.resource_paths],
         }
 
 
@@ -256,8 +258,9 @@ def resolve_windows_asar_integrity(
 
     ``carrier_paths=None`` retains the historical single-file API for callers
     that only have one executable. Passing an explicit iterable, including an
-    empty iterable, makes the carrier inventory authoritative and prevents a
-    manifest executable from silently becoming the integrity carrier.
+    empty iterable, makes the fuse inventory authoritative. PE resources are
+    also inspected in the executable: split Electron builds keep the fuse in
+    chrome.dll and INTEGRITY/ELECTRONASAR in the host executable.
     """
     paths, paths_known = _carrier_paths_from_argument(executable, carrier_paths)
     carrier_records: list[dict[str, object]] = []
@@ -266,8 +269,12 @@ def resolve_windows_asar_integrity(
     resource_entries: list[dict[str, object]] = []
     resource_errors: list[str] = []
     resource_present = False
-    for path in paths:
-        fuse, fuse_error, fuse_wire_present = _read_fuse_state(path)
+    resource_paths: list[Path] = []
+    observed_paths = tuple(dict.fromkeys((*paths, executable)))
+    for path in observed_paths:
+        fuse, fuse_error, fuse_wire_present = (
+            _read_fuse_state(path) if path in paths else (None, None, False)
+        )
         if fuse is not None:
             fuses.append(fuse)
         if fuse_error:
@@ -281,6 +288,7 @@ def resolve_windows_asar_integrity(
                 _resource_asar_digest(resource_result)
                 resource_present = True
                 resource_entries.extend(entries)
+                resource_paths.append(path)
         except (OSError, RuntimeError) as error:
             resource_error = _safe_error(error)
             resource_errors.append(f"{path}: {resource_error}")
@@ -310,6 +318,7 @@ def resolve_windows_asar_integrity(
         "carrier_paths": paths,
         "carrier_records": tuple(carrier_records),
         "carrier_paths_known": paths_known,
+        "resource_paths": tuple(resource_paths),
     }
     if all_errors:
         return WindowsAsarIntegrityPlan(
@@ -322,7 +331,7 @@ def resolve_windows_asar_integrity(
         return WindowsAsarIntegrityPlan(
             FUSE_PRESENT_RESOURCE_PRESENT,
             True,
-            "the actual Electron fuse carrier enables ASAR validation and carries PE integrity metadata",
+            "Electron enables ASAR validation and the host/carrier PE integrity metadata is present",
             **common,
         )
     if asar_validation_enabled and not resource_present:
@@ -368,7 +377,7 @@ def apply_windows_asar_integrity(
     if not plan.resolved:
         raise RuntimeError(f"Windows ASAR integrity plan is not buildable: {plan.state}: {plan.reason}")
     digest = asar_header_digest(asar)
-    targets = plan.carrier_paths if plan.carrier_paths_known else (executable,)
+    targets = plan.resource_paths or (plan.carrier_paths if plan.carrier_paths_known else (executable,))
     targets = tuple(targets)
     if not targets:
         return {
