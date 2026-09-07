@@ -21,7 +21,8 @@
     "_H": "ia",
     "S2": "Iq",
     "CH": "yo",
-    "jLa": "yV"
+    "jLa": "yV",
+    "lt": "cv"
   },
   "operations": [
     {
@@ -161,6 +162,24 @@
       "name": "thread owner independent of source count",
       "old": "function Zw(e){let t=(0,tT.c)(58),",
       "new": "function Zw(e){return (0,rT.jsxs)(rT.Fragment,{children:[(0,rT.jsx)(CodexMuxNativeSources,e),(0,rT.jsx)(CodexMuxThreadSubscription,{})]})}function CodexMuxNativeSources(e){let t=(0,tT.c)(58),"
+    },
+    {
+      "name": "manage plugins account picker",
+      "asset": "webview/assets/plugins-page-9d09e36b8f32.js",
+      "old": "children:U?(0,$.jsxs)(Te,{embedded:!0,fullWidth:d,className:Se(!d&&`h-full overflow-y-auto p-panel [scrollbar-gutter:stable]`),children:[",
+      "new": "children:U?(0,$.jsxs)(Te,{embedded:!0,fullWidth:d,className:Se(!d&&`h-full overflow-y-auto p-panel [scrollbar-gutter:stable]`),children:[globalThis.CodexMuxPluginScope?.()??null,"
+    },
+    {
+      "name": "selected profile plan badge",
+      "asset": "webview/assets/profile-4f666da923e4.js",
+      "old": "account:We==null?null:(0,$.jsx)(la,{accountLabel:We}),avatar:",
+      "new": "account:globalThis.CodexMuxProfilePlanBadge?.()??null,avatar:"
+    },
+    {
+      "name": "primary only profile mutation controls",
+      "asset": "webview/assets/profile-4f666da923e4.js",
+      "old": "className:`-me-2 flex items-center gap-2 no-drag`,children:[st,ct,ft,_t]",
+      "new": "className:`-me-2 flex items-center gap-2 no-drag`,children:globalThis.CodexMuxProfileActions?.([st,ct,ft,_t])??null"
     }
   ]
 }

@@ -20,6 +20,8 @@ class ExactRendererTests(unittest.TestCase):
                     self.assertNotEqual(operation['old'], operation['new'])
                 self.assertIn(spec['primary'], spec['assets'])
                 self.assertIn(spec['thread'], spec['assets'])
+                self.assertIn('lt', spec['component_replacements'])
+                self.assertIn('manage plugins account picker', {op['name'] for op in spec['operations']})
 
     def test_late_asset_tampering_rejects_before_any_write(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -21,7 +21,8 @@
     "_H": "U_",
     "S2": "Pq",
     "CH": "Cp",
-    "jLa": "yV"
+    "jLa": "yV",
+    "lt": "sS"
   },
   "operations": [
     {
@@ -161,6 +162,24 @@
       "name": "selected subscription usage",
       "old": "let y=v;if(g!=null){",
       "new": "let y=window.__codexMuxSelectedUsageWindows??v;if(g!=null){"
+    },
+    {
+      "name": "manage plugins account picker",
+      "asset": "webview/assets/plugins-page-79578c6493a8.js",
+      "old": "children:U?(0,$.jsxs)(ge,{embedded:!0,fullWidth:m,className:Gi(!m&&`h-full overflow-y-auto p-panel [scrollbar-gutter:stable]`),children:[",
+      "new": "children:U?(0,$.jsxs)(ge,{embedded:!0,fullWidth:m,className:Gi(!m&&`h-full overflow-y-auto p-panel [scrollbar-gutter:stable]`),children:[globalThis.CodexMuxPluginScope?.()??null,"
+    },
+    {
+      "name": "selected profile plan badge",
+      "asset": "webview/assets/profile-e8859c1885bd.js",
+      "old": "account:Je==null?null:(0,$.jsx)(ca,{accountLabel:Je}),avatar:",
+      "new": "account:globalThis.CodexMuxProfilePlanBadge?.()??null,avatar:"
+    },
+    {
+      "name": "primary only profile mutation controls",
+      "asset": "webview/assets/profile-e8859c1885bd.js",
+      "old": "className:`-me-2 flex items-center gap-2 no-drag`,children:[ut,dt,pt,St]",
+      "new": "className:`-me-2 flex items-center gap-2 no-drag`,children:globalThis.CodexMuxProfileActions?.([ut,dt,pt,St])??null"
     }
   ],
   "thread_route": "Ml(Cc)"

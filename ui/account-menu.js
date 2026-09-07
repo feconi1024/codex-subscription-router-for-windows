@@ -865,6 +865,43 @@ function CodexMuxOverlappingAvatars({ accounts, size = "size-20" }) {
   });
 }
 
+function codexMuxPublishProfileSelection(accountId) {
+  globalThis.__codexMuxSelectedProfileAccountId = accountId;
+  globalThis.dispatchEvent(new Event("codex-mux-profile-selection"));
+}
+
+function codexMuxProfileSelection() {
+  const selectedId = globalThis.__codexMuxSelectedProfileAccountId || null;
+  const accounts = globalThis.__codexMuxCombinedProfileAccounts || [];
+  return { selectedId, account: accounts.find(account => account.id === selectedId) || null };
+}
+
+function CodexMuxUseProfileSelection() {
+  const [selection, setSelection] = kXc.useState(codexMuxProfileSelection);
+  kXc.useEffect(() => {
+    const refresh = () => setSelection(codexMuxProfileSelection());
+    globalThis.addEventListener("codex-mux-profile-selection", refresh);
+    refresh();
+    return () => globalThis.removeEventListener("codex-mux-profile-selection", refresh);
+  }, []);
+  return selection;
+}
+
+function CodexMuxProfilePlanBadge() {
+  const { selectedId, account } = CodexMuxUseProfileSelection();
+  return (0, e7.jsx)("span", {
+    className: "text-xs text-token-text-secondary",
+    children: selectedId ? account?.planLabel || account?.planType || "" : "Combined profile",
+  });
+}
+
+function CodexMuxProfileActions({ children }) {
+  const { selectedId } = CodexMuxUseProfileSelection();
+  // Native profile writes still target the Desktop's primary credentials.
+  // Only expose those actions while actually viewing that account.
+  return selectedId === "primary" ? children : null;
+}
+
 function CodexMuxProfileAvatarStack({ onSelect }) {
   const [accounts, setAccounts] = kXc.useState(
     globalThis.__codexMuxCombinedProfileAccounts || [],
@@ -882,6 +919,7 @@ function CodexMuxProfileAvatarStack({ onSelect }) {
         );
         globalThis.__codexMuxCombinedProfileAccounts = connected;
         setAccounts(connected);
+        codexMuxPublishProfileSelection(globalThis.__codexMuxSelectedProfileAccountId || null);
       })
       .catch(() => {});
     return () => {
@@ -889,11 +927,12 @@ function CodexMuxProfileAvatarStack({ onSelect }) {
     };
   }, []);
   kXc.useEffect(() => {
-    globalThis.__codexMuxSelectedProfileAccountId = null;
+    codexMuxPublishProfileSelection(null);
     setSelectedId(null);
     onSelect?.();
     return () => {
-      globalThis.__codexMuxSelectedProfileAccountId = null;
+      codexMuxPublishProfileSelection(null);
+      onSelect?.();
     };
   }, []);
   if (accounts.length === 0) return null;
@@ -925,7 +964,7 @@ function CodexMuxProfileAvatarStack({ onSelect }) {
               : account.label,
             onClick: () => {
               const nextId = selectedId === account.id ? null : account.id;
-              globalThis.__codexMuxSelectedProfileAccountId = nextId;
+              codexMuxPublishProfileSelection(nextId);
               setSelectedId(nextId);
               onSelect?.();
             },
@@ -942,10 +981,24 @@ function CodexMuxProfileAvatarStack({ onSelect }) {
   });
 }
 
+function codexMuxPluginQueryFilter() {
+  return { predicate: query => ["apps", "plugins", "mcp"].includes(query.queryKey?.[0]) };
+}
+
+async function codexMuxChangePluginScope(queryClient, accountId) {
+  const filter = codexMuxPluginQueryFilter();
+  // Cancel old account requests before clearing cached connection data. An
+  // invalidation alone leaves the previous account's connections on screen.
+  await queryClient.cancelQueries(filter);
+  globalThis.__codexMuxPluginAccountId = accountId;
+  await queryClient.resetQueries(filter);
+}
+
 function CodexMuxPluginScope() {
   const [accounts, setAccounts] = kXc.useState([]);
   const [selectedId, setSelectedId] = kXc.useState("primary");
   const [loading, setLoading] = kXc.useState(true);
+  const [switching, setSwitching] = kXc.useState(false);
   const queryClient = lt();
   kXc.useEffect(() => {
     let live = true;
@@ -968,22 +1021,23 @@ function CodexMuxPluginScope() {
   }, []);
 
   kXc.useEffect(() => {
-    globalThis.__codexMuxPluginAccountId = selectedId;
+    globalThis.__codexMuxPluginAccountId = "primary";
     return () => {
       delete globalThis.__codexMuxPluginAccountId;
+      // Returning to native screens must not reuse a secondary account cache.
+      queryClient.resetQueries(codexMuxPluginQueryFilter()).catch(() => {});
     };
-  }, [selectedId]);
+  }, [queryClient]);
 
   async function selectAccount(accountId) {
-    if (accountId === selectedId) return;
-    globalThis.__codexMuxPluginAccountId = accountId;
-    setSelectedId(accountId);
-    await queryClient.invalidateQueries({
-      predicate: (query) => {
-        const root = query.queryKey?.[0];
-        return root === "apps" || root === "plugins" || root === "mcp";
-      },
-    });
+    if (accountId === selectedId || switching) return;
+    setSwitching(true);
+    try {
+      await codexMuxChangePluginScope(queryClient, accountId);
+      setSelectedId(accountId);
+    } finally {
+      setSwitching(false);
+    }
   }
 
   const selected =
@@ -1028,6 +1082,7 @@ function CodexMuxPluginScope() {
                       : "text-token-text-secondary hover:bg-token-foreground/5",
                   ].join(" "),
                   "aria-pressed": active,
+                  disabled: switching,
                   onClick: () => selectAccount(account.id),
                   children: [
                     (0, e7.jsx)(CodexMuxAccountAvatar, {
@@ -1057,5 +1112,10 @@ globalThis.CodexMuxAccountAvatar = CodexMuxAccountAvatar;
 globalThis.codexMuxProfileData = codexMuxProfileData;
 globalThis.CodexMuxProfileAvatarStack = (props) =>
   (0, e7.jsx)(CodexMuxProfileAvatarStack, props || {});
+
+globalThis.CodexMuxProfilePlanBadge = () =>
+  (0, e7.jsx)(CodexMuxProfilePlanBadge, {});
+globalThis.CodexMuxProfileActions = (children) =>
+  (0, e7.jsx)(CodexMuxProfileActions, { children });
 globalThis.CodexMuxPluginScope = () =>
   (0, e7.jsx)(CodexMuxPluginScope, {});

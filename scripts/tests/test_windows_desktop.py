@@ -2439,6 +2439,9 @@ function request(pathname,timeout=7000){return new Promise((resolve,reject)=>{co
             ), patch(
                 "scripts.windows.smoke._read_ui_bridge_status",
                 return_value={"stage": "LISTENING", "observed": True},
+            ), patch(
+                "scripts.windows.smoke.preflight_ui_bridge_port",
+                return_value={"pass": True, "status": "READY"},
             ), patch("scripts.windows.smoke._http_json_get", side_effect=fake_http), patch(
                 "scripts.windows.smoke.time.sleep",
                 return_value=None,
@@ -2523,6 +2526,9 @@ function request(pathname,timeout=7000){return new Promise((resolve,reject)=>{co
                     if "/health" in url
                     else (200, {"debug": {}}, None)
                 ),
+            ), patch(
+                "scripts.windows.smoke.preflight_ui_bridge_port",
+                return_value={"pass": True, "status": "READY"},
             ), patch("scripts.windows.smoke.time.sleep", return_value=None):
                 run_patched_shell_smoke(root, real, timeout_seconds=1.0, disposable_root=True)
             environment = captured["env"]

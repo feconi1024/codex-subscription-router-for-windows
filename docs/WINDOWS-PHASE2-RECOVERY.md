@@ -64,7 +64,7 @@ with matching original/copied ASAR SHA-256. Validation uses that fixed input.
 | 26.901.5280.0 | `6579c4326cccdb508d079ecc878ad4725451b2234370d2ed9d4db53939cf99c7` |
 
 The manifest files in `scripts/windows/renderer_26_901*.json` record hashes of
-all five modified input assets and 23 exact replacement anchors per binding.
+all five modified input assets and exact replacement anchors per binding.
 Every hash and anchor is checked before renderer mutation. The installer still
 requires the full reviewed package identity; recognizing a renderer is not
 authorization to patch an unknown package.
@@ -112,3 +112,32 @@ No account was authenticated by the agent during implementation. Any accounts
 authenticated for interactive acceptance must be logged out at session end, as
 required by this repository's AGENTS.md. Existing validation credentials are
 not copied into reports, source snapshots or release artifacts.
+
+## Two-account acceptance follow-up
+
+The operator authenticated a second account for the interactive follow-up.
+Both accounts were confirmed connected through the isolated Router. The
+earlier single-account evidence above remains a historical result.
+
+Interactive checks found and corrected three account-selection defects:
+
+- Profile plan badges now follow the selected subscription. Combined mode
+  identifies itself explicitly, and native edit/share actions are available
+  only when viewing the primary account, whose credentials those writes use.
+- Plugin selection cancels outstanding connection queries and clears their
+  caches before loading the other account. The primary account's Apps list
+  disappeared when selecting the second account and returned when selecting
+  the primary. MCP entries also differed between the accounts, while shared
+  plugin installations remained visible.
+- Leaving the second account's Profile page now clears the selection and
+  refetches the shared native profile cache, preventing its identity from
+  lingering in the sidebar. This final correction has a behavior regression
+  test; its rebuilt GUI verification is pending.
+
+The follow-up JavaScript suite has five passing behavior tests. Go tests and
+vet pass. The Python suite reports 141 tests with three bridge tests initially
+skipped because the native test bridge occupied their port; all three passed
+when rerun after the native process cleanup. Full acceptance remains pending real task
+routing, subsequent-turn ownership, depletion/reset previews, lifecycle
+checks, and logout of the account added for this session. No real reset credit
+has been redeemed.

@@ -76,3 +76,59 @@ test('native auth changes without opening menu and is cleared on host unmount', 
   assert.equal(context.__codexMuxProfileMenuControllerReady, false);
   assert.equal(context.__codexMuxOpenProfileMenuForTest, undefined);
 });
+
+test('profile plan and native edit controls follow the selected account', () => {
+  const context = renderer();
+  context.kXc = { useState: init => [init(), () => {}], useEffect: () => {} };
+  context.e7 = { jsx: (type, props) => ({ type, props }) };
+  // The production helper is in an ES module: its local component names are
+  // distinct from the same-named global lazy-chunk factories.
+  vm.runInContext(menu.slice(0, menu.indexOf('globalThis.CodexMuxAccountAvatar =')), context);
+  context.__codexMuxCombinedProfileAccounts = [
+    { id: 'primary', planLabel: 'Plus' }, { id: 'secondary', planLabel: 'Free' },
+  ];
+  for (const [selected, expected, editable] of [[null, 'Combined profile', false], ['secondary', 'Free', false], ['primary', 'Plus', true]]) {
+    context.__codexMuxSelectedProfileAccountId = selected;
+    assert.equal(vm.runInContext('CodexMuxProfilePlanBadge().props.children', context), expected);
+    assert.equal(vm.runInContext('CodexMuxProfileActions({children:"edit"})', context), editable ? 'edit' : null);
+  }
+});
+
+test('leaving a secondary profile refreshes the shared native profile cache', () => {
+  const context = renderer();
+  const cleanups = [];
+  context.kXc = {
+    useState: init => [typeof init === 'function' ? init() : init, () => {}],
+    useEffect: effect => { cleanups.push(effect()); },
+  };
+  vm.runInContext(menu.slice(0, menu.indexOf('globalThis.CodexMuxAccountAvatar =')), context);
+  vm.runInContext('codexMuxRequest = () => new Promise(() => {}); codexMuxPublishProfileSelection = id => { globalThis.__codexMuxSelectedProfileAccountId = id; };', context);
+  const selections = [];
+  context.onSelect = () => selections.push(context.__codexMuxSelectedProfileAccountId);
+  vm.runInContext('CodexMuxProfileAvatarStack({onSelect})', context);
+  context.__codexMuxSelectedProfileAccountId = 'secondary';
+  for (const cleanup of cleanups) cleanup?.();
+  assert.equal(context.__codexMuxSelectedProfileAccountId, null);
+  assert.deepEqual(selections, [null, null]);
+});
+
+test('switching plugin scope cancels old requests before clearing connection caches', async () => {
+  const context = renderer();
+  vm.runInContext(menu, context);
+  const calls = [];
+  context.__codexMuxPluginAccountId = 'primary';
+  context.client = {
+    cancelQueries: async filter => {
+      assert.equal(context.__codexMuxPluginAccountId, 'primary');
+      for (const root of ['apps', 'plugins', 'mcp']) assert.equal(filter.predicate({queryKey: [root]}), true);
+      assert.equal(filter.predicate({queryKey: ['threads']}), false);
+      calls.push('cancel');
+    },
+    resetQueries: async () => {
+      assert.equal(context.__codexMuxPluginAccountId, 'secondary');
+      calls.push('reset');
+    },
+  };
+  await vm.runInContext('codexMuxChangePluginScope(client, "secondary")', context);
+  assert.deepEqual(calls, ['cancel', 'reset']);
+});
