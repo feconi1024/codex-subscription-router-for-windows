@@ -94,6 +94,24 @@ test('profile plan and native edit controls follow the selected account', () => 
   }
 });
 
+test('successful reset redemption refreshes the account selector without retrying the redemption', async () => {
+  const context = renderer();
+  const events = [];
+  context.Event = class { constructor(type) { this.type = type; } };
+  context.dispatchEvent = event => events.push(event.type);
+  vm.runInContext(menu, context);
+  let requests = 0;
+  context.result = {code: 'reset'};
+  context.request = async () => { requests++; return context.result; };
+  vm.runInContext('codexMuxRequest = request', context);
+  for (const code of ['reset', 'already_redeemed', 'no_credit']) {
+    context.result = {code};
+    assert.equal((await vm.runInContext('codexMuxConsumeRateLimitReset("secondary", {redeemRequestId:"test"})', context)).code, code);
+  }
+  assert.equal(requests, 3);
+  assert.deepEqual(events, ['codex-mux-reset-updated', 'codex-mux-reset-updated']);
+});
+
 test('only recognized depletion errors are exposed by the pending-task adapter', () => {
   const context = renderer();
   vm.runInContext(menu, context);

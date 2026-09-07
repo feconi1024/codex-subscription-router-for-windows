@@ -164,4 +164,27 @@ and thrown creation failures. The page displays that message, including the
 reset time when supplied, and retains the native back/retry action. Other
 errors continue to use the native generic message. Memoization tracks the
 pending state, including its error text. Native verification of this final
-correction is in progress.
+correction passed native verification: the failure page displayed the
+add-subscription/wait advice and, in a separate test, the exact supplied
+local reset time. The back action restored the draft without submitting it.
+
+### Reset, profile teardown, and normal exit
+
+The native Usage dialog showed separate primary/secondary account selectors.
+With explicitly configured test credits (primary zero, secondary one), the
+second account's confirmation flow displayed a successful reset and its
+available count became zero. The control API confirmed that only the second
+account's test count decreased. Both accounts were in preview mode, so no
+real reset credit could be redeemed by this test.
+
+This revealed a stale count in the selector above the native reset panel.
+Successful redemptions now notify the selector to reload its account counts;
+the redemption itself is never retried by this refresh. Seven JavaScript
+behavior tests and all 141 Python tests pass. Rebuilt GUI verification of the
+selector refresh is pending.
+
+The Profile teardown correction passed visually: after viewing the secondary
+profile and returning to the task, the sidebar restored the primary identity.
+The application File > Quit action also passed: after shutdown completed,
+there were zero processes under the isolated shell directory and no listeners
+on either test/control port. Abnormal exit and final account logout remain.

@@ -280,7 +280,7 @@ async function codexMuxRateLimitResets(accountId) {
 }
 
 async function codexMuxConsumeRateLimitReset(accountId, input) {
-  return codexMuxRequest(
+  const result = await codexMuxRequest(
     `/accounts/${encodeURIComponent(accountId)}/rate-limit-resets/consume`,
     {
       method: "POST",
@@ -290,6 +290,10 @@ async function codexMuxConsumeRateLimitReset(accountId, input) {
       }),
     },
   );
+  if (result.code === "reset" || result.code === "already_redeemed") {
+    globalThis.dispatchEvent(new Event("codex-mux-reset-updated"));
+  }
+  return result;
 }
 
 function CodexMuxUsageModal({
@@ -339,7 +343,10 @@ function CodexMuxUseResetAccountState() {
   }, []);
 
   kXc.useEffect(() => {
-    loadAccounts().catch(() => setLoading(false));
+    const refresh = () => loadAccounts().catch(() => setLoading(false));
+    globalThis.addEventListener("codex-mux-reset-updated", refresh);
+    refresh();
+    return () => globalThis.removeEventListener("codex-mux-reset-updated", refresh);
   }, [loadAccounts]);
 
   kXc.useEffect(
