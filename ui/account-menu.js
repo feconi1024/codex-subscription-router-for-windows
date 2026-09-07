@@ -865,6 +865,15 @@ function CodexMuxOverlappingAvatars({ accounts, size = "size-20" }) {
   });
 }
 
+function codexMuxDepletionMessage(error) {
+  const message = typeof error === "string" ? error : error?.message;
+  return typeof message === "string" &&
+    /^All connected subscriptions are depleted\.(?: Add another subscription or wait for usage to reset\.| Usage resets on [^\r\n]{1,160}\.)$/.test(message)
+    ? message : null;
+}
+
+globalThis.codexMuxDepletionMessage = codexMuxDepletionMessage;
+
 function codexMuxPublishProfileSelection(accountId) {
   globalThis.__codexMuxSelectedProfileAccountId = accountId;
   globalThis.dispatchEvent(new Event("codex-mux-profile-selection"));

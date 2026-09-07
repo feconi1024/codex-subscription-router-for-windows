@@ -180,6 +180,48 @@
       "asset": "webview/assets/profile-4f666da923e4.js",
       "old": "className:`-me-2 flex items-center gap-2 no-drag`,children:[st,ct,ft,_t]",
       "new": "className:`-me-2 flex items-center gap-2 no-drag`,children:globalThis.CodexMuxProfileActions?.([st,ct,ft,_t])??null"
+    },
+    {
+      "asset": "webview/assets/app-primary-809d1fa17f2d.js",
+      "name": "preserve settled depletion error j",
+      "old": "e.set(Qa,o,{...j,status:`failed`})",
+      "new": "e.set(Qa,o,{...j,status:`failed`,codexMuxError:globalThis.codexMuxDepletionMessage(t.message)})"
+    },
+    {
+      "asset": "webview/assets/app-primary-809d1fa17f2d.js",
+      "name": "preserve settled depletion error N",
+      "old": "e.set(Qa,o,{...N,status:`failed`})",
+      "new": "e.set(Qa,o,{...N,status:`failed`,codexMuxError:globalThis.codexMuxDepletionMessage(t.message)})"
+    },
+    {
+      "asset": "webview/assets/app-primary-809d1fa17f2d.js",
+      "name": "preserve local task depletion error",
+      "old": "catch(t){if(L||await U(),o!=null&&!L){let t=e.get(Qa,o);t!=null&&e.set(Qa,o,e.get(dTe,o)==null?{...t,status:`failed`}:null)}",
+      "new": "catch(codexMuxError){let t=codexMuxError;if(L||await U(),o!=null&&!L){let t=e.get(Qa,o);t!=null&&e.set(Qa,o,e.get(dTe,o)==null?{...t,status:`failed`,codexMuxError:globalThis.codexMuxDepletionMessage(codexMuxError)}:null)}"
+    },
+    {
+      "asset": "webview/assets/app-primary-809d1fa17f2d.js",
+      "name": "preserve projectless depletion error",
+      "old": "catch(t){throw y||(await E(),o!=null&&x!=null&&e.get(Qa,o)===x&&e.set(Qa,o,{...x,status:`failed`})),t}",
+      "new": "catch(t){throw y||(await E(),o!=null&&x!=null&&e.get(Qa,o)===x&&e.set(Qa,o,{...x,status:`failed`,codexMuxError:globalThis.codexMuxDepletionMessage(t)})),t}"
+    },
+    {
+      "asset": "webview/assets/local-conversation-thread-981fc52ad9d4.js",
+      "name": "render actionable subscription depletion reason",
+      "old": "(0,dO.jsx)(J,{id:`localConversation.pendingProjectless.failed`,defaultMessage:`Could not start this chat`,description:`Error shown when a pending projectless conversation cannot be created`})",
+      "new": "(l.codexMuxError??(0,dO.jsx)(J,{id:`localConversation.pendingProjectless.failed`,defaultMessage:`Could not start this chat`,description:`Error shown when a pending projectless conversation cannot be created`}))"
+    },
+    {
+      "asset": "webview/assets/local-conversation-thread-981fc52ad9d4.js",
+      "name": "refresh failed task reason when pending state changes",
+      "old": "t[22]!==l.status||t[23]!==o?",
+      "new": "t[22]!==l||t[23]!==o?"
+    },
+    {
+      "asset": "webview/assets/local-conversation-thread-981fc52ad9d4.js",
+      "name": "cache failed task state with its reason",
+      "old": "t[22]=l.status,t[23]=o,t[24]=b",
+      "new": "t[22]=l,t[23]=o,t[24]=b"
     }
   ]
 }

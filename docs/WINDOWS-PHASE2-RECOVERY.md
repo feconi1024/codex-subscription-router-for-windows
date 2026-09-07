@@ -141,3 +141,27 @@ when rerun after the native process cleanup. Full acceptance remains pending rea
 routing, subsequent-turn ownership, depletion/reset previews, lifecycle
 checks, and logout of the account added for this session. No real reset credit
 has been redeemed.
+
+### Real task routing
+
+The operator-unlocked desktop was used to submit minimal fixed-response tasks
+through the real editor. With a test-only primary-account depletion preview,
+the new task returned `ROUTER_PHASE2_OK` and displayed the second subscription
+as owner. After clearing the preview, a subsequent message in the same task
+returned `ROUTER_STICKY_OK` and retained that owner. A new task under normal
+quotas returned `ROUTER_NORMAL_OK` and selected the primary subscription.
+Persisted ownership metadata agreed with the visible subscription rows.
+
+The native model selector automatically migrated the selected, retired
+GPT-5.4 Mini to GPT-5.6 Luna. The routing assertions concern subscription
+ownership, not the model alias.
+
+The all-account depletion preview exposed another integration defect: the
+backend returned an actionable depletion message, but the pending-task page
+discarded it and displayed only "Could not start this chat". Both reviewed
+renderer bindings now preserve recognized depletion messages through settled
+and thrown creation failures. The page displays that message, including the
+reset time when supplied, and retains the native back/retry action. Other
+errors continue to use the native generic message. Memoization tracks the
+pending state, including its error text. Native verification of this final
+correction is in progress.

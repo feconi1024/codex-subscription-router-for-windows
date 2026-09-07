@@ -94,6 +94,20 @@ test('profile plan and native edit controls follow the selected account', () => 
   }
 });
 
+test('only recognized depletion errors are exposed by the pending-task adapter', () => {
+  const context = renderer();
+  vm.runInContext(menu, context);
+  const unknownReset = 'All connected subscriptions are depleted. Add another subscription or wait for usage to reset.';
+  const knownReset = 'All connected subscriptions are depleted. Usage resets on Monday, 7 September at 8:30 PM.';
+  for (const value of [unknownReset, knownReset]) {
+    assert.equal(context.codexMuxDepletionMessage(value), value);
+    assert.equal(context.codexMuxDepletionMessage({message: value}), value);
+  }
+  for (const value of [null, {}, {message: 'private backend details'}, 'All connected subscriptions are depleted.\nprivate data', 'All connected subscriptions are depleted. Unexpected data']) {
+    assert.equal(context.codexMuxDepletionMessage(value), null);
+  }
+});
+
 test('leaving a secondary profile refreshes the shared native profile cache', () => {
   const context = renderer();
   const cleanups = [];
