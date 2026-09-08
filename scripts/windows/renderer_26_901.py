@@ -19,7 +19,7 @@ def contract(*, bundle: str | None = None, extracted: Path | None = None) -> dic
             raise RuntimeError("expected exactly one initial renderer")
         bundle = initial[0].read_text(encoding="utf-8")
     digest = hashlib.sha256(bundle.encode("utf-8")).hexdigest() if bundle is not None else None
-    for path in (Path(__file__).with_suffix(".json"), Path(__file__).with_name("renderer_26_901_5280.json")):
+    for path in (Path(__file__).with_suffix(".json"), Path(__file__).with_name("renderer_26_901_5280.json"), Path(__file__).with_name("renderer_26_901_6511.json")):
         spec = json.loads(path.read_text(encoding="utf-8"))
         if digest is None or spec["initial_sha256"] == digest:
             return spec

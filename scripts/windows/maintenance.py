@@ -120,9 +120,11 @@ def initialize(root: Path, *, adopt_validation_profile: bool = False) -> Layout:
     if adopt_validation_profile and not (layout.data / "mux-home/control-token").is_file():
         raise RuntimeError("no existing Router validation profile to adopt")
     with maintenance_lock(layout):
+        if layout.root.resolve() != layout.root:
+            raise RuntimeError("installation directory is redirected by the Store host; run install.ps1 from a normal PowerShell window or choose a non-virtualized --root")
+        atomic_json(layout.root / "installation.json", layout.marker())
         layout.builds.mkdir(exist_ok=True)
         secure_directory(layout.data)
-        atomic_json(layout.root / "installation.json", layout.marker())
     return layout
 
 
@@ -132,12 +134,13 @@ def _verify_official(candidate: Path) -> None:
         raise RuntimeError(f"official executable signature is not valid OpenAI: {candidate.name}")
 
 
-def install_launcher(layout: Layout, build: Path) -> None:
+def install_launcher(layout: Layout, build: Path, *, on_launch: bool = False) -> None:
     launcher = layout.root / "Codex Subscription Router.exe"
     reject_reparse(launcher)
     # The launcher has a stable schema contract. A running launcher cannot be
     # replaced on Windows; keep it during launch-time reconciliation.
-    if not launcher.exists():
+    changed = not launcher.exists() or sha256_file(launcher) != sha256_file(build / launcher.name)
+    if changed and (not on_launch or not launcher.exists()):
         temporary = layout.root / (".launcher-" + uuid.uuid4().hex + ".exe")
         shutil.copyfile(build / launcher.name, temporary)
         os.replace(temporary, launcher)
@@ -150,10 +153,16 @@ def install_launcher(layout: Layout, build: Path) -> None:
 
 
 def reconcile(layout: Layout, *, source_path: Path | None = None, real_path: Path | None = None,
-              repair: bool = False, require_native: bool = False, signing_thumbprint: str | None = None) -> dict:
+              repair: bool = False, require_native: bool = False, signing_thumbprint: str | None = None,
+              on_launch: bool = False) -> dict:
     from ..patch_app_windows import build_windows_desktop
     from .startup_smoke import startup_smoke
     with maintenance_lock(layout):
+        policy_path = layout.root / "maintenance-policy.json"
+        reject_reparse(policy_path)
+        policy = json.loads(policy_path.read_text(encoding="utf-8")) if policy_path.exists() else {}
+        signing_thumbprint = signing_thumbprint or policy.get("signing_thumbprint")
+        require_native = require_native or policy.get("require_native", False)
         source = locate_desktop_source(source_path)
         identity = source_identity(source)
         record = find_reviewed_source(identity)
@@ -168,7 +177,10 @@ def reconcile(layout: Layout, *, source_path: Path | None = None, real_path: Pat
             metadata = json.loads((layout.build(previous["build"]) / "metadata.json").read_text(encoding="utf-8"))
             if (current["source"] == identity and metadata.get("real_codex_sha256") == real.sha256
                     and metadata.get("tooling_sha256") == tooling
+                    and metadata.get("signing_thumbprint") == signing_thumbprint
+                    and (not require_native or metadata.get("computer_use", {}).get("status") == "VERIFIED")
                     and metadata.get("control_token_sha256") == sha256_file(layout.data / "mux-home/control-token")):
+                install_launcher(layout, layout.build(previous["build"]), on_launch=on_launch)
                 return {"status": "UNCHANGED", "current": previous}
         require_idle(layout)
         _verify_official(source.executable)
@@ -182,6 +194,7 @@ def reconcile(layout: Layout, *, source_path: Path | None = None, real_path: Pat
                     payload_acl_strategy=str(record["payload_acl_strategy"]),
                     production_data_root=layout.data, include_computer_use=True)
         metadata["tooling_sha256"] = tooling
+        metadata["signing_thumbprint"] = signing_thumbprint
         metadata["control_token_sha256"] = sha256_file(layout.data / "mux-home/control-token")
         try:
             # Codex's native sandbox/code-mode commands locate these siblings.
@@ -202,8 +215,10 @@ def reconcile(layout: Layout, *, source_path: Path | None = None, real_path: Pat
             if source_identity(source) != identity or sha256_file(real.path) != real.sha256 or tooling_digest() != tooling:
                 raise RuntimeError("official source changed during build; current version was retained")
             seal_build(build, identity, smoke)
-            install_launcher(layout, build)
+            install_launcher(layout, build, on_launch=on_launch)
             pointer = activate(layout, identifier)
+            atomic_json(policy_path, {"schema_version": 1, "signing_thumbprint": signing_thumbprint,
+                                      "require_native": bool(require_native)})
             return {"status": "UPDATED", "current": pointer, "computer_use": metadata["computer_use"], "startup_smoke": smoke}
         except BaseException:
             # Retain the unactivated build for diagnosis. It cannot be selected
@@ -232,12 +247,23 @@ def doctor(layout: Layout) -> dict:
         root = layout.build(current["build"])
         verify_build(root)
         report["checks"]["payload"] = "PASS"
-        report["computer_use"] = json.loads((root / "metadata.json").read_text(encoding="utf-8")).get("computer_use")
+        metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+        report["computer_use"] = metadata.get("computer_use")
+        _verify_official(root / "runtime/codex.real.exe")
+        report["checks"]["official_cli_signature"] = "PASS"
+        for relative in metadata.get("project_signatures", {}):
+            if read_authenticode(root / relative).status.casefold() != "valid":
+                raise RuntimeError("project executable signature no longer validates")
+        report["checks"]["project_signatures"] = "PASS" if metadata.get("project_signatures") else "NOT_CONFIGURED"
+        launcher = layout.root / "Codex Subscription Router.exe"
+        report["checks"]["launcher"] = "PASS" if sha256_file(launcher) == sha256_file(root / launcher.name) else "UPDATE_DEFERRED_UNTIL_EXPLICIT_UPDATE"
         for path in (layout.data, layout.data / "mux-home", layout.data / "codex-home"):
             reject_reparse(path)
             if not path.is_dir():
                 raise RuntimeError("persistent data layout is incomplete")
+            secure_directory(path, verify_only=True)
         report["checks"]["state_layout"] = "PASS"
+        report["checks"]["state_dacl"] = "PASS"
     except (OSError, RuntimeError, ValueError) as error:
         report.update(status="FAIL", reason=str(error))
     report["running_process_count"] = len(inventory_processes_under_root(layout.builds))

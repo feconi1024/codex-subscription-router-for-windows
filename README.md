@@ -157,6 +157,50 @@ python3 scripts/patch_app.py --allow-adhoc-signing
 
 Appshots and Computer Use may not function with an ad-hoc signature.
 
+## Windows managed installation (Phase 3 preview)
+
+From a normal PowerShell window in this checkout, with Python 3.11+, Go 1.26+,
+Node.js 22.12+ and npm installed:
+
+```powershell
+.\install.ps1
+```
+
+The installer uses the installed official Codex package as input, accepts only
+an exactly reviewed source, and activates a build only after an isolated startup
+check. It creates a per-user Start Menu shortcut. Use `-NoLaunch` to finish
+without opening the installed application, or `-InstallRoot 'E:\Apps\Router'`
+to choose another location. Store-hosted terminals may redirect LocalAppData;
+run the installer from normal PowerShell if it reports filesystem redirection.
+
+Account and desktop data stay in `Data`, outside replaceable `builds`. Existing
+Phase 2 users can explicitly select `-AdoptValidationProfile` to reuse their
+Router validation profile in place. The installer never imports credentials
+from the official application.
+
+```powershell
+$router = "$env:LOCALAPPDATA\Codex Subscription Router\routerctl.ps1"
+& $router doctor
+& $router update
+& $router rollback
+& $router repair
+& $router uninstall
+```
+
+Quit Router before maintenance. Launch-time reconciliation retains the current
+build when the installed official version is unknown. Rollback pins the selected
+build until an explicit update. Uninstall preserves account data by default;
+`uninstall --purge-data` explicitly deletes it. Keep the source checkout at its
+installed location because maintenance uses that checkout.
+
+Use `-RequireNative` to require a verified Computer Use runtime and
+`-SigningThumbprint <certificate-thumbprint>` to sign project executables with
+an existing CurrentUser code-signing certificate. These requirements persist
+across updates. OpenAI executables are not re-signed. Runtime verification is
+separate from authenticated Computer Use acceptance; Appshots remains subject
+to the official Windows feature gate. See the current
+[Phase 3 acceptance status](docs/WINDOWS-PHASE3.md).
+
 ## Windows Desktop MVP (development build)
 
 The Windows Desktop MVP creates a writable local copy without modifying the
@@ -178,8 +222,8 @@ and `app.asar` hash have been manually audited and recorded in
 [WINDOWS-COMPATIBILITY.md](docs/WINDOWS-COMPATIBILITY.md). The generated tree
 contains `Codex Subscription Router.exe`, the patched desktop under `app\`,
 and `codex-mux.exe` plus the byte-identical real Codex binary under `runtime\`.
-Windows signing, Computer Use, Appshots, and final GUI validation are deferred
-to later phases.
+For managed builds, signing and runtime acquisition use the Phase 3 installer
+above. The development command does not provide the managed update lifecycle.
 
 ## Grant macOS permissions
 

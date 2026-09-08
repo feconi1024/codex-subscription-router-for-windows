@@ -13,7 +13,7 @@ from .managed_paths import reject_reparse
 def sign_project_binaries(build: Path, thumbprint: str) -> dict:
     if not re.fullmatch(r"[0-9a-fA-F]{40}", thumbprint):
         raise ValueError("signing thumbprint must contain exactly 40 hexadecimal characters")
-    powershell = shutil.which("powershell.exe") or shutil.which("pwsh.exe")
+    powershell = shutil.which("pwsh.exe") or shutil.which("powershell.exe")
     if not powershell:
         raise RuntimeError("PowerShell is required for signing")
     result = {}
@@ -21,7 +21,7 @@ def sign_project_binaries(build: Path, thumbprint: str) -> dict:
         path = build / relative
         reject_reparse(path)
         literal = "'" + str(path).replace("'", "''") + "'"
-        script = f"""
+        script = rf"""
 $ErrorActionPreference = 'Stop'
 $cert = Get-Item -LiteralPath 'Cert:\CurrentUser\My\{thumbprint}'
 if (!$cert.HasPrivateKey -or $cert.NotAfter -le (Get-Date)) {{ throw 'A valid private code-signing key is required' }}

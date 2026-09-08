@@ -27,6 +27,7 @@ def main() -> int:
     parser.add_argument("--signing-thumbprint", help="CurrentUser My code-signing certificate for project executables")
     parser.add_argument("--purge-data", action="store_true", help="uninstall: permanently delete Router account/profile data")
     parser.add_argument("--on-launch", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--no-shortcut", action="store_true", help="do not create a Start Menu shortcut")
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("routerctl is Windows-only")
@@ -42,13 +43,19 @@ def main() -> int:
         if args.command in {"install", "update", "repair", "reconcile"}:
             result = reconcile(layout, source_path=args.source, real_path=args.real_codex,
                                repair=args.command == "repair", require_native=args.require_native,
-                               signing_thumbprint=args.signing_thumbprint)
+                               signing_thumbprint=args.signing_thumbprint, on_launch=args.on_launch)
         elif args.command == "rollback":
             result = rollback(layout, args.build)
         elif args.command == "doctor":
             result = doctor(layout)
         else:
             result = uninstall(layout, purge_data=args.purge_data)
+        if args.command == "install" and result["status"] in {"UPDATED", "UNCHANGED"} and not args.no_shortcut:
+            from scripts.windows.shortcuts import start_menu
+            result["start_menu"] = start_menu(layout)
+        elif args.command == "uninstall":
+            from scripts.windows.shortcuts import start_menu
+            result["start_menu"] = start_menu(layout, remove=True)
         if args.command != "doctor":
             atomic_json(layout.root / "last-maintenance.json", result)
         print(json.dumps(result, indent=2))

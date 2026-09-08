@@ -17,6 +17,7 @@ Phase 3 progress: [WINDOWS-PHASE3.md](WINDOWS-PHASE3.md).
 | 26.825.6671.0 | X64 | PATCHABLE | windows-26.825 |
 | 26.901.4073.0 | X64 | PATCHABLE | windows-26.901 |
 | 26.901.5280.0 | X64 | PATCHABLE | windows-26.901 |
+| 26.901.6511.0 | X64 | PATCHABLE | windows-26.901 |
 
 ## Derived legacy diagnostic records
 
@@ -68,6 +69,16 @@ Phase 3 progress: [WINDOWS-PHASE3.md](WINDOWS-PHASE3.md).
     "package_version": "26.901.5280.0",
     "app_file_version": "152.0.7977.64",
     "app_asar_sha256": "6579c4326cccdb508d079ecc878ad4725451b2234370d2ed9d4db53939cf99c7",
+    "real_codex_version": null,
+    "real_codex_sha256": null,
+    "tested_patch_anchors": "windows-26.901"
+  },
+  {
+    "architecture": "X64",
+    "package_name": "OpenAI.Codex",
+    "package_version": "26.901.6511.0",
+    "app_file_version": "152.0.7977.83",
+    "app_asar_sha256": "e75bae2b8a02f174c7ceeed6d631aaff355e44f8af5c798fa3628089f11d659e",
     "real_codex_version": null,
     "real_codex_sha256": null,
     "tested_patch_anchors": "windows-26.901"

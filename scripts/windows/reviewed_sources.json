@@ -73,5 +73,25 @@
     "integrity_state": "FUSE_PRESENT_RESOURCE_PRESENT",
     "payload_acl_strategy": "UNRESOLVED",
     "review_status": "PATCHABLE"
+  },
+  {
+    "package_name": "OpenAI.Codex",
+    "package_full_name": "OpenAI.Codex_26.901.6511.0_x64__2p2nqsd0c76g0",
+    "package_version": "26.901.6511.0",
+    "architecture": "X64",
+    "app_file_version": "152.0.7977.83",
+    "app_asar_sha256": "e75bae2b8a02f174c7ceeed6d631aaff355e44f8af5c798fa3628089f11d659e",
+    "app_asar_header_sha256": "05c17bbfdf015b00c3ca8aa645b44b315dbfd2cedb8a69ac9e415eeb670deca3",
+    "renderer_variant": "windows-26.901",
+    "authoritative_shell": "app\\ChatGPT.exe",
+    "bootstrap_strategy": "environment-only",
+    "integrity_state": "FUSE_PRESENT_RESOURCE_PRESENT",
+    "payload_acl_strategy": "UNRESOLVED",
+    "review_status": "PATCHABLE",
+    "capabilities": {
+      "computer_use": {"status": "RUNTIME_DISCOVERED", "native_acceptance": "NOT_RUN"},
+      "appshots": {"status": "UPSTREAM_GATED", "native_acceptance": "NOT_RUN"}
+    },
+    "acceptance": {"phase3": "NOT_RUN"}
   }
 ]
