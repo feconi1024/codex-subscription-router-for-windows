@@ -113,3 +113,6 @@ jobs:
             Write-Output "::error file=scripts/tests/test_windows_desktop.py::$details"
             exit $exitCode
           }
+
+      - name: Check generated Windows compatibility documentation
+        run: python -m scripts.windows.generate_compatibility --check

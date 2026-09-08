@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/b-nnett/codex-subscription-router/internal/permissions"
 )
 
 const stateVersion = 1
@@ -49,7 +51,7 @@ func Open(root, primaryCodexHome string) (*Store, error) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, fmt.Errorf("create state root: %w", err)
 	}
-	if err := os.Chmod(root, 0o700); err != nil {
+	if err := permissions.Directory(root); err != nil {
 		return nil, fmt.Errorf("secure state root: %w", err)
 	}
 
@@ -171,7 +173,7 @@ func (s *Store) AddAccount(label string) (Account, error) {
 	if err := os.MkdirAll(codexHome, 0o700); err != nil {
 		return Account{}, fmt.Errorf("create account home: %w", err)
 	}
-	if err := os.Chmod(codexHome, 0o700); err != nil {
+	if err := permissions.Directory(codexHome); err != nil {
 		return Account{}, fmt.Errorf("secure account home: %w", err)
 	}
 	if err := syncIsolatedConfig(s.primaryCodexHome, codexHome); err != nil {
@@ -261,7 +263,7 @@ func (s *Store) saveLocked() error {
 	if err := os.WriteFile(temporary, append(data, '\n'), 0o600); err != nil {
 		return fmt.Errorf("write state: %w", err)
 	}
-	if err := os.Chmod(temporary, 0o600); err != nil {
+	if err := permissions.File(temporary); err != nil {
 		return fmt.Errorf("secure state: %w", err)
 	}
 	if err := os.Rename(temporary, s.path); err != nil {

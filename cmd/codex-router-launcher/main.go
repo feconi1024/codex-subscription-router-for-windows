@@ -8,6 +8,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/b-nnett/codex-subscription-router/internal/installationlock"
+	"github.com/b-nnett/codex-subscription-router/internal/permissions"
 )
 
 const (
@@ -35,6 +38,7 @@ type launchPaths struct {
 	mux      string
 	real     string
 	userData string
+	dataRoot string
 }
 
 func main() {
@@ -47,6 +51,18 @@ func run() int {
 		fmt.Fprintf(os.Stderr, "Codex Subscription Router: resolve launcher path: %v\n", err)
 		return 1
 	}
+	installationRoot := filepath.Dir(launcher)
+	reconcileAtLaunch(installationRoot)
+	release := func() {}
+	if regularFile(filepath.Join(installationRoot, "installation.json")) {
+		unlock, err := installationlock.Acquire(installationRoot)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Codex Subscription Router: maintenance is running; try launching again after it finishes")
+			return 1
+		}
+		release = unlock
+	}
+	defer func() { release() }()
 	paths, err := resolveLaunchPaths(launcher)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Codex Subscription Router: %v\n", err)
@@ -55,8 +71,26 @@ func run() int {
 	userData := paths.userData
 	muxHome := filepath.Join(paths.root, "runtime", muxStateDirectoryName)
 	codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME"))
+	if paths.dataRoot != "" {
+		muxHome = filepath.Join(paths.dataRoot, muxHomeDirectoryName)
+		codexHome = filepath.Join(paths.dataRoot, codexHomeDirectoryName)
+		for _, private := range []string{paths.dataRoot, muxHome, codexHome} {
+			if err := rejectRedirectedPath(private); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+			if err := permissions.Directory(private); err != nil {
+				fmt.Fprintf(os.Stderr, "Codex Subscription Router: protect persistent state: %v\n", err)
+				return 1
+			}
+		}
+	}
 	persistentProfileRoot := strings.TrimSpace(os.Getenv("CODEX_MUX_PERSISTENT_PROFILE_ROOT"))
 	if persistentProfileRoot != "" {
+		if paths.dataRoot != "" {
+			fmt.Fprintln(os.Stderr, "Codex Subscription Router: validation override is incompatible with a managed installation")
+			return 1
+		}
 		if os.Getenv("CODEX_MUX_UI_TESTS") != "1" {
 			fmt.Fprintln(os.Stderr, "Codex Subscription Router: persistent validation profile is test-only")
 			return 1
@@ -70,7 +104,7 @@ func run() int {
 		codexHome = filepath.Join(profileRoot, codexHomeDirectoryName)
 		muxHome = filepath.Join(profileRoot, muxHomeDirectoryName)
 	}
-	if err := os.MkdirAll(userData, 0o700); err != nil {
+	if err := permissions.Directory(userData); err != nil {
 		fmt.Fprintf(os.Stderr, "Codex Subscription Router: create isolated user data: %v\n", err)
 		return 1
 	}
@@ -83,9 +117,10 @@ func run() int {
 		"CODEX_ELECTRON_USER_DATA_PATH": userData,
 		"CODEX_SPARKLE_ENABLED":         "false",
 	})
-	if persistentProfileRoot != "" {
+	if persistentProfileRoot != "" || paths.dataRoot != "" {
 		environment = buildEnvironment(environment, map[string]string{
-			"CODEX_HOME": codexHome,
+			"CODEX_HOME":        codexHome,
+			"CODEX_SQLITE_HOME": codexHome,
 		})
 	}
 	arguments := isolatedArguments(os.Args[1:], userData)
@@ -95,7 +130,15 @@ func run() int {
 	command.Stdin = os.Stdin
 	command.Stdout = os.Stdout
 	command.Stderr = os.Stderr
-	if err := command.Run(); err != nil {
+	if err := command.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "Codex Subscription Router: launch selected Desktop shell: %v\n", err)
+		return 1
+	}
+	// The child is now visible to maintenance's process inventory. Release the
+	// admission lock, allowing subsequent launches to reach Electron's singleton.
+	release()
+	release = func() {}
+	if err := command.Wait(); err != nil {
 		var exitError *exec.ExitError
 		if errors.As(err, &exitError) {
 			return exitError.ExitCode()
@@ -139,6 +182,10 @@ func resolveLaunchPaths(launcher string) (launchPaths, error) {
 		return launchPaths{}, fmt.Errorf("resolve launcher path: %w", err)
 	}
 	root := filepath.Dir(absoluteLauncher)
+	root, dataRoot, err := resolveManagedRoot(root)
+	if err != nil {
+		return launchPaths{}, err
+	}
 	appDir := filepath.Join(root, "app")
 	chatGPT, err := resolveDesktopExecutable(root, appDir)
 	if err != nil {
@@ -151,6 +198,10 @@ func resolveLaunchPaths(launcher string) (launchPaths, error) {
 		mux:      filepath.Join(root, "runtime", muxExecutableName),
 		real:     filepath.Join(root, "runtime", realCodexName),
 		userData: filepath.Join(root, userDataDirectoryName),
+		dataRoot: dataRoot,
+	}
+	if dataRoot != "" {
+		paths.userData = filepath.Join(dataRoot, userDataDirectoryName)
 	}
 	missing := make([]string, 0, 3)
 	if !regularFile(paths.chatGPT) {

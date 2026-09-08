@@ -1779,6 +1779,8 @@ def build_windows_desktop(
     payload_acl_strategy: str | None = None,
     mux_home_override: Path | None = None,
     validation_profile_local_appdata: Path | None = None,
+    production_data_root: Path | None = None,
+    include_computer_use: bool = False,
 ) -> dict[str, object]:
     destination = destination.expanduser().resolve(strict=False)
     if (
@@ -1803,7 +1805,6 @@ def build_windows_desktop(
             "--payload-acl-strategy must be one of "
             + ", ".join(PAYLOAD_ACL_STRATEGIES)
         )
-    records = load_compatibility_records(COMPATIBILITY_DOCUMENT)
     source_hash = sha256_file(source.app_asar)
     source_header_hash = asar_header_digest(source.app_asar).hash
     source_identity = {
@@ -1821,22 +1822,10 @@ def build_windows_desktop(
         else find_reviewed_source(source_identity)
     )
     reviewed_ok, reviewed_reason = reviewed_source_is_patchable(source_identity, reviewed_record)
-    matching = find_matching_record(
-        records,
-        package_name=source.package.name,
-        package_version=source.package.version,
-        app_file_version=source.file_version,
-        app_asar_sha256=source_hash,
-    )
     if not reviewed_ok and not allow_untested_source:
-        compatibility_note = (
-            "no legacy compatibility record matched either"
-            if matching is None
-            else "a legacy compatibility record is insufficient without an exact reviewed-source record"
-        )
         raise RuntimeError(
             "unknown Windows ChatGPT source: reviewed-source gate failed: "
-            f"{reviewed_reason}; {compatibility_note}; "
+            f"{reviewed_reason}; "
             "pass --allow-untested-source only for a deliberate generic test build"
         )
     go_executable = go_executable_or_raise()
@@ -1846,7 +1835,26 @@ def build_windows_desktop(
         if mux_home_override is not None
         else None
     )
-    if persistent_mux_home is not None:
+    state_root = None
+    if production_data_root is not None:
+        if mux_home_override is not None or allow_untested_source or force:
+            raise RuntimeError("production builds require a reviewed source and a new immutable build directory")
+        try:
+            from .windows.managed_paths import Layout, reject_reparse
+            from .windows.private_state import secure_directory
+        except ImportError:
+            from windows.managed_paths import Layout, reject_reparse
+            from windows.private_state import secure_directory
+        layout = Layout.load(destination.parent.parent)
+        if destination.parent != layout.builds or production_data_root.absolute() != layout.data:
+            raise RuntimeError("production builds and Data must belong to the same managed installation")
+        layout.build(destination.name)
+        reject_reparse(layout.data)
+        state_root = layout.data
+        persistent_mux_home = state_root / "mux-home"
+        for directory in (state_root, persistent_mux_home, state_root / "codex-home"):
+            secure_directory(directory)
+    elif persistent_mux_home is not None:
         if validation_profile_local_appdata is not None:
             profile_local_appdata_path = validation_profile_local_appdata
         else:
@@ -1870,6 +1878,7 @@ def build_windows_desktop(
         if persistent_mux_home == destination or persistent_mux_home.is_relative_to(destination):
             raise RuntimeError("persistent CODEX_MUX_HOME must remain outside patched-shell")
         persistent_mux_home.mkdir(parents=True, exist_ok=True)
+        state_root = profile_layout.root
     token: str
     mirror_plan = plan_mirror_source(source)
     storage_check = storage_preflight(
@@ -1882,7 +1891,7 @@ def build_windows_desktop(
         ),
         current_destination=destination if destination.exists() else None,
         asar_path=source.app_asar,
-        validation_profile_root=(profile_layout.root if persistent_mux_home is not None else None),
+        validation_profile_root=state_root,
         local_appdata=validation_profile_local_appdata,
     )
     require_storage_capacity(storage_check)
@@ -2050,6 +2059,20 @@ def build_windows_desktop(
         build_go_binary("./cmd/codex-router-launcher", launcher, go_executable)
         copy_byte_identical(real.path, staged_real)
 
+        native_runtime = {"status": "NOT_REQUESTED", "native_acceptance": "NOT_RUN"}
+        if include_computer_use:
+            try:
+                try:
+                    from .windows.computer_use import acquire, smoke
+                except ImportError:
+                    from windows.computer_use import acquire, smoke
+                native_runtime = acquire(source.resources_dir, staged_resources / "cua_node", source.package.architecture)
+                native_runtime["smoke"] = smoke(staged_resources / "cua_node")
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                # Preserve multi-account Desktop availability if an optional
+                # native component cannot be acquired. Never call this PASS.
+                native_runtime = {"status": "UNAVAILABLE", "reason": str(error)[:600], "native_acceptance": "NOT_RUN"}
+
         if persistent_mux_home is None:
             (staged / "User Data").mkdir(parents=True, exist_ok=True)
             (staged / "codex-home").mkdir(parents=True, exist_ok=True)
@@ -2077,6 +2100,7 @@ def build_windows_desktop(
             renderer_syntax_validation,
         )
         metadata["reviewed_source"] = dict(reviewed_record) if reviewed_ok else None
+        metadata["computer_use"] = native_runtime
         metadata["reviewed_source_gate"] = {
             "status": "PATCHABLE" if reviewed_ok else "GENERIC_TEST_ESCAPE_HATCH",
             "reason": reviewed_reason,
@@ -2126,7 +2150,7 @@ def build_windows_desktop(
             destination,
             force,
             policy=install_policy,
-            router_root=(profile_layout.root if persistent_mux_home is not None else None),
+            router_root=(destination.parent if persistent_mux_home is not None else None),
         )
     print(f"Windows Desktop staged at {destination}")
     if backup is not None:

@@ -1,0 +1,178 @@
+"""Failure-oriented tests using synthetic payloads, never official binaries."""
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from scripts.windows.managed_paths import Layout, atomic_json, build_id, maintenance_lock
+from scripts.windows.maintenance import activate, seal_build, verify_build, uninstall, rollback, initialize
+from scripts.windows.computer_use import identity, validate
+
+
+class MaintenanceTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.layout = Layout(Path(self.temporary.name) / "Router")
+        self.layout.builds.mkdir(parents=True)
+        self.layout.data.mkdir()
+        atomic_json(self.layout.root / "installation.json", self.layout.marker())
+        # Deliberately distinctive sentinel: update/rollback must never copy or
+        # modify this account-state stand-in.
+        (self.layout.data / "private-sentinel").write_text("private-original")
+
+    def build(self, name):
+        root = self.layout.build(name)
+        for relative in ("app/ChatGPT.exe", "app/resources/app.asar", "runtime/codex-mux.exe",
+                         "runtime/codex.real.exe", "launch.json", "metadata.json", "Codex Subscription Router.exe"):
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(name)
+        seal_build(root, {"version": name}, {"status": "PASS"})
+        return root
+
+    def test_switch_and_rollback_preserve_data_and_both_payloads(self):
+        old, new = self.build("old"), self.build("new")
+        activate(self.layout, "old")
+        activate(self.layout, "new")
+        with mock.patch("scripts.windows.maintenance.require_idle"):
+            result = rollback(self.layout)
+        self.assertEqual(result["current"]["build"], "old")
+        self.assertFalse(result["current"]["auto_update"])
+        self.assertEqual((self.layout.data / "private-sentinel").read_text(), "private-original")
+        verify_build(old)
+        verify_build(new)
+
+    def test_failed_validation_never_replaces_pointer(self):
+        self.build("old")
+        new = self.build("new")
+        activate(self.layout, "old")
+        before = (self.layout.root / "current.json").read_bytes()
+        (new / "app/ChatGPT.exe").write_text("corrupt")
+        with self.assertRaisesRegex(RuntimeError, "differs"):
+            activate(self.layout, "new")
+        self.assertEqual((self.layout.root / "current.json").read_bytes(), before)
+
+    def test_pointer_replace_failure_retains_previous_bytes(self):
+        self.build("old")
+        self.build("new")
+        activate(self.layout, "old")
+        before = (self.layout.root / "current.json").read_bytes()
+        with mock.patch("scripts.windows.managed_paths.os.replace", side_effect=PermissionError("locked")):
+            with self.assertRaises(PermissionError):
+                activate(self.layout, "new")
+        self.assertEqual((self.layout.root / "current.json").read_bytes(), before)
+        self.assertFalse(list(self.layout.root.glob(".current.json-*")))
+
+    def test_unsealed_or_failed_smoke_build_cannot_activate(self):
+        root = self.layout.build("unsealed")
+        root.mkdir()
+        with self.assertRaises(FileNotFoundError):
+            activate(self.layout, "unsealed")
+        with self.assertRaisesRegex(RuntimeError, "startup smoke"):
+            seal_build(root, {}, {"status": "FAIL"})
+
+    def test_extra_payload_files_are_detected(self):
+        root = self.build("extra")
+        (root / "unexpected.dll").write_text("not sealed")
+        with self.assertRaisesRegex(RuntimeError, "differs"):
+            verify_build(root)
+
+    def test_state_is_forbidden_inside_payload(self):
+        root = self.build("state")
+        (root / "User Data").mkdir()
+        with self.assertRaisesRegex(RuntimeError, "persistent state"):
+            verify_build(root)
+
+    def test_build_ids_reject_traversal_streams_devices_and_absolute_paths(self):
+        for value in ("..", "../Data", "a/../b", "C:\\temp", "a:b", "new.", "CON", "nul.exe", "new ", "a\\b", ""):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                build_id(value)
+
+    def test_malformed_pointer_never_falls_back(self):
+        (self.layout.root / "current.json").write_text('{"schema_version":1,"build":"../Data"}')
+        with self.assertRaises(ValueError):
+            self.layout.current()
+
+    def test_os_lock_releases_and_stale_file_is_harmless(self):
+        with maintenance_lock(self.layout):
+            with self.assertRaisesRegex(RuntimeError, "another Router"):
+                with maintenance_lock(self.layout):
+                    self.fail("second holder admitted")
+        with maintenance_lock(self.layout):
+            pass
+
+    def test_uninstall_preserves_data_and_unknown_files(self):
+        self.build("old")
+        activate(self.layout, "old")
+        (self.layout.root / "user-notes.txt").write_text("keep")
+        with mock.patch("scripts.windows.maintenance.inventory_processes_under_root", return_value=[]):
+            result = uninstall(self.layout)
+        self.assertTrue(result["data_preserved"])
+        self.assertEqual((self.layout.data / "private-sentinel").read_text(), "private-original")
+        self.assertTrue((self.layout.root / "user-notes.txt").exists())
+        self.assertEqual(Layout.load(self.layout.root), self.layout)
+        self.assertFalse(self.layout.builds.exists())
+
+    def test_purge_requires_explicit_flag(self):
+        with mock.patch("scripts.windows.maintenance.inventory_processes_under_root", return_value=[]):
+            uninstall(self.layout, purge_data=True)
+        self.assertFalse(self.layout.data.exists())
+
+    def test_busy_uninstall_makes_no_changes(self):
+        self.build("old")
+        with mock.patch("scripts.windows.maintenance.inventory_processes_under_root", return_value=[object()]):
+            with self.assertRaisesRegex(RuntimeError, "running"):
+                uninstall(self.layout)
+        self.assertTrue(self.layout.build("old").exists())
+        self.assertTrue(self.layout.data.exists())
+
+    def test_reinstall_reuses_marker_without_reinitializing_data(self):
+        self.assertEqual(initialize(self.layout.root), self.layout)
+        self.assertEqual((self.layout.data / "private-sentinel").read_text(), "private-original")
+
+    def test_refuses_nonempty_unmanaged_root(self):
+        other = self.layout.root / "other"
+        other.mkdir()
+        (other / "unrelated.txt").write_text("keep")
+        with self.assertRaisesRegex(RuntimeError, "nonempty"):
+            initialize(other)
+
+    def test_manifest_cannot_escape_build(self):
+        root = self.build("manifest")
+        manifest = json.loads((root / "build-manifest.json").read_text())
+        manifest["files"]["../Data/private-sentinel"] = "0" * 64
+        atomic_json(root / "build-manifest.json", manifest)
+        with self.assertRaisesRegex(RuntimeError, "invalid manifest"):
+            verify_build(root)
+
+
+class RuntimeTests(unittest.TestCase):
+    def test_runtime_identity_changes_when_repl_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "bin").mkdir()
+            for name in ("manifest.json", "bin/node.exe", "bin/node_repl.exe"):
+                (root / name).write_text(name)
+            before = identity(root)
+            (root / "bin/node_repl.exe").write_text("updated")
+            self.assertNotEqual(identity(root), before)
+
+    def test_manifest_cannot_select_external_executables(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "manifest.json").write_text(json.dumps({"platform": "windows", "arch": "x64", "node_path": "../../external.exe"}))
+            with self.assertRaisesRegex(RuntimeError, "layout"):
+                validate(root, "x64")
+
+    def test_wrong_architecture_fails_before_execution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "manifest.json").write_text(json.dumps({"platform": "windows", "arch": "arm64"}))
+            with self.assertRaisesRegex(RuntimeError, "architecture"):
+                validate(root, "x64")
+
+
+if __name__ == "__main__":
+    unittest.main()

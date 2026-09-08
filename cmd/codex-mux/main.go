@@ -19,6 +19,7 @@ import (
 
 	"github.com/b-nnett/codex-subscription-router/internal/control"
 	"github.com/b-nnett/codex-subscription-router/internal/mux"
+	"github.com/b-nnett/codex-subscription-router/internal/permissions"
 	"github.com/b-nnett/codex-subscription-router/internal/protocol"
 	"github.com/b-nnett/codex-subscription-router/internal/state"
 )
@@ -183,7 +184,7 @@ func loadOrCreateToken(root string) (string, error) {
 		if validateErr != nil {
 			return "", fmt.Errorf("read control token: %w", validateErr)
 		}
-		if chmodErr := os.Chmod(path, 0o600); chmodErr != nil {
+		if chmodErr := permissions.File(path); chmodErr != nil {
 			return "", fmt.Errorf("secure control token: %w", chmodErr)
 		}
 		return token, nil
@@ -197,6 +198,9 @@ func loadOrCreateToken(root string) (string, error) {
 	token := hex.EncodeToString(bytes)
 	if err := os.WriteFile(path, []byte(token), 0o600); err != nil {
 		return "", fmt.Errorf("write control token: %w", err)
+	}
+	if err := permissions.File(path); err != nil {
+		return "", err
 	}
 	return token, nil
 }
