@@ -3,6 +3,33 @@
 Date: 2026-09-06. Baseline: `main@ce706f6` and
 `codex/windows-desktop-mvp@496eabc`.
 
+## Final acceptance status — 2026-09-08
+
+Full Phase 2 acceptance is complete for the reviewed Windows Desktop source
+26.901.5280.0 on this host. The implementation remains on
+`codex/windows-desktop-mvp`; it has not been merged into `main`.
+
+The entries below this status section preserve the investigation history;
+their earlier pending statements describe those checkpoints.
+
+| Requirement | Result |
+| --- | --- |
+| Isolated Windows Desktop, integrity enforcement, native mux chain | PASS on reviewed 26.901.5280.0 |
+| Two-account add and operator authentication | PASS |
+| Combined and per-account Profile, Usage, reset selection | PASS |
+| Reset count first load and refresh after simulated redemption | PASS |
+| Account-scoped Apps and MCP connections | PASS |
+| Real task routing and sticky follow-up | PASS |
+| Depletion advice with and without a known reset time | PASS |
+| Persistence across crash, restart, and rebuild | PASS: both connections and all existing ownership entries retained |
+| Normal and abnormal exit cleanup | PASS: zero isolated processes and control listeners |
+| Secondary-account logout through the desktop menu | PASS: session-added account disconnected; primary retained |
+
+Local verification: nine JavaScript behavior tests and 141 Python tests pass.
+Go tests and vet passed earlier and are also checked by CI. Real reset credit
+redemption was never performed; the UI flow used explicit test-only credits.
+The official installation and its existing session were not modified.
+
 ## Decision and acceptance scope
 
 Continue on `codex/windows-desktop-mvp`. It descends from `main`; the branch
@@ -22,7 +49,7 @@ successful Phase 2A.5 transport or menu probe. Acceptance includes:
 - Restart persistence, normal/abnormal exit cleanup and absence of stale ports.
 
 Computer Use, Appshots, installers, signing and automatic Store-update rebuilds
-remain outside this phase. No full Phase 2 pass is claimed by this document.
+remain outside this phase.
 
 ## Findings supported by code and source inspection
 
@@ -221,3 +248,22 @@ account list on success, and displays request failures. A regression verifies
 that only the selected secondary account receives the logout request and the
 primary remains in the connected cache. Native verification and final logout
 of the session-added account are pending this rebuild.
+
+### Final closure
+
+Commit `678b7da` passed GitHub CI and the rebuilt native host probe
+(`phase2-final-logout-host.json`): all nine production gates passed, two
+accounts loaded, and zero renderer errors were recorded. The desktop menu's
+`Log out Subscription 2` action then succeeded. The menu showed one connected
+subscription, the secondary account reported disconnected, and its actual
+`codex-home/auth.json` was absent. The primary connection predated this
+session and was retained.
+
+The final graceful exit completed with zero processes under the isolated
+shell and zero listeners on 48123/48124. All in-memory quota/reset previews
+were cleared by the intervening shutdowns; the final logout run used normal
+quotas. Local evidence is recorded in `final-logout-result.json`,
+`final-cleanup-result.json`, and `persistence-final-result.json` under the
+ignored `docs/generated` directory. Generated evidence and authentication
+material are not committed. The final status table supersedes the historical
+pending entries above.
