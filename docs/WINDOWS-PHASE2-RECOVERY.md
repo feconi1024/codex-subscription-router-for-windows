@@ -188,3 +188,19 @@ profile and returning to the task, the sidebar restored the primary identity.
 The application File > Quit action also passed: after shutdown completed,
 there were zero processes under the isolated shell directory and no listeners
 on either test/control port. Abnormal exit and final account logout remain.
+
+### Selector memoization follow-up
+
+The rebuilt redemption flow still left the selector at one while the native
+panel showed zero. The native modal memoizes its heading, so refreshing the
+outer hook did not replace the cached selector element. Reset counts now live
+inside the selector component, which subscribes to successful redemptions and
+ignores obsolete responses and responses after unmount. This also fixes the
+initial count remaining unavailable until the account selection changed.
+Eight JavaScript behavior tests and all 141 Python tests pass. Native
+verification of this additional correction is pending.
+
+The abnormal-exit check passed: terminating only the isolated Electron main
+process caused the launcher, mux, and children to exit automatically. The
+subsequent inventory found zero isolated processes and zero listeners on
+48123/48124. No child process was manually terminated in this check.

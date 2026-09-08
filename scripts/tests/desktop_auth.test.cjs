@@ -112,6 +112,39 @@ test('successful reset redemption refreshes the account selector without retryin
   assert.deepEqual(events, ['codex-mux-reset-updated', 'codex-mux-reset-updated']);
 });
 
+test('cached selector independently loads and refreshes counts, ignoring late responses', async () => {
+  const context = renderer();
+  const listeners = new Map();
+  let effect, cleanup, counts, updates = 0;
+  context.kXc = {
+    useState: initial => [initial, value => { counts = value; updates++; }],
+    useEffect: callback => { effect = callback; },
+  };
+  context.e7 = { jsx: (type, props) => ({type, props}), jsxs: (type, props) => ({type, props}) };
+  context.addEventListener = (name, callback) => listeners.set(name, callback);
+  context.removeEventListener = name => listeners.delete(name);
+  const pending = [];
+  context.request = () => new Promise(resolve => pending.push(resolve));
+  vm.runInContext(menu, context);
+  vm.runInContext('codexMuxRateLimitResets = request; CodexMuxResetAccountSelector({accounts:[{id:"secondary"}],loading:false,selectedId:"secondary",onSelect:()=>{}})', context);
+  cleanup = effect();
+  // The parent never renders again, as with the native memoized heading.
+  const refresh = listeners.get('codex-mux-reset-updated');
+  const redemptionRefresh = refresh();
+  pending[1]({available_count: 0});
+  await redemptionRefresh;
+  assert.equal(counts.secondary, 0);
+  pending[0]({available_count: 1});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(counts.secondary, 0);
+  const afterUnmount = refresh();
+  cleanup();
+  pending[2]({available_count: 9});
+  await afterUnmount;
+  assert.equal(updates, 1);
+  assert.equal(listeners.has('codex-mux-reset-updated'), false);
+});
+
 test('only recognized depletion errors are exposed by the pending-task adapter', () => {
   const context = renderer();
   vm.runInContext(menu, context);

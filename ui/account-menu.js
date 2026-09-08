@@ -314,7 +314,6 @@ function CodexMuxUseResetAccountState() {
   );
   const [accounts, setAccounts] = kXc.useState(cachedAccounts);
   const [selectedId, setSelectedId] = kXc.useState("primary");
-  const [resetCounts, setResetCounts] = kXc.useState({});
   const [loading, setLoading] = kXc.useState(cachedAccounts.length === 0);
 
   const loadAccounts = kXc.useCallback(async () => {
@@ -329,24 +328,11 @@ function CodexMuxUseResetAccountState() {
         : connected[0]?.id || "primary",
     );
     setLoading(false);
-    const entries = await Promise.all(
-      connected.map(async (account) => {
-        try {
-          const resets = await codexMuxRateLimitResets(account.id);
-          return [account.id, Math.max(0, resets.available_count || 0)];
-        } catch {
-          return [account.id, null];
-        }
-      }),
-    );
-    setResetCounts(Object.fromEntries(entries));
   }, []);
 
   kXc.useEffect(() => {
     const refresh = () => loadAccounts().catch(() => setLoading(false));
-    globalThis.addEventListener("codex-mux-reset-updated", refresh);
     refresh();
-    return () => globalThis.removeEventListener("codex-mux-reset-updated", refresh);
   }, [loadAccounts]);
 
   kXc.useEffect(
@@ -370,7 +356,6 @@ function CodexMuxUseResetAccountState() {
     {
       accounts,
       loading,
-      resetCounts,
       selectedId: activeId,
       onSelect: setSelectedId,
     },
@@ -382,9 +367,33 @@ function CodexMuxResetAccountSelector({
   accounts,
   loading,
   onSelect,
-  resetCounts,
   selectedId,
 }) {
+  // The native modal memoizes its heading, including this element. Own the
+  // asynchronous counts here so they can update without a parent rerender.
+  const [resetCounts, setResetCounts] = kXc.useState({});
+  kXc.useEffect(() => {
+    let active = true;
+    let revision = 0;
+    const refresh = async () => {
+      const current = ++revision;
+      const entries = await Promise.all(accounts.map(async (account) => {
+        try {
+          const resets = await codexMuxRateLimitResets(account.id);
+          return [account.id, Math.max(0, resets.available_count || 0)];
+        } catch {
+          return [account.id, null];
+        }
+      }));
+      if (active && current === revision) setResetCounts(Object.fromEntries(entries));
+    };
+    globalThis.addEventListener("codex-mux-reset-updated", refresh);
+    refresh();
+    return () => {
+      active = false;
+      globalThis.removeEventListener("codex-mux-reset-updated", refresh);
+    };
+  }, [accounts]);
   return (0, e7.jsxs)("div", {
     className: "pt-4",
     children: [
