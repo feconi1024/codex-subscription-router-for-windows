@@ -145,6 +145,30 @@ test('cached selector independently loads and refreshes counts, ignoring late re
   assert.equal(listeners.has('codex-mux-reset-updated'), false);
 });
 
+test('secondary logout targets only the selected account and refreshes connected accounts', async () => {
+  const context = renderer();
+  const primary = {id:'primary',label:'Primary',connected:true,enabled:true};
+  const secondary = {id:'secondary',label:'Subscription 2',connected:true,enabled:true};
+  const values = [[primary,secondary],false,false,'',null,false];
+  context.kXc = {useState: () => [values.shift(), () => {}],useEffect: () => {},useCallback: fn => fn};
+  context.e7 = {jsx: (type, props, key) => ({type,props,key}),Fragment:'fragment'};
+  Object.assign(context, {Lo: () => ({}),Q:{},CH:{Separator:'separator'},_H:'menuitem',S2:'icon'});
+  vm.runInContext(menu, context);
+  const calls = [];
+  context.request = async (route, options) => {calls.push({route,method:options?.method});return {accounts:[primary]};};
+  vm.runInContext('codexMuxRequest=request; globalThis.__codexMuxAccountMenuMounted=true;', context);
+  const rows = vm.runInContext('CodexMuxAccountMenu()', context).props.children;
+  const actions = rows.filter(row => row.key?.startsWith('codex-mux-logout-'));
+  assert.equal(actions.length, 1);
+  assert.equal(actions[0].props.children, 'Log out Subscription 2');
+  let prevented = false;
+  await actions[0].props.onSelect({preventDefault:()=>{prevented=true;}});
+  assert.equal(prevented, true);
+  assert.deepEqual(calls, [{route:'/accounts/secondary/logout',method:'POST'},{route:'/accounts',method:undefined}]);
+  assert.equal(context.__codexMuxConnectedAccounts.length, 1);
+  assert.equal(context.__codexMuxConnectedAccounts[0].id, 'primary');
+});
+
 test('only recognized depletion errors are exposed by the pending-task adapter', () => {
   const context = renderer();
   vm.runInContext(menu, context);

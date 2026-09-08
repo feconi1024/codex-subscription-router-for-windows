@@ -204,3 +204,20 @@ The abnormal-exit check passed: terminating only the isolated Electron main
 process caused the launcher, mux, and children to exit automatically. The
 subsequent inventory found zero isolated processes and zero listeners on
 48123/48124. No child process was manually terminated in this check.
+
+The selector correction passed native verification on 2026-09-08: first load
+showed primary zero/secondary one without changing selection; redeeming the
+secondary test credit updated both the selector and native panel to zero.
+The rebuilt host probe passed all nine production gates with two accounts and
+zero renderer errors (`phase2-selector-owned-host.json`). Commit `791d623`
+also passed GitHub CI. Restart preserved both connections, the two visible
+acceptance tasks, and all nine existing ownership entries; the harness added
+one additional ownership record.
+
+Final logout inspection found that the secondary account row had no logout
+action despite backend support. The menu now gives each connected secondary
+subscription an explicitly labeled logout action, refreshes the connected
+account list on success, and displays request failures. A regression verifies
+that only the selected secondary account receives the logout request and the
+primary remains in the connected cache. Native verification and final logout
+of the session-added account are pending this rebuild.

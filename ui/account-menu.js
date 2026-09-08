@@ -699,6 +699,28 @@ function CodexMuxAccountMenu() {
         `codex-mux-account-${account.id}`,
       ),
     );
+    if (account.id !== "primary") {
+      rows.push((0, e7.jsx)(_H, {
+        disabled: busy,
+        onSelect: async (event) => {
+          event.preventDefault();
+          if (busy) return;
+          setBusy(true);
+          setError("");
+          try {
+            await codexMuxRequest(`/accounts/${encodeURIComponent(account.id)}/logout`, {
+              method: "POST",
+            });
+            await refresh();
+          } catch (requestError) {
+            setError(requestError.message);
+          } finally {
+            setBusy(false);
+          }
+        },
+        children: `Log out ${account.label}`,
+      }, `codex-mux-logout-${account.id}`));
+    }
   }
 
   if (login) {
