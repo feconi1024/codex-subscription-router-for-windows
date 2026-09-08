@@ -1,0 +1,2885 @@
+#!/usr/bin/env python3
+"""Platform-independent ASAR and renderer patching helpers."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+try:
+    from .windows import renderer_26_901
+except ImportError:
+    from windows import renderer_26_901
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_VERSION = (PROJECT_ROOT / "VERSION").read_text(encoding="utf-8").strip()
+DEFAULT_STATE_ROOT = Path.home() / ".codex-mux"
+CONTROL_PORT = 48123
+RENDERER_SYNTAX_BLOCKED = "PHASE 2A.5 RENDERER SYNTAX BLOCKED"
+
+
+@dataclass(frozen=True)
+class AnchorAudit:
+    """One semantic renderer hook checked before any renderer mutation."""
+
+    name: str
+    asset: str
+    status: str
+    matched: str | None
+    count: int
+
+
+@dataclass(frozen=True)
+class RendererVariant:
+    """A renderer patch contract selected by several exact build fingerprints."""
+
+    variant_id: str
+    package_name: str | None
+    package_version: str | None
+    app_asar_sha256: str | None
+    fingerprints: tuple[str, ...]
+    values: dict[str, object]
+
+
+def load_or_create_token(state_root: Path | None = None) -> str:
+    """Reuse the existing mux token so rebuilds keep renderer/mux agreement."""
+    root = (state_root or DEFAULT_STATE_ROOT).expanduser()
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        root.chmod(0o700)
+    except OSError:
+        pass
+    token_path = root / "control-token"
+    if token_path.exists():
+        token = token_path.read_text(encoding="utf-8").strip()
+        if re.fullmatch(r"[0-9a-f]{64}", token) is None:
+            raise RuntimeError(f"invalid control token at {token_path}")
+        try:
+            token_path.chmod(0o600)
+        except OSError:
+            pass
+        return token
+    token = secrets.token_hex(32)
+    descriptor = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(token)
+    return token
+
+
+def ensure_asar_tool() -> Path:
+    """Return the repository-pinned ASAR CLI and reject a mismatched install."""
+    asar = PROJECT_ROOT / "node_modules" / ".bin" / "asar"
+    if os.name == "nt":
+        asar = asar.with_suffix(".cmd")
+    package_manifest = PROJECT_ROOT / "node_modules" / "@electron" / "asar" / "package.json"
+    expected = json.loads(
+        (PROJECT_ROOT / "package.json").read_text(encoding="utf-8")
+    )["devDependencies"]["@electron/asar"]
+    if not asar.exists() or not package_manifest.is_file():
+        raise RuntimeError("run `npm ci --ignore-scripts` before patching")
+    actual = json.loads(package_manifest.read_text(encoding="utf-8")).get("version")
+    if actual != expected:
+        raise RuntimeError(
+            f"installed @electron/asar is {actual!r}, expected {expected!r}; "
+            "run `npm ci --ignore-scripts`"
+        )
+    return asar
+
+
+def replace_javascript_identifiers(source: str, replacements: dict[str, str]) -> str:
+    """Retarget injected source to exact minified imports in a known build."""
+    for original, replacement in replacements.items():
+        pattern = rf"(?<![A-Za-z0-9_$]){re.escape(original)}(?![A-Za-z0-9_$])"
+        source, count = re.subn(pattern, replacement, source)
+        if count == 0:
+            raise RuntimeError(
+                f"could not retarget injected JavaScript identifier {original!r}"
+            )
+    return source
+
+
+def _variant(
+    text: str,
+    name: str,
+    asset: str,
+    current: str,
+    renamed: str | None = None,
+    semantic: str | None = None,
+) -> AnchorAudit:
+    current_count = text.count(current)
+    if current_count == 1:
+        return AnchorAudit(name, asset, "UNCHANGED", "current", current_count)
+    if current_count > 1:
+        return AnchorAudit(name, asset, "AMBIGUOUS", "current", current_count)
+    if renamed is not None:
+        renamed_count = text.count(renamed)
+        if renamed_count == 1:
+            return AnchorAudit(name, asset, "RENAMED", "renamed", renamed_count)
+        if renamed_count > 1:
+            return AnchorAudit(name, asset, "AMBIGUOUS", "renamed", renamed_count)
+    if semantic is not None:
+        semantic_count = text.count(semantic)
+        if semantic_count == 1:
+            return AnchorAudit(name, asset, "SEMANTICALLY_CHANGED", "semantic", semantic_count)
+        if semantic_count > 1:
+            return AnchorAudit(name, asset, "AMBIGUOUS", "semantic", semantic_count)
+    return AnchorAudit(name, asset, "MISSING", None, 0)
+
+
+def _asset_with_anchor(
+    assets: list[Path],
+    name: str,
+    glob_label: str,
+    anchor: str,
+) -> tuple[Path | None, AnchorAudit]:
+    matches = [(path, path.read_text(encoding="utf-8").count(anchor)) for path in assets]
+    matching = [(path, count) for path, count in matches if count]
+    if len(matching) == 1 and matching[0][1] == 1:
+        return matching[0][0], AnchorAudit(name, glob_label, "UNCHANGED", str(matching[0][0].name), 1)
+    if len(matching) > 1 or any(count > 1 for _, count in matching):
+        return None, AnchorAudit(name, glob_label, "AMBIGUOUS", None, sum(count for _, count in matching))
+    return None, AnchorAudit(name, glob_label, "MISSING", None, 0)
+
+
+def _require_unique(text: str, anchor: str, message: str) -> None:
+    count = text.count(anchor)
+    if count != 1:
+        raise RuntimeError(f"{message} (anchor count: {count})")
+
+
+def _require_usage_value_anchor(bundle: str, values: dict[str, object]) -> str:
+    """Require a usage-menu anchor outside the native destructuring binding."""
+
+    usage_anchor = str(values["usage_slot"])
+    component_anchor = str(values["component_anchor"])
+    if usage_anchor in component_anchor:
+        raise RuntimeError(
+            "renderer usage menu slot resolves to the native destructuring binding; "
+            "a value-site anchor is required"
+        )
+    _require_unique(bundle, usage_anchor, "could not find the native ChatGPT usage menu value slot")
+    return usage_anchor
+
+
+def _require_asset(assets: list[Path], anchor: str, message: str) -> Path:
+    matching = [path for path in assets if path.read_text(encoding="utf-8").count(anchor) == 1]
+    if len(matching) != 1:
+        raise RuntimeError(f"{message} (matching assets: {len(matching)})")
+    return matching[0]
+
+
+def _build_6662(bundle: str) -> bool:
+    return "function Icl(e){let t=(0,Vcl.c)(248)," in bundle
+
+
+def _legacy_renderer_variant_values(bundle: str) -> dict[str, object]:
+    build_6662 = _build_6662(bundle)
+    if build_6662:
+        return {
+            "build_6662": True,
+            "component_anchor": "function Icl(e){let t=(0,Vcl.c)(248),",
+            "rpc_wrapper": "J9",
+            "status_rpc_wrapper": "q9",
+            "app_server_anchor": (
+                "function Bp(e,t,n){return n==null?N8e.sendRequest(e,t):"
+                "N8e.sendRequest(e,t,n)}"
+            ),
+            "app_server_replacement": (
+                "function Bp(e,t,n){let r=codexMuxScopePluginRequest(e,t);"
+                "return n==null?N8e.sendRequest(e,r):N8e.sendRequest(e,r,n)}"
+            ),
+            "profile_query": "let e=await c_.safeGet(`/wham/profiles/me`)",
+            "usage_modal": "function E$s(e){",
+            "reset_query": (
+                "function Ooi(){let e=(0,SI.c)(1),t;return "
+                "e[0]===Symbol.for(`react.memo_cache_sentinel`)?"
+                "(t={queryKey:[`rate-limit-reset-credits`],queryFn:koi,"
+                "refetchInterval:Wp.ONE_MINUTE,staleTime:Wp.FIVE_SECONDS},e[0]=t):"
+                "t=e[0],It(t)}"
+            ),
+            "reset_mutation": (
+                "function Aoi(){let e=(0,SI.c)(3),t=ct(),n=Uw(),r;return "
+                "e[0]!==n||e[1]!==t?(r={mutationFn:joi,onSuccess:(e,r)=>{"
+                "let{creditId:i}=r,a=e.code;if(a===`reset`||a===`already_redeemed`){"
+                "let n=e.code===`reset`?e.credit?.id??i:i;"
+                "t.setQueryData([`rate-limit-reset-credits`],e=>eoi(e,a,n))}"
+                "Promise.all([n([`rate-limit-status`]),n([`rate-limit-reset-credits`])])}},"
+                "e[0]=n,e[1]=t,e[2]=r):r=e[2],Qt(r)}"
+            ),
+            "usage_header": (
+                "let _e;t[46]===he?_e=t[47]:"
+                "(_e=(0,I0.jsxs)(WL,{children:[he,ge]}),t[46]=he,t[47]=_e);"
+            ),
+            "usage_header_replacement": (
+                "let _e=(0,I0.jsxs)(WL,{children:[he,ge,"
+                "window.__codexMuxResetAccountSelector??null]});"
+            ),
+            "usage_slot": "usageItems:Ct",
+            "usage_slot_replacement": (
+                "usageItems:(globalThis.__codexMuxAccountMenuInjected=true,"
+                "(0,$5.jsx)(CodexMuxAccountMenu,{}))"
+            ),
+            "open_change": (
+                "triggerButton:Dt,onOpenChange:l,children:P",
+                "open:s,onOpenChange:l,contentWidth:`panel`,triggerButton:Dt",
+            ),
+            "open_name": "l",
+            "profile_avatar": (
+                "avatar:(0,$.jsxs)($.Fragment,{children:["
+                "(0,$.jsxs)(`label`,{\"aria-disabled\":z.isPending,"
+                "className:Le(`group relative flex size-20 rounded-full outline-none "
+                "focus-within:ring-1 focus-within:ring-ring`,"
+            ),
+            "profile_avatar_replacement": (
+                "avatar:(0,$.jsxs)($.Fragment,{children:["
+                "globalThis.CodexMuxProfileAvatarStack?.({onSelect:()=>M.refetch()})??null,"
+                "(0,$.jsxs)(`label`,{\"aria-disabled\":z.isPending,"
+                "className:Le(globalThis.CodexMuxProfileAvatarStack?`hidden`:"
+                "`group relative flex size-20 rounded-full outline-none "
+                "focus-within:ring-1 focus-within:ring-ring`,"
+            ),
+            "profile_name": (
+                "displayName:Ze??(0,$.jsx)(o,{id:`profile.nameFallback`,"
+                "defaultMessage:`ChatGPT user`,description:`Fallback profile display name`})"
+            ),
+            "profile_name_replacement": (
+                "displayName:globalThis.__codexMuxSelectedProfileAccountId?"
+                "(Ze??(0,$.jsx)(o,{id:`profile.nameFallback`,"
+                "defaultMessage:`ChatGPT user`,"
+                "description:`Fallback profile display name`})):null"
+            ),
+            "profile_identity": (
+                "username:Ke==null?null:(0,$.jsx)(o,{id:`profile.usernameValue`,"
+                "defaultMessage:`@{username}`,"
+                "description:`Profile username shown with an at-sign prefix`,"
+                "values:{username:Ke}})"
+            ),
+            "profile_identity_replacement": (
+                "username:globalThis.__codexMuxSelectedProfileAccountId&&Ke!=null?"
+                "(0,$.jsx)(o,{id:`profile.usernameValue`,"
+                "defaultMessage:`@{username}`,"
+                "description:`Profile username shown with an at-sign prefix`,"
+                "values:{username:Ke}}):null"
+            ),
+            "plugin_anchor": "ee=(0,tc.jsxs)(tc.Fragment,{children:[H,U]})",
+            "plugin_replacement": (
+                "ee=(0,tc.jsxs)(tc.Fragment,{children:[globalThis.CodexMuxPluginScope?.()??null,H,U]})"
+            ),
+            "plugin_glob": "plugins-page-*.js",
+            "thread_anchor": "function bE(){let e=(0,SE.c)(1)",
+            "thread_component_replacements": {"$n": "jf", "sr": "Pa", "TE": "jy", "zE": "CE", "K": "q"},
+            "summary_component": "CE",
+        }
+    return {
+        "build_6662": False,
+        "component_anchor": "function wXc({sidebarFooter:e,triggerButton:t})",
+        "rpc_wrapper": "q9",
+        "status_rpc_wrapper": "K9",
+        "app_server_anchor": (
+            "function gm(e,t,n){return n==null?h6e.sendRequest(e,t):"
+            "h6e.sendRequest(e,t,n)}"
+        ),
+        "app_server_replacement": (
+            "function gm(e,t,n){let r=codexMuxScopePluginRequest(e,t);"
+            "return n==null?h6e.sendRequest(e,r):h6e.sendRequest(e,r,n)}"
+        ),
+        "profile_query": "let e=await T_.safeGet(`/wham/profiles/me`)",
+        "usage_modal": "function QLs(e){",
+        "reset_query": (
+            "function l6r(){let e=(0,$F.c)(1),t;return "
+            "e[0]===Symbol.for(`react.memo_cache_sentinel`)?"
+            "(t={queryKey:[`rate-limit-reset-credits`],queryFn:u6r,"
+            "refetchInterval:vm.ONE_MINUTE,staleTime:vm.FIVE_SECONDS},e[0]=t):"
+            "t=e[0],Lt(t)}"
+        ),
+        "reset_mutation": (
+            "function d6r(){let e=(0,$F.c)(3),t=lt(),n=zO(),r;return "
+            "e[0]!==n||e[1]!==t?(r={mutationFn:f6r,onSuccess:(e,r)=>{"
+            "let{creditId:i}=r,a=e.code;if(a===`reset`||a===`already_redeemed`){"
+            "let n=e.code===`reset`?e.credit?.id??i:i;"
+            "t.setQueryData([`rate-limit-reset-credits`],e=>F3r(e,a,n))}"
+            "Promise.all([n([`rate-limit-status`]),n([`rate-limit-reset-credits`])])}},"
+            "e[0]=n,e[1]=t,e[2]=r):r=e[2],$t(r)}"
+        ),
+        "usage_header": (
+            "let ve;t[46]===ge?ve=t[47]:"
+            "(ve=(0,k2.jsxs)(LL,{children:[ge,_e]}),t[46]=ge,t[47]=ve);"
+        ),
+        "usage_header_replacement": (
+            "let ve=(0,k2.jsxs)(LL,{children:[ge,_e,"
+            "window.__codexMuxResetAccountSelector??null]});"
+        ),
+        "usage_slot": "usageItems:Ge",
+        "usage_slot_replacement": (
+            "usageItems:(globalThis.__codexMuxAccountMenuInjected=true,"
+            "(0,e7.jsx)(CodexMuxAccountMenu,{}))"
+        ),
+        "open_change": (
+            "triggerButton:Ke,onOpenChange:o,children:(0,e7.jsx)(bXc",
+            "return(0,e7.jsx)(vH,{open:a,onOpenChange:o,contentWidth:`panel`",
+        ),
+        "open_name": "o",
+        "profile_avatar": (
+            "children:[(0,$.jsxs)(`div`,{className:`relative mb-4 size-20`,children:["
+        ),
+        "profile_avatar_replacement": (
+            "children:[globalThis.CodexMuxProfileAvatarStack?.({onSelect:()=>A.refetch()})??null,"
+            "(0,$.jsxs)(`div`,{className:globalThis.CodexMuxProfileAvatarStack?"
+            "`hidden`:`relative mb-4 size-20`,children:["
+        ),
+        "profile_name": "className:`flex w-full justify-center`",
+        "profile_name_replacement": (
+            "className:globalThis.__codexMuxSelectedProfileAccountId&&!A.isFetching?"
+            "`flex w-full justify-center`:`hidden`"
+        ),
+        "profile_identity": (
+            "className:`mt-1 flex min-h-7 items-center gap-1.5 text-base leading-5 "
+            "font-normal text-token-text-tertiary`"
+        ),
+        "profile_identity_replacement": (
+            "className:globalThis.__codexMuxSelectedProfileAccountId&&!A.isFetching?"
+            "`mt-1 flex min-h-7 items-center gap-1.5 text-base leading-5 font-normal "
+            "text-token-text-tertiary`:`hidden`"
+        ),
+        "plugin_anchor": "action:F,children:w})",
+        "plugin_replacement": "action:F,children:[globalThis.CodexMuxPluginScope?.()??null,w]})",
+        "plugin_glob": "plugins-settings-*.js",
+        "thread_anchor": "function bE(){let e=(0,wE.c)(57)",
+        "thread_component_replacements": {},
+        "summary_component": "zE",
+    }
+
+
+WINDOWS_26_820_PACKAGE_NAME = "OpenAI.Codex"
+WINDOWS_26_820_PACKAGE_VERSION = "26.820.7780.0"
+WINDOWS_26_820_ASAR_SHA256 = "5df8bf5a9d30742919390ab11fa419e83aab0891152569a42c6ea4abf15386c2"
+
+
+def _windows_26_820_renderer_values() -> dict[str, object]:
+    """Return the exact renderer contract for the acquired Windows build."""
+    component_anchor = (
+        "function Jyl(e){let t=(0,Yyl.c)(33),{accountIcon:n,accountLabel:r,"
+        "additionalItems:i,displayName:a,identityItems:o,isPetVisible:s,"
+        "onCopyUserId:c,onLogOut:l,onOpenProfile:u,onOpenSettings:d,"
+        "onOpenWorkspaceSettings:f,onTogglePet:p,settingsShortcut:m,"
+        "usageItems:h,workspaceSettingsRightIcon:g}=e"
+    )
+    app_server_anchor = (
+        "function qg(e,t){let n=e.get(Jg);if(n==null)throw Error("
+        "`AppServerManager RPC is not connected`);return n.forHost(t)}"
+    )
+    usage_header = (
+        "children:(0,d1.jsx)(Z,{id:`codex.rateLimitResetPromptModal.usageTrackingHeading`,"
+        "defaultMessage:`Usage`,description:`Heading for the Codex usage limit modal`})"
+    )
+    reset_query = (
+        "function WAa(){let e=(0,uH.c)(1),t;return e[0]===Symbol.for(`react.memo_cache_sentinel`)?"
+        "(t={queryKey:[`rate-limit-reset-credits`],queryFn:GAa,"
+        "refetchInterval:nm.ONE_MINUTE,staleTime:nm.FIVE_SECONDS},e[0]=t):"
+        "t=e[0],Lt(t)}"
+    )
+    reset_mutation = (
+        "function KAa(){let e=(0,uH.c)(3),t=lt(),n=AS(),r;return "
+        "e[0]!==n||e[1]!==t?(r={mutationFn:qAa,onSuccess:(e,r)=>{"
+        "let{creditId:i}=r,a=e.code;if(a===`reset`||a===`already_redeemed`){"
+        "let n=e.code===`reset`?e.credit?.id??i:i;"
+        "t.setQueryData([`rate-limit-reset-credits`],e=>gAa(e,a,n))}"
+        "Promise.all([n([`rate-limit-status`]),n([`rate-limit-reset-credits`])])}},"
+        "e[0]=n,e[1]=t,e[2]=r):r=e[2],$t(r)}"
+    )
+    plugin_mappings = (
+        {
+            "name": "list-installed-apps RPC mapping",
+            "current": "qg(e,n).sendRequest(`app/installed`,t?{forceRefresh:!0}:{})",
+            "replacement": (
+                "qg(e,n).sendRequest(`app/installed`,"
+                'codexMuxScopePluginRequest("list-installed-apps",t?{forceRefresh:!0}:{}))'
+            ),
+        },
+        {
+            "name": "read-apps RPC mapping",
+            "current": "qg(e,n).sendRequest(`app/read`,{appIds:t})",
+            "replacement": (
+                "qg(e,n).sendRequest(`app/read`,"
+                'codexMuxScopePluginRequest("read-apps",{appIds:t}))'
+            ),
+        },
+        {
+            "name": "list-apps RPC mapping",
+            "current": (
+                "qg(e,n).sendRequest(`app/list`,{cursor:i,limit:E9r,"
+                "forceRefetch:t},{trace:a})"
+            ),
+            "replacement": (
+                "qg(e,n).sendRequest(`app/list`,"
+                'codexMuxScopePluginRequest("list-apps",{cursor:i,limit:E9r,forceRefetch:t}),'
+                "{trace:a})"
+            ),
+        },
+        {
+            "name": "login-mcp-server RPC mapping",
+            "current": "t.sendRequest(`mcpServer/oauth/login`,e)",
+            "replacement": (
+                't.sendRequest(`mcpServer/oauth/login`,'
+                'codexMuxScopePluginRequest("login-mcp-server",e))'
+            ),
+        },
+        {
+            "name": "list-mcp-server-status RPC mapping",
+            "current": (
+                "qg(e,t).listMcpServers({cursor:i,detail:n,limit:100},"
+                "r===void 0?void 0:{trace:r})"
+            ),
+            "replacement": (
+                "qg(e,t).listMcpServers("
+                'codexMuxScopePluginRequest("list-mcp-server-status",{cursor:i,detail:n,limit:100}),'
+                "r===void 0?void 0:{trace:r})"
+            ),
+        },
+        {
+            "name": "listMcpServers RPC wrapper",
+            "current": (
+                "listMcpServers(e,t){let n=JSON.stringify({options:t,params:e}),"
+                "r=this.mcpServerStatusPromises.get(n);if(r)return r;"
+                "let i=this.sendRequest(`mcpServerStatus/list`,e,t);"
+            ),
+            "replacement": (
+                "listMcpServers(e,t){let n=JSON.stringify({options:t,params:e}),"
+                "r=this.mcpServerStatusPromises.get(n);if(r)return r;"
+                "let i=this.sendRequest(`mcpServerStatus/list`,e,t);"
+            ),
+        },
+        {
+            "name": "mcpServerStatus/list RPC call",
+            "current": "this.sendRequest(`mcpServerStatus/list`,e,t)",
+            "replacement": "this.sendRequest(`mcpServerStatus/list`,e,t)",
+        },
+    )
+    return {
+        "variant_id": "windows-26.820",
+        "build_6662": False,
+        "component_anchor": component_anchor,
+        "component_replacements": {
+            "e7": "p8",
+            "kXc": "ibl",
+            "Lo": "ds",
+            "BW": "Tz",
+            "QLs": "g6s",
+            "_H": "UI",
+            "S2": "DP",
+            "CH": "YI",
+            "jLa": "aza",
+        },
+        "rpc_wrapper": "",
+        "status_rpc_wrapper": "",
+        "app_server_anchor": app_server_anchor,
+        "app_server_replacement": app_server_anchor,
+        "profile_query": "let e=await Ob.safeGet(`/wham/profiles/me`)",
+        "usage_modal": "function c6s(e){",
+        "reset_query": reset_query,
+        "reset_mutation": reset_mutation,
+        "usage_header": usage_header,
+        "usage_header_replacement": (
+            "children:(0,d1.jsxs)(d1.Fragment,{children:["
+            + usage_header[len("children:") :]
+            + ",globalThis.__codexMuxResetAccountSelector??null]})"
+        ),
+        "usage_slot": "usageItems:wt",
+        "usage_slot_replacement": (
+            "usageItems:(globalThis.__codexMuxAccountMenuInjected=true,"
+            "(0,p8.jsx)(CodexMuxAccountMenu,{}))"
+        ),
+        "open_change": (
+            "open:s,side:`top`,sideOffset:6,triggerButton:Ot,onOpenChange:l,children:N",
+        ),
+        "open_name": "l",
+        "open_preserved": "open:s,onOpenChange:l,contentWidth:`panel`,triggerButton:Ot",
+        "profile_avatar": (
+            "avatar:(0,$.jsxs)($.Fragment,{children:[(0,$.jsxs)(`label`,"
+            '{"aria-disabled":I.isPending,className:$t(`group relative flex size-20 '
+            "rounded-full outline-none focus-within:ring-1 focus-within:ring-ring`,"
+        ),
+        "profile_avatar_replacement": (
+            "avatar:(0,$.jsxs)($.Fragment,{children:["
+            "globalThis.CodexMuxProfileAvatarStack?.({onSelect:()=>j.refetch()})??null,"
+            "(0,$.jsxs)(`label`,{\"aria-disabled\":I.isPending,"
+            "className:$t(globalThis.CodexMuxProfileAvatarStack?`hidden`:"
+            "`group relative flex size-20 rounded-full outline-none "
+            "focus-within:ring-1 focus-within:ring-ring`,"
+        ),
+        "profile_name": (
+            "displayName:Ye??(0,$.jsx)(J,{id:`profile.nameFallback`,"
+            "defaultMessage:`ChatGPT user`,description:`Fallback profile display name`})"
+        ),
+        "profile_name_replacement": (
+            "displayName:globalThis.__codexMuxSelectedProfileAccountId?"
+            "Ye??(0,$.jsx)(J,{id:`profile.nameFallback`,"
+            "defaultMessage:`ChatGPT user`,description:`Fallback profile display name`}):null"
+        ),
+        "profile_identity": (
+            "username:qe==null?null:(0,$.jsx)(J,{id:`profile.usernameValue`,"
+            "defaultMessage:`@{username}`,description:`Profile username shown with an at-sign prefix`,"
+            "values:{username:qe}})"
+        ),
+        "profile_identity_replacement": (
+            "username:globalThis.__codexMuxSelectedProfileAccountId&&qe!=null?"
+            "(0,$.jsx)(J,{id:`profile.usernameValue`,"
+            "defaultMessage:`@{username}`,description:`Profile username shown with an at-sign prefix`,"
+            "values:{username:qe}}):null"
+        ),
+        "plugin_anchor": "contentAfterConnected:(0,$.jsxs)($.Fragment,{children:[",
+        "plugin_replacement": (
+            "contentAfterConnected:(0,$.jsxs)($.Fragment,{children:["
+            "globalThis.CodexMuxPluginScope?.()??null,"
+        ),
+        "plugin_glob": "plugins-page-*.js",
+        "thread_anchor": "function $T(){let e=(0,rE.c)(58),",
+        "thread_summary_anchor": (
+            "(0,aE.jsx)(W.Section,{sectionKey:`tool-sources`,after:z,title:B,"
+            "titleSuffix:V,children:H})"
+        ),
+        "thread_component_replacements": {},
+        "thread_route": "null",
+        "thread_react": "iE",
+        "thread_jsx": "aE",
+        "thread_section": "W",
+        "summary_component": "aE",
+        "plugin_mappings": plugin_mappings,
+    }
+
+
+WINDOWS_26_825_PACKAGE_NAME = "OpenAI.Codex"
+WINDOWS_26_825_PACKAGE_VERSION = "26.825.5331.0"
+WINDOWS_26_825_ASAR_SHA256 = "178b65229452b17b0203ab41d5ceafedccd770c9bd42d239a6d048d27d80252b"
+
+
+def _windows_26_825_renderer_values() -> dict[str, object]:
+    """Return the separately reviewed renderer contract for Windows 26.825."""
+
+    component_anchor = (
+        "function ZCc(e){let t=(0,QCc.c)(33),{accountIcon:n,accountLabel:r,"
+        "additionalItems:i,displayName:a,identityItems:o,isPetVisible:s,"
+        "onCopyUserId:c,onLogOut:l,onOpenProfile:u,onOpenSettings:d,"
+        "onOpenWorkspaceSettings:f,onTogglePet:p,settingsShortcut:m,"
+        "usageItems:h,workspaceSettingsRightIcon:g}=e"
+    )
+    app_server_anchor = (
+        "function Pb(e,t){let n=e.get(Fb);if(n==null)throw Error("
+        "`AppServerManager RPC is not connected`);return n.forHost(t)}"
+    )
+    reset_query = (
+        "function idi(){let e=(0,fR.c)(1),t;return "
+        "e[0]===Symbol.for(`react.memo_cache_sentinel`)?"
+        "(t={queryKey:[`rate-limit-reset-credits`],queryFn:adi,"
+        "refetchInterval:bx.ONE_MINUTE,staleTime:bx.FIVE_SECONDS},"
+        "e[0]=t):t=e[0],Tx(t)}"
+    )
+    reset_query_replacement = (
+        "function idi(){let e=window.__codexMuxResetAccountId;return "
+        "Tx({queryKey:[`rate-limit-reset-credits`,e??`primary`],"
+        "queryFn:e?()=>codexMuxRateLimitResets(e):adi,"
+        "refetchInterval:bx.ONE_MINUTE,staleTime:bx.FIVE_SECONDS})}"
+    )
+    reset_mutation = (
+        "function odi(){let e=(0,fR.c)(3),t=Sx(),n=bD(),r;return "
+        "e[0]!==n||e[1]!==t?(r={mutationFn:sdi,onSuccess:(e,r)=>{"
+        "let{creditId:i}=r,a=e.code;if(a===`reset`||a===`already_redeemed`){"
+        "let n=e.code===`reset`?e.credit?.id??i:i;"
+        "t.setQueryData([`rate-limit-reset-credits`],e=>Aui(e,a,n))}"
+        "Promise.all([n([`rate-limit-status`]),"
+        "n([`rate-limit-reset-credits`])])}},e[0]=n,e[1]=t,e[2]=r):"
+        "r=e[2],Dx(r)}"
+    )
+    reset_mutation_replacement = (
+        "function odi(){let e=Sx(),t=bD(),n=window.__codexMuxResetAccountId,"
+        "r=[`rate-limit-reset-credits`,n??`primary`];return Dx({"
+        "mutationFn:n?i=>codexMuxConsumeRateLimitReset(n,i):sdi,"
+        "onSuccess:(a,o)=>{let{creditId:i}=o,c=a.code;"
+        "if(c===`reset`||c===`already_redeemed`){let n=c===`reset`?"
+        "a.credit?.id??i:i;e.setQueryData(r,e=>Aui(e,c,n))}"
+        "Promise.all([t([`rate-limit-status`]),t(r)])}})}"
+    )
+    usage_header = (
+        "_e=(0,SQ.jsx)(SR,{title:(0,SQ.jsx)(Iz,{asChild:!0,"
+        "children:(0,SQ.jsx)(`h2`,{className:`m-0`,children:(0,SQ.jsx)(J,{"
+        "id:`codex.rateLimitResetPromptModal.usageTrackingHeading`,"
+        "defaultMessage:`Usage`,description:`Heading for the Codex usage limit modal`"
+        "})})})}),"
+    )
+    usage_header_replacement = (
+        "_e=(0,SQ.jsxs)(SQ.Fragment,{children:["
+        "(0,SQ.jsx)(SR,{title:(0,SQ.jsx)(Iz,{asChild:!0,"
+        "children:(0,SQ.jsx)(`h2`,{className:`m-0`,children:(0,SQ.jsx)(J,{"
+        "id:`codex.rateLimitResetPromptModal.usageTrackingHeading`,"
+        "defaultMessage:`Usage`,description:`Heading for the Codex usage limit modal`"
+        "})})})}),globalThis.__codexMuxResetAccountSelector??null]}),"
+    )
+    plugin_mappings = (
+        {
+            "name": "list-installed-apps RPC mapping",
+            "current": "Pb(e,n).sendRequest(`app/installed`,t?{forceRefresh:!0}:{})",
+            "replacement": (
+                "Pb(e,n).sendRequest(`app/installed`,"
+                'codexMuxScopePluginRequest("list-installed-apps",t?{forceRefresh:!0}:{}))'
+            ),
+        },
+        {
+            "name": "read-apps RPC mapping",
+            "current": "Pb(e,n).sendRequest(`app/read`,{appIds:t})",
+            "replacement": (
+                "Pb(e,n).sendRequest(`app/read`,"
+                'codexMuxScopePluginRequest("read-apps",{appIds:t}))'
+            ),
+        },
+        {
+            "name": "list-apps RPC mapping",
+            "current": (
+                "Pb(e,n).sendRequest(`app/list`,{cursor:i,limit:tsr,"
+                "forceRefetch:t},{trace:a})"
+            ),
+            "replacement": (
+                "Pb(e,n).sendRequest(`app/list`,"
+                'codexMuxScopePluginRequest("list-apps",{cursor:i,limit:tsr,forceRefetch:t}),'
+                "{trace:a})"
+            ),
+        },
+        {
+            "name": "login-mcp-server RPC mapping",
+            "current": "t.sendRequest(`mcpServer/oauth/login`,e)",
+            "replacement": (
+                't.sendRequest(`mcpServer/oauth/login`,'
+                'codexMuxScopePluginRequest("login-mcp-server",e))'
+            ),
+        },
+        {
+            "name": "list-mcp-server-status RPC mapping",
+            "current": (
+                "Pb(e,t).listMcpServers({cursor:i,detail:n,limit:100},"
+                "r===void 0?void 0:{trace:r})"
+            ),
+            "replacement": (
+                "Pb(e,t).listMcpServers("
+                'codexMuxScopePluginRequest("list-mcp-server-status",{cursor:i,detail:n,limit:100}),'
+                "r===void 0?void 0:{trace:r})"
+            ),
+        },
+        {
+            "name": "listMcpServers RPC wrapper",
+            "current": (
+                "listMcpServers(e,t){let n=JSON.stringify({options:t,params:e}),"
+                "r=this.mcpServerStatusPromises.get(n);if(r)return r;"
+                "let i=this.sendRequest(`mcpServerStatus/list`,e,t);"
+            ),
+            "replacement": (
+                "listMcpServers(e,t){let n=JSON.stringify({options:t,params:e}),"
+                "r=this.mcpServerStatusPromises.get(n);if(r)return r;"
+                "let i=this.sendRequest(`mcpServerStatus/list`,e,t);"
+            ),
+        },
+        {
+            "name": "mcpServerStatus/list RPC call",
+            "current": "this.sendRequest(`mcpServerStatus/list`,e,t)",
+            "replacement": "this.sendRequest(`mcpServerStatus/list`,e,t)",
+        },
+    )
+    return {
+        "variant_id": "windows-26.825",
+        "build_6662": False,
+        "component_anchor": component_anchor,
+        "component_replacements": {
+            "e7": "l8",
+            "kXc": "swc",
+            "Lo": "A_",
+            "BW": "ZL",
+            "QLs": "GCo",
+            "_H": "cz",
+            "S2": "vF",
+            "CH": "mz",
+            "jLa": "KLo",
+        },
+        "rpc_wrapper": "",
+        "status_rpc_wrapper": "",
+        "app_server_anchor": app_server_anchor,
+        "app_server_replacement": app_server_anchor,
+        "profile_query": "async function Mbc(){let e=await dS.safeGet(`/wham/profiles/me`)",
+        "profile_query_replacement": (
+            "async function Mbc(){let e=await "
+            "codexMuxProfileData(globalThis.__codexMuxSelectedProfileAccountId??null)"
+        ),
+        "usage_modal": "function GCo(e){let t=(0,KCo.c)(20),{defaultResetCreditsOpen:n,initialAvailableCount:r,isRateLimitReached:i,onClose:a,onResetComplete:o}=e",
+        "reset_query": reset_query,
+        "reset_query_replacement": reset_query_replacement,
+        "reset_mutation": reset_mutation,
+        "reset_mutation_replacement": reset_mutation_replacement,
+        "usage_header": usage_header,
+        "usage_header_replacement": usage_header_replacement,
+        # ``usageItems:h`` belongs to ZCc's object-destructuring binding. The
+        # native profile-menu call later passes its computed value as ``wt``;
+        # patch that value site so the binding remains valid JavaScript.
+        "usage_slot": "usageItems:wt",
+        "usage_slot_replacement": (
+            "usageItems:(globalThis.__codexMuxAccountMenuInjected=true,"
+            "(0,l8.jsx)(CodexMuxAccountMenu,{}))"
+        ),
+        "open_change": (
+            "open:s,side:`top`,sideOffset:6,triggerButton:Ot,onOpenChange:c,children:[N,null]",
+        ),
+        "open_name": "c",
+        "open_preserved": "open:s,onOpenChange:c,contentWidth:`panel`,triggerButton:Ot",
+        "profile_avatar": (
+            "avatar:(0,$.jsxs)($.Fragment,{children:[(0,$.jsxs)(`label`,"
+            '{"aria-disabled":B.isPending,className:Wt(`group relative flex size-20 '
+            "rounded-full outline-none focus-within:ring-1 focus-within:ring-ring`,"
+        ),
+        "profile_avatar_replacement": (
+            "avatar:(0,$.jsxs)($.Fragment,{children:["
+            "globalThis.CodexMuxProfileAvatarStack?.({onSelect:()=>I.refetch()})??null,"
+            "(0,$.jsxs)(`label`,{\"aria-disabled\":B.isPending,"
+            "className:Wt(globalThis.CodexMuxProfileAvatarStack?`hidden`:"
+            "`group relative flex size-20 rounded-full outline-none "
+            "focus-within:ring-1 focus-within:ring-ring`,"
+        ),
+        "profile_name": (
+            "displayName:ze??(0,$.jsx)(q,{id:`profile.nameFallback`,"
+            "defaultMessage:`ChatGPT user`,description:`Fallback profile display name`})"
+        ),
+        "profile_name_replacement": (
+            "displayName:globalThis.__codexMuxSelectedProfileAccountId?"
+            "ze??(0,$.jsx)(q,{id:`profile.nameFallback`,"
+            "defaultMessage:`ChatGPT user`,description:`Fallback profile display name`}):null"
+        ),
+        "profile_identity": (
+            "username:Re==null?null:(0,$.jsx)(q,{id:`profile.usernameValue`,"
+            "defaultMessage:`@{username}`,description:`Profile username shown with an at-sign prefix`,"
+            "values:{username:Re}})"
+        ),
+        "profile_identity_replacement": (
+            "username:globalThis.__codexMuxSelectedProfileAccountId&&Re!=null?"
+            "(0,$.jsx)(q,{id:`profile.usernameValue`,"
+            "defaultMessage:`@{username}`,description:`Profile username shown with an at-sign prefix`,"
+            "values:{username:Re}}):null"
+        ),
+        "plugin_anchor": "contentAfterConnected:(0,$.jsxs)($.Fragment,{children:[",
+        "plugin_replacement": (
+            "contentAfterConnected:(0,$.jsxs)($.Fragment,{children:["
+            "globalThis.CodexMuxPluginScope?.()??null,"
+        ),
+        "plugin_glob": "plugins-page-*.js",
+        "thread_anchor": "function WT(e){let t=(0,JT.c)(58),",
+        "thread_summary_anchor": (
+            "(0,XT.jsx)(X.Section,{sectionKey:`tool-sources`,after:V,title:H,"
+            "titleSuffix:U,children:W})"
+        ),
+        "thread_component_replacements": {},
+        "thread_route": "xt(wa)",
+        "thread_react": "YT",
+        "thread_jsx": "XT",
+        "thread_section": "X",
+        "summary_component": "XT",
+        "thread_conversation_id": "c",
+        "plugin_mappings": plugin_mappings,
+    }
+
+
+def _windows_26_825_6671_renderer_values() -> dict[str, object]:
+    """Return the 26.825 semantic contract bound to the 26.825.6671 bundle.
+
+    The installed 26.825.6671 build keeps the reviewed behavior but its
+    minifier renamed several functions, imports, and the thread-summary
+    section component.  This is a source binding, not a second semantic
+    contract: the exact reviewed-source registry selects ``windows-26.825``
+    and this binding supplies the independently audited byte-level hooks.
+    """
+
+    values = _windows_26_825_renderer_values()
+    plugin_mappings = (
+        {
+            "name": "list-installed-apps RPC mapping",
+            "current": "Cb(e,n).sendRequest(`app/installed`,t?{forceRefresh:!0}:{})",
+            "replacement": (
+                "Cb(e,n).sendRequest(`app/installed`,"
+                'codexMuxScopePluginRequest("list-installed-apps",t?{forceRefresh:!0}:{}))'
+            ),
+        },
+        {
+            "name": "read-apps RPC mapping",
+            "current": "Cb(e,n).sendRequest(`app/read`,{appIds:t})",
+            "replacement": (
+                "Cb(e,n).sendRequest(`app/read`,"
+                'codexMuxScopePluginRequest("read-apps",{appIds:t}))'
+            ),
+        },
+        {
+            "name": "list-apps RPC mapping",
+            "current": (
+                "Cb(e,n).sendRequest(`app/list`,{cursor:i,limit:Ssr,"
+                "forceRefetch:t},{trace:a})"
+            ),
+            "replacement": (
+                "Cb(e,n).sendRequest(`app/list`,"
+                'codexMuxScopePluginRequest("list-apps",{cursor:i,limit:Ssr,forceRefetch:t}),'
+                "{trace:a})"
+            ),
+        },
+        {
+            "name": "login-mcp-server RPC mapping",
+            "current": "t.sendRequest(`mcpServer/oauth/login`,e)",
+            "replacement": (
+                't.sendRequest(`mcpServer/oauth/login`,'
+                'codexMuxScopePluginRequest("login-mcp-server",e))'
+            ),
+        },
+        {
+            "name": "list-mcp-server-status RPC mapping",
+            "current": (
+                "Cb(e,t).listMcpServers({cursor:i,detail:n,limit:100},"
+                "r===void 0?void 0:{trace:r})"
+            ),
+            "replacement": (
+                "Cb(e,t).listMcpServers("
+                'codexMuxScopePluginRequest("list-mcp-server-status",{cursor:i,detail:n,limit:100}),'
+                "r===void 0?void 0:{trace:r})"
+            ),
+        },
+        {
+            "name": "listMcpServers RPC wrapper",
+            "current": (
+                "listMcpServers(e,t){let n=JSON.stringify({options:t,params:e}),"
+                "r=this.mcpServerStatusPromises.get(n);if(r)return r;"
+                "let i=this.sendRequest(`mcpServerStatus/list`,e,t);"
+            ),
+            "replacement": (
+                "listMcpServers(e,t){let n=JSON.stringify({options:t,params:e}),"
+                "r=this.mcpServerStatusPromises.get(n);if(r)return r;"
+                "let i=this.sendRequest(`mcpServerStatus/list`,e,t);"
+            ),
+        },
+        {
+            "name": "mcpServerStatus/list RPC call",
+            "current": "this.sendRequest(`mcpServerStatus/list`,e,t)",
+            "replacement": "this.sendRequest(`mcpServerStatus/list`,e,t)",
+        },
+    )
+    values.update(
+        {
+            "source_binding": "26.825.6671.0",
+            "component_anchor": (
+                "function $Cc(e){let t=(0,ewc.c)(33),{accountIcon:n,accountLabel:r,"
+                "additionalItems:i,displayName:a,identityItems:o,isPetVisible:s,"
+                "onCopyUserId:c,onLogOut:l,onOpenProfile:u,onOpenSettings:d,"
+                "onOpenWorkspaceSettings:f,onTogglePet:p,settingsShortcut:m,"
+                "usageItems:h,workspaceSettingsRightIcon:g}=e"
+            ),
+            "component_replacements": {
+                "e7": "c8",
+                "kXc": "lwc",
+                "Lo": "u_",
+                "BW": "AL",
+                "QLs": "Qwo",
+                "_H": "VR",
+                "S2": "NZ",
+                "CH": "qR",
+                "jLa": "nzo",
+            },
+            "app_server_anchor": (
+                "function Cb(e,t){let n=e.get(wb);if(n==null)throw Error("
+                "`AppServerManager RPC is not connected`);return n.forHost(t)}"
+            ),
+            "app_server_replacement": (
+                "function Cb(e,t){let n=e.get(wb);if(n==null)throw Error("
+                "`AppServerManager RPC is not connected`);return n.forHost(t)}"
+            ),
+            "profile_query": "async function Ibc(){let e=await Yx.safeGet(`/wham/profiles/me`)",
+            "profile_query_replacement": (
+                "async function Ibc(){let e=await "
+                "codexMuxProfileData(globalThis.__codexMuxSelectedProfileAccountId??null)"
+            ),
+            "usage_modal": (
+                "function Qwo(e){let t=(0,$wo.c)(20),{defaultResetCreditsOpen:n,"
+                "initialAvailableCount:r,isRateLimitReached:i,onClose:a,onResetComplete:o}=e"
+            ),
+            "reset_query": (
+                "function Edi(){let e=(0,GL.c)(1),t;return "
+                "e[0]===Symbol.for(`react.memo_cache_sentinel`)?"
+                "(t={queryKey:[`rate-limit-reset-credits`],queryFn:Ddi,"
+                "refetchInterval:sx.ONE_MINUTE,staleTime:sx.FIVE_SECONDS},"
+                "e[0]=t):t=e[0],fx(t)}"
+            ),
+            "reset_query_replacement": (
+                "function Edi(){let e=window.__codexMuxResetAccountId;return "
+                "fx({queryKey:[`rate-limit-reset-credits`,e??`primary`],"
+                "queryFn:e?()=>codexMuxRateLimitResets(e):Ddi,"
+                "refetchInterval:sx.ONE_MINUTE,staleTime:sx.FIVE_SECONDS})}"
+            ),
+            "reset_mutation": (
+                "function Odi(){let e=(0,GL.c)(3),t=lx(),n=HE(),r;return "
+                "e[0]!==n||e[1]!==t?(r={mutationFn:kdi,onSuccess:(e,r)=>{"
+                "let{creditId:i}=r,a=e.code;if(a===`reset`||a===`already_redeemed`){"
+                "let n=e.code===`reset`?e.credit?.id??i:i;"
+                "t.setQueryData([`rate-limit-reset-credits`],e=>Qui(e,a,n))}"
+                "Promise.all([n([`rate-limit-status`]),"
+                "n([`rate-limit-reset-credits`])])}},e[0]=n,e[1]=t,e[2]=r):"
+                "r=e[2],mx(r)}"
+            ),
+            "reset_mutation_replacement": (
+                "function Odi(){let e=lx(),t=HE(),n=window.__codexMuxResetAccountId,"
+                "r=[`rate-limit-reset-credits`,n??`primary`];return mx({"
+                "mutationFn:n?i=>codexMuxConsumeRateLimitReset(n,i):kdi,"
+                "onSuccess:(a,o)=>{let{creditId:i}=o,c=a.code;"
+                "if(c===`reset`||c===`already_redeemed`){let n=c===`reset`?"
+                "a.credit?.id??i:i;e.setQueryData(r,e=>Qui(e,c,n))}"
+                "Promise.all([t([`rate-limit-status`]),t(r)])}})}"
+            ),
+            "usage_header": (
+                "_e=(0,gZ.jsx)(tR,{title:(0,gZ.jsx)(hz,{asChild:!0,"
+                "children:(0,gZ.jsx)(`h2`,{className:`m-0`,children:(0,gZ.jsx)(J,{"
+                "id:`codex.rateLimitResetPromptModal.usageTrackingHeading`,"
+                "defaultMessage:`Usage`,description:`Heading for the Codex usage limit modal`"
+                "})})})}),"
+            ),
+            "usage_header_replacement": (
+                "_e=(0,gZ.jsxs)(gZ.Fragment,{children:["
+                "(0,gZ.jsx)(tR,{title:(0,gZ.jsx)(hz,{asChild:!0,"
+                "children:(0,gZ.jsx)(`h2`,{className:`m-0`,children:(0,gZ.jsx)(J,{"
+                "id:`codex.rateLimitResetPromptModal.usageTrackingHeading`,"
+                "defaultMessage:`Usage`,description:`Heading for the Codex usage limit modal`"
+                "})})})}),globalThis.__codexMuxResetAccountSelector??null]}),"
+            ),
+            "usage_slot_replacement": (
+                "usageItems:(globalThis.__codexMuxAccountMenuInjected=true,"
+                "(0,c8.jsx)(CodexMuxAccountMenu,{}))"
+            ),
+            "profile_avatar": (
+                "avatar:(0,$.jsxs)($.Fragment,{children:[(0,$.jsxs)(`label`,"
+                '{"aria-disabled":z.isPending,className:Wt(`group relative flex size-20 '
+                "rounded-full outline-none focus-within:ring-1 focus-within:ring-ring`,"
+            ),
+            "profile_avatar_replacement": (
+                "avatar:(0,$.jsxs)($.Fragment,{children:["
+                "globalThis.CodexMuxProfileAvatarStack?.({onSelect:()=>F.refetch()})??null,"
+                "(0,$.jsxs)(`label`,{\"aria-disabled\":z.isPending,"
+                "className:Wt(globalThis.CodexMuxProfileAvatarStack?`hidden`:"
+                "`group relative flex size-20 rounded-full outline-none "
+                "focus-within:ring-1 focus-within:ring-ring`,"
+            ),
+            "profile_identity": (
+                "username:Le==null?null:(0,$.jsx)(q,{id:`profile.usernameValue`,"
+                "defaultMessage:`@{username}`,description:`Profile username shown with an at-sign prefix`,"
+                "values:{username:Le}})"
+            ),
+            "profile_identity_replacement": (
+                "username:globalThis.__codexMuxSelectedProfileAccountId&&Le!=null?"
+                "(0,$.jsx)(q,{id:`profile.usernameValue`,"
+                "defaultMessage:`@{username}`,description:`Profile username shown with an at-sign prefix`,"
+                "values:{username:Le}}):null"
+            ),
+            "thread_summary_anchor": (
+                "(0,XT.jsx)(Z.Section,{sectionKey:`tool-sources`,after:V,title:H,"
+                "titleSuffix:U,children:W})"
+            ),
+            "thread_route": "oa(Ca)",
+            "thread_section": "Z",
+            "plugin_mappings": plugin_mappings,
+        }
+    )
+    return values
+
+
+def _renderer_contract_bindings(variant_id: str) -> tuple[dict[str, object], ...]:
+    """Return source bindings owned by one semantic renderer contract."""
+
+    if variant_id == "windows-26.820":
+        return (renderer_variant_template(variant_id),)
+    if variant_id == "windows-26.825":
+        return (
+            renderer_variant_template(variant_id),
+            _windows_26_825_6671_renderer_values(),
+        )
+    if variant_id == "electron-6662":
+        return (renderer_variant_template(variant_id),)
+    if variant_id == "electron-original":
+        return (renderer_variant_template(variant_id),)
+    raise ValueError(f"unknown renderer contract: {variant_id}")
+
+
+def _variant_fingerprints(values: dict[str, object]) -> tuple[str, ...]:
+    return (
+        str(values["component_anchor"]),
+        str(values["app_server_anchor"]),
+        str(values["profile_query"]),
+        str(values["usage_modal"]),
+        str(values["reset_query"]),
+        str(values["reset_mutation"]),
+        str(values["usage_slot"]),
+        str(values["open_change"][0]),
+    )
+
+
+def renderer_variant_template(variant_id: str) -> dict[str, object]:
+    """Return a test/fixture template without pretending it selected a build."""
+    if variant_id == "windows-26.820":
+        return dict(_windows_26_820_renderer_values())
+    if variant_id == "windows-26.825":
+        return dict(_windows_26_825_renderer_values())
+    if variant_id == "electron-6662":
+        values = _legacy_renderer_variant_values("function Icl(e){let t=(0,Vcl.c)(248),")
+        values["variant_id"] = variant_id
+        return values
+    if variant_id == "electron-original":
+        values = _legacy_renderer_variant_values("fixture")
+        values["variant_id"] = variant_id
+        return values
+    raise ValueError(f"unknown renderer variant template: {variant_id}")
+
+
+def _renderer_variants() -> tuple[RendererVariant, ...]:
+    original = renderer_variant_template("electron-original")
+    renamed = renderer_variant_template("electron-6662")
+    windows_26_820 = renderer_variant_template("windows-26.820")
+    windows_26_825 = renderer_variant_template("windows-26.825")
+    return (
+        RendererVariant(
+            "windows-26.820",
+            WINDOWS_26_820_PACKAGE_NAME,
+            WINDOWS_26_820_PACKAGE_VERSION,
+            WINDOWS_26_820_ASAR_SHA256,
+            _variant_fingerprints(windows_26_820),
+            windows_26_820,
+        ),
+        RendererVariant(
+            "windows-26.825",
+            WINDOWS_26_825_PACKAGE_NAME,
+            WINDOWS_26_825_PACKAGE_VERSION,
+            WINDOWS_26_825_ASAR_SHA256,
+            _variant_fingerprints(windows_26_825),
+            windows_26_825,
+        ),
+        RendererVariant(
+            "electron-6662",
+            None,
+            None,
+            None,
+            _variant_fingerprints(renamed),
+            renamed,
+        ),
+        RendererVariant(
+            "electron-original",
+            None,
+            None,
+            None,
+            _variant_fingerprints(original),
+            original,
+        ),
+    )
+
+
+RENDERER_VARIANTS = _renderer_variants()
+
+
+def select_renderer_contract(bundle: str, contract_id: str) -> RendererVariant:
+    """Select one exact source binding for a reviewed semantic contract.
+
+    The reviewed-source registry owns the exact package identity and maps it
+    to ``contract_id``.  This function owns only the contract-to-renderer
+    semantics mapping, including multiple minifier bindings for one semantic
+    contract.  A bundle that matches more than one binding is rejected.
+    """
+
+    if contract_id == renderer_26_901.CONTRACT_ID:
+        if not renderer_26_901.matches_initial(bundle):
+            raise RuntimeError("26.901 initial renderer hash does not match reviewed source")
+        return RendererVariant(contract_id, None, None, None, (), {"source_binding": renderer_26_901.contract(bundle=bundle)["package_version"]})
+    bindings = _renderer_contract_bindings(contract_id)
+    matches: list[dict[str, object]] = []
+    for values in bindings:
+        fingerprints = _variant_fingerprints(values)
+        if all(bundle.count(fingerprint) == 1 for fingerprint in fingerprints):
+            matches.append(values)
+    if len(matches) == 1:
+        values = matches[0]
+        return RendererVariant(
+            contract_id,
+            None,
+            None,
+            None,
+            _variant_fingerprints(values),
+            values,
+        )
+    if len(matches) > 1:
+        bindings_seen = [str(values.get("source_binding", "unknown")) for values in matches]
+        raise RuntimeError(
+            f"renderer contract binding is ambiguous for {contract_id!r}: {bindings_seen}"
+        )
+    raise RuntimeError(
+        f"no renderer binding matched exact fingerprints for contract {contract_id!r}"
+    )
+
+
+def detect_renderer_contract(bundle: str) -> RendererVariant:
+    """Detect one exact renderer binding without authorizing a source.
+
+    This is intentionally separate from the reviewed-source registry gate.
+    It is useful during a read-only source review, where the package identity
+    is being established before a new exact registry record can be added.
+    """
+
+    matches: list[RendererVariant] = []
+    for contract_id in sorted({item.variant_id for item in RENDERER_VARIANTS} | {renderer_26_901.CONTRACT_ID}):
+        try:
+            matches.append(select_renderer_contract(bundle, contract_id))
+        except RuntimeError:
+            continue
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"renderer contract detection is ambiguous: {[item.variant_id for item in matches]}"
+        )
+    raise RuntimeError("no exact renderer contract binding matched")
+
+
+def select_renderer_variant(
+    bundle: str,
+    *,
+    package_name: str | None = None,
+    package_version: str | None = None,
+    app_asar_sha256: str | None = None,
+) -> RendererVariant:
+    """Select a legacy metadata-bound variant or one exact fixture contract.
+
+    Production builds must pass the contract ID obtained from the exact
+    reviewed-source registry to :func:`select_renderer_contract`.  This
+    compatibility selector remains for older callers and test fixtures; it
+    does not authorize a source identity.
+    """
+    package_name = None if package_name in {None, "", "unknown"} else package_name
+    package_version = None if package_version in {None, "", "unknown"} else package_version
+    app_asar_sha256 = None if app_asar_sha256 in {None, ""} else app_asar_sha256
+    metadata_bound_ids: set[str] = set()
+    for variant in RENDERER_VARIANTS:
+        if variant.package_name is not None and package_name is not None and package_name != variant.package_name:
+            continue
+        if variant.package_version is not None and package_version is not None and package_version != variant.package_version:
+            continue
+        if variant.app_asar_sha256 is not None and app_asar_sha256 is not None and app_asar_sha256.casefold() != variant.app_asar_sha256:
+            continue
+        metadata_bound_ids.add(variant.variant_id)
+
+    candidate_ids = metadata_bound_ids or {
+        variant.variant_id for variant in RENDERER_VARIANTS
+    }
+    matches: list[RendererVariant] = []
+    for contract_id in candidate_ids:
+        try:
+            matches.append(select_renderer_contract(bundle, contract_id))
+        except RuntimeError:
+            continue
+    if len(matches) == 1:
+        return matches[0]
+    metadata = {
+        "package_name": package_name,
+        "package_version": package_version,
+        "app_asar_sha256": app_asar_sha256,
+    }
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"renderer variant selection is ambiguous: {[variant.variant_id for variant in matches]}"
+        )
+    raise RuntimeError(f"no renderer variant matched exact fingerprints: {metadata}")
+
+
+def _renderer_variant_values(bundle: str) -> dict[str, object]:
+    """Compatibility accessor that still requires exact multi-anchor selection."""
+    return select_renderer_variant(bundle).values
+
+
+def _observed_renderer_semantic_anchors(bundle: str) -> dict[str, str]:
+    """Identify exact semantic counterparts seen in the acquired 26.820 build.
+
+    These are audit evidence only. They deliberately do not make that build
+    patchable: the replacement code still requires the historical exact
+    anchors, and ``patch_renderer`` fails closed for every semantic change.
+    """
+    return {
+        "native profile menu": (
+            "function Jyl(e){let t=(0,Yyl.c)(33),{accountIcon:n,accountLabel:r,"
+            "additionalItems:i,displayName:a,identityItems:o,isPetVisible:s,"
+            "onCopyUserId:c,onLogOut:l,onOpenProfile:u,onOpenSettings:d,"
+            "onOpenWorkspaceSettings:f,onTogglePet:p,settingsShortcut:m,"
+            "usageItems:h,workspaceSettingsRightIcon:g}=e"
+        ),
+        "app-server request bridge": (
+            "function qg(e,t){let n=e.get(Jg);if(n==null)throw Error("
+            "`AppServerManager RPC is not connected`);return n.forHost(t)}"
+        ),
+        "profile statistics request": (
+            "async function n2a(){let e=await Ob.safeGet(`/wham/profiles/me`);"
+            "return{activityInsights:u2a(e.stats)"
+        ),
+        "native usage modal": (
+            "function c6s(e){let t=(0,u6s.c)(28),{defaultResetCreditsOpen:n,"
+            "errorMessage:r,initialAvailableCount:i,isResetting:a,onClose:o,"
+            "onResetCredit:s}=e,{data:c}=lH(),{data:l}=J(BO),"
+            "{data:u,isLoading:d}=WAa()"
+        ),
+        "reset-credit query": (
+            "function WAa(){let e=(0,uH.c)(1),t;return e[0]==="
+            "Symbol.for(`react.memo_cache_sentinel`)?(t={queryKey:["
+            "`rate-limit-reset-credits`],queryFn:GAa"
+        ),
+        "reset-credit mutation": (
+            "function KAa(){let e=(0,uH.c)(3),t=lt(),n=AS(),r;return "
+            "e[0]!==n||e[1]!==t?(r={mutationFn:qAa"
+        ),
+        "usage sheet header": (
+            "id:`codex.rateLimitResetPromptModal.usageTrackingHeading`,"
+            "defaultMessage:`Usage`"
+        ),
+        "usage menu slot": "usageItems:wt",
+        "list-apps RPC mapping": (
+            "async function g9r({scope:e,forceRefetch:t,hostId:n}){try{"
+            "let r=async(i,a)=>{let o=await qg(e,n).sendRequest(`app/list`"
+        ),
+        "list-installed-apps RPC mapping": (
+            "async function h9r({scope:e,forceRefresh:t=!1,hostId:n}){try{"
+            "let r=(await qg(e,n).sendRequest(`app/installed`"
+        ),
+        "read-apps RPC mapping": "qg(e,n).sendRequest(`app/read`,{appIds:t})",
+        "login-mcp-server RPC mapping": "sendRequest(`mcpServer/oauth/login`,e)",
+        "list-mcp-server-status RPC mapping": (
+            "async function exn(e,t,n,r,i=null){let a=await qg(e,t).listMcpServers"
+        ),
+        "profile menu open-state hook 1": (
+            "open:s,side:`top`,sideOffset:6,triggerButton:Ot,onOpenChange:l"
+        ),
+    }
+
+
+def _observed_profile_semantic_anchors() -> dict[str, str]:
+    """Exact profile-page counterparts found in the acquired renderer asset."""
+    return {
+        "Profile avatar": (
+            'avatar:(0,$.jsxs)($.Fragment,{children:[(0,$.jsxs)(`label`,'
+            '{"aria-disabled":I.isPending'
+        ),
+        "Profile display name": "displayName:Ye??(0,$.jsx)(J,{id:`profile.nameFallback`",
+        "Profile username and plan": "username:qe==null?null:(0,$.jsx)(J,{id:`profile.usernameValue`",
+    }
+
+
+def _semantic_variant(text: str, name: str, asset: str, semantic: str | None) -> AnchorAudit:
+    if semantic is None:
+        return AnchorAudit(name, asset, "MISSING", None, 0)
+    count = text.count(semantic)
+    if count == 1:
+        return AnchorAudit(name, asset, "SEMANTICALLY_CHANGED", "semantic", count)
+    if count > 1:
+        return AnchorAudit(name, asset, "AMBIGUOUS", "semantic", count)
+    return AnchorAudit(name, asset, "MISSING", None, 0)
+
+
+def _audit_windows_26_820(
+    extracted: Path,
+    index: str,
+    bundle_path: Path,
+    bundle: str,
+    values: dict[str, object],
+) -> list[AnchorAudit]:
+    """Audit the exact 26.820 surfaces, including the moved thread summary."""
+    assets = extracted / "webview" / "assets"
+    audit: list[AnchorAudit] = [
+        AnchorAudit(
+            "renderer CSP",
+            "webview/index.html",
+            "UNCHANGED" if index.count("connect-src &#39;self&#39;") == 1 else "MISSING",
+            "connect-src &#39;self&#39;" if index.count("connect-src &#39;self&#39;") == 1 else None,
+            index.count("connect-src &#39;self&#39;"),
+        )
+    ]
+    for name, key in (
+        ("native profile menu", "component_anchor"),
+        ("app-server request bridge", "app_server_anchor"),
+        ("profile statistics request", "profile_query"),
+        ("native usage modal", "usage_modal"),
+        ("reset-credit query", "reset_query"),
+        ("reset-credit mutation", "reset_mutation"),
+        ("usage sheet header", "usage_header"),
+        ("usage menu slot", "usage_slot"),
+        ("profile menu open-state hook 1", "open_change"),
+        ("profile menu outside open-state preservation", "open_preserved"),
+    ):
+        current = values[key]
+        if key == "open_change":
+            current = current[0]
+        audit.append(_variant(bundle, name, bundle_path.name, str(current)))
+    audit.append(_variant(bundle, "usage-window selection", bundle_path.name, "let y=v;if(g!=null){"))
+    for spec in values["plugin_mappings"]:
+        audit.append(_variant(bundle, str(spec["name"]), bundle_path.name, str(spec["current"])))
+    for message in (
+        "defaultMessage:`You’re out of Codex and Work usage`",
+        "defaultMessage:`You’ve used all Codex and Work usage`",
+        "defaultMessage:`You’ve reached your usage limit`",
+    ):
+        audit.append(_variant(bundle, "subscription depletion alert", bundle_path.name, message))
+
+    profile_assets = list(assets.glob("profile-*.js"))
+    profile_path = profile_assets[0] if len(profile_assets) == 1 else None
+    profile_text = profile_path.read_text(encoding="utf-8") if profile_path else ""
+    for name, key in (
+        ("Profile avatar", "profile_avatar"),
+        ("Profile display name", "profile_name"),
+        ("Profile username and plan", "profile_identity"),
+    ):
+        audit.append(
+            _variant(
+                profile_text,
+                name,
+                profile_path.name if profile_path else "profile-*.js",
+                str(values[key]),
+            )
+        )
+
+    plugin_assets = list(assets.glob(str(values["plugin_glob"])))
+    _, plugin_audit = _asset_with_anchor(
+        plugin_assets,
+        "Plugins settings content",
+        str(values["plugin_glob"]),
+        str(values["plugin_anchor"]),
+    )
+    audit.append(plugin_audit)
+
+    thread_assets = list(assets.glob("local-conversation-thread-*.js"))
+    thread_path, thread_audit = _asset_with_anchor(
+        thread_assets,
+        "thread summary source component",
+        "local-conversation-thread-*.js",
+        str(values["thread_anchor"]),
+    )
+    audit.append(thread_audit)
+    thread_text = thread_path.read_text(encoding="utf-8") if thread_path else ""
+    audit.append(
+        _variant(
+            thread_text,
+            "thread summary insertion point",
+            "local-conversation-thread-*.js",
+            str(values["thread_summary_anchor"]),
+        )
+    )
+    return audit
+
+
+def _audit_windows_26_825(
+    extracted: Path,
+    index: str,
+    bundle_path: Path,
+    bundle: str,
+    values: dict[str, object],
+) -> list[AnchorAudit]:
+    """Audit the exact 26.825 renderer contract after the compatibility refresh."""
+
+    assets = extracted / "webview" / "assets"
+    audit: list[AnchorAudit] = [
+        AnchorAudit(
+            "renderer CSP",
+            "webview/index.html",
+            "UNCHANGED" if index.count("connect-src &#39;self&#39;") == 1 else "MISSING",
+            "connect-src &#39;self&#39;" if index.count("connect-src &#39;self&#39;") == 1 else None,
+            index.count("connect-src &#39;self&#39;"),
+        )
+    ]
+    for name, key in (
+        ("native profile menu", "component_anchor"),
+        ("app-server request bridge", "app_server_anchor"),
+        ("profile statistics request", "profile_query"),
+        ("native usage modal", "usage_modal"),
+        ("reset-credit query", "reset_query"),
+        ("reset-credit mutation", "reset_mutation"),
+        ("usage sheet header", "usage_header"),
+        ("usage menu slot", "usage_slot"),
+        ("profile menu open-state hook 1", "open_change"),
+        ("profile menu outside open-state preservation", "open_preserved"),
+    ):
+        current = values[key]
+        if key == "open_change":
+            current = current[0]
+        audit.append(_variant(bundle, name, bundle_path.name, str(current)))
+    audit.append(
+        _variant(bundle, "usage-window selection", bundle_path.name, "let y=v;if(g!=null){")
+    )
+    for spec in values["plugin_mappings"]:
+        audit.append(_variant(bundle, str(spec["name"]), bundle_path.name, str(spec["current"])))
+    for message in (
+        "defaultMessage:`You’re out of Codex and Work usage`",
+        "defaultMessage:`You’ve used all Codex and Work usage`",
+        "defaultMessage:`You’ve reached your usage limit`",
+    ):
+        audit.append(_variant(bundle, "subscription depletion alert", bundle_path.name, message))
+
+    profile_assets = list(assets.glob("profile-*.js"))
+    profile_path = profile_assets[0] if len(profile_assets) == 1 else None
+    profile_text = profile_path.read_text(encoding="utf-8") if profile_path else ""
+    for name, key in (
+        ("Profile avatar", "profile_avatar"),
+        ("Profile display name", "profile_name"),
+        ("Profile username and plan", "profile_identity"),
+    ):
+        audit.append(
+            _variant(
+                profile_text,
+                name,
+                profile_path.name if profile_path else "profile-*.js",
+                str(values[key]),
+            )
+        )
+
+    plugin_assets = list(assets.glob(str(values["plugin_glob"])))
+    _, plugin_audit = _asset_with_anchor(
+        plugin_assets,
+        "Plugins settings content",
+        str(values["plugin_glob"]),
+        str(values["plugin_anchor"]),
+    )
+    audit.append(plugin_audit)
+
+    thread_assets = list(assets.glob("local-conversation-thread-*.js"))
+    thread_path, thread_audit = _asset_with_anchor(
+        thread_assets,
+        "thread summary source component",
+        "local-conversation-thread-*.js",
+        str(values["thread_anchor"]),
+    )
+    audit.append(thread_audit)
+    thread_text = thread_path.read_text(encoding="utf-8") if thread_path else ""
+    audit.append(
+        _variant(
+            thread_text,
+            "thread summary insertion point",
+            "local-conversation-thread-*.js",
+            str(values["thread_summary_anchor"]),
+        )
+    )
+    return audit
+
+
+def audit_renderer_anchors(
+    extracted: Path,
+    *,
+    renderer_variant: str | None = None,
+    package_name: str | None = None,
+    package_version: str | None = None,
+    app_asar_sha256: str | None = None,
+) -> list[AnchorAudit]:
+    """Audit exact hooks without changing the extracted ASAR.
+
+    When ``renderer_variant`` is supplied it is the reviewed-source
+    registry's contract ID and is authoritative.  Metadata-only selection is
+    retained solely for historical fixture callers.
+    """
+    if renderer_variant == renderer_26_901.CONTRACT_ID:
+        return [AnchorAudit(**row) for row in renderer_26_901.audit(extracted)]
+    webview = extracted / "webview"
+    assets = webview / "assets"
+    index_path = webview / "index.html"
+    if not index_path.is_file():
+        return [AnchorAudit("renderer CSP", "webview/index.html", "MISSING", None, 0)]
+    index = index_path.read_text(encoding="utf-8")
+    initial_bundles = list(assets.glob("app-initial-*.js"))
+    if len(initial_bundles) != 1:
+        return [AnchorAudit("initial renderer bundle", "webview/assets", "AMBIGUOUS", None, len(initial_bundles))]
+    bundle_path = initial_bundles[0]
+    bundle = bundle_path.read_text(encoding="utf-8")
+    try:
+        variant = (
+            select_renderer_contract(bundle, renderer_variant)
+            if renderer_variant is not None
+            else select_renderer_variant(
+                bundle,
+                package_name=package_name,
+                package_version=package_version,
+                app_asar_sha256=app_asar_sha256,
+            )
+        )
+    except (RuntimeError, ValueError) as error:
+        if renderer_variant is not None:
+            raise RuntimeError(
+                f"reviewed renderer contract could not be selected: {renderer_variant}"
+            ) from error
+        variant = None
+    if variant is None and renderer_variant is None:
+        try:
+            variant = detect_renderer_contract(bundle)
+        except RuntimeError as error:
+            if "ambiguous" in str(error).casefold():
+                return [
+                    AnchorAudit(
+                        "renderer contract",
+                        bundle_path.name,
+                        "AMBIGUOUS",
+                        None,
+                        0,
+                    )
+                ]
+    if variant is not None and variant.variant_id == renderer_26_901.CONTRACT_ID:
+        return [AnchorAudit(**row) for row in renderer_26_901.audit(extracted)]
+    if variant is not None and variant.variant_id == "windows-26.820":
+        return _audit_windows_26_820(extracted, index, bundle_path, bundle, variant.values)
+    if variant is not None and variant.variant_id == "windows-26.825":
+        return _audit_windows_26_825(extracted, index, bundle_path, bundle, variant.values)
+    values = variant.values if variant is not None else _legacy_renderer_variant_values(bundle)
+    semantic_anchors = _observed_renderer_semantic_anchors(bundle)
+    old_values = _legacy_renderer_variant_values(bundle.replace("function Icl(e){let t=(0,Vcl.c)(248),", "function wXc({sidebarFooter:e,triggerButton:t})"))
+    build_6662 = bool(values["build_6662"])
+    audit: list[AnchorAudit] = [
+        AnchorAudit(
+            "renderer CSP",
+            "webview/index.html",
+            "UNCHANGED" if index.count("connect-src &#39;self&#39;") == 1 else "MISSING",
+            "connect-src &#39;self&#39;" if index.count("connect-src &#39;self&#39;") == 1 else None,
+            index.count("connect-src &#39;self&#39;"),
+        )
+    ]
+    def add_variant(
+        name: str,
+        current: str,
+        renamed: str | None = None,
+        *,
+        prefer_semantic: bool = False,
+    ) -> None:
+        semantic = semantic_anchors.get(name)
+        if prefer_semantic and semantic is not None and bundle.count(semantic) > 0:
+            audit.append(_semantic_variant(bundle, name, bundle_path.name, semantic))
+        else:
+            audit.append(_variant(bundle, name, bundle_path.name, current, renamed, semantic))
+
+    def add_key_variant(name: str, key: str) -> None:
+        current = str(old_values[key] if build_6662 else values[key])
+        renamed = str(values[key]) if build_6662 else None
+        add_variant(name, current, renamed, prefer_semantic=name == "native usage modal")
+
+    add_key_variant("native profile menu", "component_anchor")
+    add_key_variant("app-server request bridge", "app_server_anchor")
+    add_key_variant("profile statistics request", "profile_query")
+    add_key_variant("native usage modal", "usage_modal")
+    add_key_variant("reset-credit query", "reset_query")
+    add_key_variant("reset-credit mutation", "reset_mutation")
+    add_variant(
+        "usage-window selection",
+        "let y=v;if(g!=null){",
+    )
+    add_key_variant("usage sheet header", "usage_header")
+    add_key_variant("usage menu slot", "usage_slot")
+
+    mapping_names = (
+        "list-apps RPC mapping",
+        "list-installed-apps RPC mapping",
+        "read-apps RPC mapping",
+        "login-mcp-server RPC mapping",
+        "list-mcp-server-status RPC mapping",
+        "listMcpServers RPC wrapper",
+        "mcpServerStatus/list RPC call",
+    )
+    current_mappings = _plugin_mapping_anchors(
+        str(values["rpc_wrapper"]),
+        str(values["status_rpc_wrapper"]),
+    )
+    old_mappings = _plugin_mapping_anchors(
+        str(old_values["rpc_wrapper"]),
+        str(old_values["status_rpc_wrapper"]),
+    )
+    for name, current_mapping, old_mapping in zip(
+        mapping_names,
+        current_mappings,
+        old_mappings,
+    ):
+        audit.append(
+            _variant(
+                bundle,
+                name,
+                bundle_path.name,
+                old_mapping if build_6662 else current_mapping,
+                current_mapping if build_6662 else None,
+                semantic_anchors.get(name),
+            )
+        )
+
+    for index, anchor in enumerate(values["open_change"]):
+        old_anchor = old_values["open_change"][index]
+        audit.append(
+            _variant(
+                bundle,
+                f"profile menu open-state hook {index + 1}",
+                bundle_path.name,
+                old_anchor if build_6662 else anchor,
+                anchor if build_6662 else None,
+                semantic_anchors.get(f"profile menu open-state hook {index + 1}"),
+            )
+        )
+    for message in (
+        "defaultMessage:`You’re out of Codex and Work usage`",
+        "defaultMessage:`You’ve used all Codex and Work usage`",
+        "defaultMessage:`You’ve reached your usage limit`",
+    ):
+        audit.append(_variant(bundle, "subscription depletion alert", bundle_path.name, message))
+
+    profile_assets = list(assets.glob("profile-*.js"))
+    profile_path = profile_assets[0] if len(profile_assets) == 1 else None
+    profile_text = profile_path.read_text(encoding="utf-8") if profile_path else ""
+    profile_semantic_anchors = _observed_profile_semantic_anchors()
+    for name, key in (
+        ("Profile avatar", "profile_avatar"),
+        ("Profile display name", "profile_name"),
+        ("Profile username and plan", "profile_identity"),
+    ):
+        current = str(old_values[key] if build_6662 else values[key])
+        renamed = str(values[key]) if build_6662 else None
+        audit.append(
+            _variant(
+                profile_text,
+                name,
+                profile_path.name if profile_path else "profile-*.js",
+                current,
+                renamed,
+                profile_semantic_anchors.get(name),
+            )
+        )
+
+    plugin_assets = list(assets.glob(str(values["plugin_glob"])))
+    plugin_path: Path | None = None
+    if build_6662:
+        old_plugin_assets = list(assets.glob(str(old_values["plugin_glob"])))
+        _, old_plugin_audit = _asset_with_anchor(
+            old_plugin_assets,
+            "Plugins settings content",
+            str(old_values["plugin_glob"]),
+            str(old_values["plugin_anchor"]),
+        )
+        plugin_path, new_plugin_audit = _asset_with_anchor(
+            plugin_assets,
+            "Plugins settings content",
+            str(values["plugin_glob"]),
+            str(values["plugin_anchor"]),
+        )
+        if new_plugin_audit.status == "UNCHANGED" and old_plugin_audit.status == "MISSING":
+            plugin_audit = AnchorAudit(
+                "Plugins settings content",
+                str(values["plugin_glob"]),
+                "MOVED",
+                new_plugin_audit.matched,
+                new_plugin_audit.count,
+            )
+        elif new_plugin_audit.status == "UNCHANGED":
+            plugin_audit = AnchorAudit(
+                "Plugins settings content",
+                str(values["plugin_glob"]),
+                "RENAMED",
+                new_plugin_audit.matched,
+                new_plugin_audit.count,
+            )
+        else:
+            plugin_audit = new_plugin_audit
+    else:
+        plugin_path, plugin_audit = _asset_with_anchor(
+            plugin_assets,
+            "Plugins settings content",
+            str(values["plugin_glob"]),
+            str(values["plugin_anchor"]),
+        )
+    audit.append(plugin_audit)
+
+    thread_assets = list(assets.glob("local-conversation-thread-*.js"))
+    if build_6662:
+        _, old_thread_audit = _asset_with_anchor(
+            thread_assets,
+            "thread summary source component",
+            "local-conversation-thread-*.js",
+            str(old_values["thread_anchor"]),
+        )
+        thread_path, new_thread_audit = _asset_with_anchor(
+            thread_assets,
+            "thread summary source component",
+            "local-conversation-thread-*.js",
+            str(values["thread_anchor"]),
+        )
+        if new_thread_audit.status == "UNCHANGED" and old_thread_audit.status == "MISSING":
+            thread_audit = AnchorAudit(
+                "thread summary source component",
+                "local-conversation-thread-*.js",
+                "RENAMED",
+                new_thread_audit.matched,
+                new_thread_audit.count,
+            )
+        else:
+            thread_audit = new_thread_audit
+    else:
+        thread_path, thread_audit = _asset_with_anchor(
+            thread_assets,
+            "thread summary source component",
+            "local-conversation-thread-*.js",
+            str(values["thread_anchor"]),
+        )
+    audit.append(thread_audit)
+    thread_text = thread_path.read_text(encoding="utf-8") if thread_path else ""
+    audit.append(_variant(thread_text, "thread summary section list", "local-conversation-thread-*.js", "children:[c,l,u,d,f,p,m,h,g,_,v,y,b,x]"))
+    return audit
+
+
+def _count_contract_anchor(extracted: Path, asset_glob: str, anchor: str) -> list[dict[str, object]]:
+    """Return exact anchor locations for a read-only renderer comparison."""
+
+    assets = sorted((extracted / "webview" / "assets").glob(asset_glob))
+    locations: list[dict[str, object]] = []
+    for asset in assets:
+        count = asset.read_text(encoding="utf-8").count(anchor)
+        if count:
+            locations.append({"asset": asset.name, "count": count})
+    return locations
+
+
+def compare_renderer_contract(
+    extracted: Path,
+    reference_variant: str = "windows-26.820",
+    *,
+    observed_variant: str | None = None,
+) -> dict[str, object]:
+    """Compare source surfaces without granting patch permission.
+
+    The reference contract describes the previously reviewed semantics.  The
+    observed contract is detected from exact fingerprints (or selected by a
+    reviewed contract ID) and supplies the byte-level source binding for the
+    current bundle.  Returned evidence contains counts, asset names, and a
+    semantic basis, never minified source text.
+    """
+
+    if observed_variant == renderer_26_901.CONTRACT_ID:
+        rows = renderer_26_901.audit(extracted)
+        return {
+            "reference_variant": reference_variant, "observed_variant": observed_variant,
+            "observed_source_binding": renderer_26_901.contract(extracted=extracted)["package_version"], "read_only": True,
+            "patch_permission_granted": False,
+            "patchable": all(row["status"] == "UNCHANGED" for row in rows),
+            "surface_status": rows,
+            "missing_anchors": [row for row in rows if row["status"] == "MISSING"],
+            "ambiguous_anchors": [row for row in rows if row["status"] == "AMBIGUOUS"],
+            "semantic_changes": ["Native AuthProvider lifecycle supplies authentication evidence"],
+            "asset_moves": ["Profile host and usage UI moved from app-initial to app-primary"],
+        }
+    reference = renderer_variant_template(reference_variant)
+    webview = extracted / "webview"
+    assets = webview / "assets"
+    index_path = webview / "index.html"
+    initial_bundles = sorted(assets.glob("app-initial-*.js"))
+    result: dict[str, object] = {
+        "reference_variant": reference_variant,
+        "reference_contract": reference_variant,
+        "reference_fingerprint_count": len(_variant_fingerprints(reference)),
+        "observed_variant": "UNRESOLVED",
+        "candidate_source": None,
+        "observed_source_binding": None,
+        "read_only": True,
+        "patch_permission_granted": False,
+        "patchable": False,
+        "exact_fingerprint_matches": [],
+        "observed_fingerprint_matches": [],
+        "missing_fingerprints": [],
+        "ambiguous_fingerprints": [],
+        "exact_replacement_anchor_matches": [],
+        "surface_status": [],
+        "missing_anchors": [],
+        "ambiguous_anchors": [],
+        "semantic_changes": [],
+        "asset_moves": [],
+    }
+    if not index_path.is_file() or len(initial_bundles) != 1:
+        missing = result["missing_anchors"]
+        assert isinstance(missing, list)
+        missing.append(
+            {
+                "name": "initial renderer bundle",
+                "asset": "webview/assets",
+                "reason": "missing" if not initial_bundles else "expected exactly one bundle",
+                "count": len(initial_bundles),
+            }
+        )
+        return result
+
+    index_html = index_path.read_text(encoding="utf-8")
+    bundle_path = initial_bundles[0]
+    bundle = bundle_path.read_text(encoding="utf-8")
+    observed: RendererVariant | None = None
+    if observed_variant is not None:
+        try:
+            observed = select_renderer_contract(bundle, observed_variant)
+        except (RuntimeError, ValueError):
+            result["observed_contract_status"] = "NO_EXACT_BINDING"
+    else:
+        try:
+            observed = detect_renderer_contract(bundle)
+        except RuntimeError as error:
+            result["observed_contract_status"] = (
+                "AMBIGUOUS" if "ambiguous" in str(error).casefold() else "NO_EXACT_BINDING"
+            )
+    if observed is not None:
+        result["observed_variant"] = observed.variant_id
+        source_binding = observed.values.get("source_binding")
+        result["observed_source_binding"] = source_binding
+        result["candidate_source"] = source_binding or observed.variant_id
+        result["observed_contract_status"] = "PASS"
+
+    exact_fingerprints: list[dict[str, object]] = []
+    for fingerprint_index, anchor in enumerate(_variant_fingerprints(reference)):
+        count = bundle.count(anchor)
+        item = {
+            "index": fingerprint_index,
+            "asset": bundle_path.name,
+            "count": count,
+        }
+        if count == 1:
+            exact_fingerprints.append(item)
+        elif count == 0:
+            missing = result["missing_fingerprints"]
+            assert isinstance(missing, list)
+            missing.append({"name": f"fingerprint-{fingerprint_index + 1}", **item})
+        else:
+            ambiguous = result["ambiguous_fingerprints"]
+            assert isinstance(ambiguous, list)
+            ambiguous.append({"name": f"fingerprint-{fingerprint_index + 1}", **item})
+    result["exact_fingerprint_matches"] = exact_fingerprints
+
+    observed_values = observed.values if observed is not None else None
+    observed_fingerprints: list[dict[str, object]] = []
+    if observed_values is not None:
+        for fingerprint_index, anchor in enumerate(_variant_fingerprints(observed_values)):
+            count = bundle.count(anchor)
+            if count == 1:
+                observed_fingerprints.append(
+                    {"index": fingerprint_index, "asset": bundle_path.name, "count": count}
+                )
+    result["observed_fingerprint_matches"] = observed_fingerprints
+
+    def _value(values: dict[str, object] | None, key: str) -> str | None:
+        if values is None:
+            return None
+        value = values.get(key)
+        if isinstance(value, (tuple, list)):
+            return str(value[0]) if value else None
+        return str(value) if value is not None else None
+
+    def _mapping(values: dict[str, object] | None) -> dict[str, str]:
+        if values is None:
+            return {}
+        mappings = values.get("plugin_mappings")
+        if not isinstance(mappings, (tuple, list)):
+            return {}
+        return {
+            str(item["name"]): str(item["current"])
+            for item in mappings
+            if isinstance(item, dict) and "name" in item and "current" in item
+        }
+
+    reference_mappings = _mapping(reference)
+    observed_mappings = _mapping(observed_values)
+    surfaces: list[tuple[str, str, str, str | None, str | None, str]] = [
+        (
+            "renderer CSP",
+            "webview/index.html",
+            "webview/index.html",
+            "connect-src &#39;self&#39;",
+            "connect-src &#39;self&#39;",
+            "same renderer connect-src self policy",
+        ),
+        (
+            "native profile menu",
+            "app-initial",
+            "app-initial",
+            _value(reference, "component_anchor"),
+            _value(observed_values, "component_anchor"),
+            "same profile-menu component and value props",
+        ),
+        (
+            "app-server request bridge",
+            "app-initial",
+            "app-initial",
+            _value(reference, "app_server_anchor"),
+            _value(observed_values, "app_server_anchor"),
+            "same host-scoped AppServerManager.forHost(hostId) bridge",
+        ),
+        (
+            "profile statistics request",
+            "app-initial",
+            "app-initial",
+            _value(reference, "profile_query"),
+            _value(observed_values, "profile_query"),
+            "same /wham/profiles/me profile statistics query",
+        ),
+        (
+            "native usage modal",
+            "app-initial",
+            "app-initial",
+            _value(reference, "usage_modal"),
+            _value(observed_values, "usage_modal"),
+            "same Usage modal props and reset-credit presentation",
+        ),
+        (
+            "reset-credit query",
+            "app-initial",
+            "app-initial",
+            _value(reference, "reset_query"),
+            _value(observed_values, "reset_query"),
+            "same rate-limit-reset-credits query key and refresh policy",
+        ),
+        (
+            "reset-credit mutation",
+            "app-initial",
+            "app-initial",
+            _value(reference, "reset_mutation"),
+            _value(observed_values, "reset_mutation"),
+            "same rate-limit-reset-credits consume operation and outcomes",
+        ),
+        (
+            "usage sheet header",
+            "app-initial",
+            "app-initial",
+            _value(reference, "usage_header"),
+            _value(observed_values, "usage_header"),
+            "same Usage sheet heading and reset selector slot",
+        ),
+        (
+            "usage menu slot",
+            "app-initial",
+            "app-initial",
+            _value(reference, "usage_slot"),
+            _value(observed_values, "usage_slot"),
+            "same object-literal usageItems value site outside destructuring",
+        ),
+        (
+            "usage-window selection",
+            "app-initial",
+            "app-initial",
+            "let y=v;if(g!=null){",
+            "let y=v;if(g!=null){",
+            "same selected usage-window value flow",
+        ),
+        (
+            "profile menu open-state hook 1",
+            "app-initial",
+            "app-initial",
+            _value(reference, "open_change"),
+            _value(observed_values, "open_change"),
+            "same profile-menu open-state callback and trigger",
+        ),
+        (
+            "profile menu outside open-state preservation",
+            "app-initial",
+            "app-initial",
+            _value(reference, "open_preserved"),
+            _value(observed_values, "open_preserved"),
+            "same outside profile-menu open-state preservation",
+        ),
+    ]
+    for name, reference_anchor in reference_mappings.items():
+        surfaces.append(
+            (
+                name,
+                "app-initial",
+                "app-initial",
+                reference_anchor,
+                observed_mappings.get(name),
+                f"same app-server RPC mapping for {name.removesuffix(' RPC mapping')}",
+            )
+        )
+    for index, message in enumerate(
+        (
+            "defaultMessage:`You’re out of Codex and Work usage`",
+            "defaultMessage:`You’ve used all Codex and Work usage`",
+            "defaultMessage:`You’ve reached your usage limit`",
+        ),
+        start=1,
+    ):
+        surfaces.append(
+            (
+                f"subscription depletion alert {index}",
+                "app-initial",
+                "app-initial",
+                message,
+                message,
+                "same subscription-depletion alert condition",
+            )
+        )
+    surfaces.extend(
+        (
+            (
+                "Profile avatar",
+                "profile-*.js",
+                "profile-*.js",
+                _value(reference, "profile_avatar"),
+                _value(observed_values, "profile_avatar"),
+                "same profile avatar control and refresh callback",
+            ),
+            (
+                "Profile display name",
+                "profile-*.js",
+                "profile-*.js",
+                _value(reference, "profile_name"),
+                _value(observed_values, "profile_name"),
+                "same profile display-name identity field",
+            ),
+            (
+                "Profile username and plan",
+                "profile-*.js",
+                "profile-*.js",
+                _value(reference, "profile_identity"),
+                _value(observed_values, "profile_identity"),
+                "same profile username and plan identity fields",
+            ),
+            (
+                "Plugins settings content",
+                str(reference["plugin_glob"]),
+                str(observed_values["plugin_glob"]) if observed_values else str(reference["plugin_glob"]),
+                _value(reference, "plugin_anchor"),
+                _value(observed_values, "plugin_anchor"),
+                "same Plugins settings connected-content insertion point",
+            ),
+            (
+                "thread summary source component",
+                "local-conversation-thread-*.js",
+                "local-conversation-thread-*.js",
+                _value(reference, "thread_anchor"),
+                _value(observed_values, "thread_anchor"),
+                "same local conversation thread renderer component",
+            ),
+            (
+                "thread summary insertion point",
+                "local-conversation-thread-*.js",
+                "local-conversation-thread-*.js",
+                _value(reference, "thread_summary_anchor"),
+                _value(observed_values, "thread_summary_anchor"),
+                "same tool-sources thread summary section",
+            ),
+        )
+    )
+
+    def _locations(asset_label: str, anchor: str | None) -> list[dict[str, object]]:
+        if not anchor:
+            return []
+        if asset_label == "webview/index.html":
+            return [{"asset": index_path.name, "count": index_html.count(anchor)}]
+        if asset_label == "app-initial":
+            return [{"asset": bundle_path.name, "count": bundle.count(anchor)}]
+        return _count_contract_anchor(extracted, asset_label, anchor)
+
+    exact_replacements: list[dict[str, object]] = []
+    surface_status: list[dict[str, object]] = []
+    for name, reference_asset, observed_asset, reference_anchor, observed_anchor, semantic_basis in surfaces:
+        reference_locations = _locations(reference_asset, reference_anchor)
+        observed_locations = _locations(observed_asset, observed_anchor)
+        reference_count = sum(int(item["count"]) for item in reference_locations)
+        observed_count = sum(int(item["count"]) for item in observed_locations)
+        if reference_count > 1 or observed_count > 1:
+            status = "AMBIGUOUS"
+        elif reference_count == 1 and observed_anchor == reference_anchor:
+            status = "UNCHANGED"
+            exact_replacements.append(
+                {"name": name, "asset": reference_asset, "count": reference_count}
+            )
+        elif observed_count == 1 and observed_values is not None:
+            # A minifier can reuse the old byte sequence for an unrelated
+            # helper.  Once the observed binding is exact, the selected
+            # surface anchor is authoritative for this comparison; a single
+            # incidental reference match does not turn a known rename into a
+            # semantic change.
+            status = "RENAMED_BUT_SEMANTICALLY_EQUIVALENT"
+        elif reference_count == 1 and observed_count == 0:
+            status = "CHANGED" if observed_values is not None else "UNCHANGED"
+            if status == "UNCHANGED":
+                exact_replacements.append(
+                    {"name": name, "asset": reference_asset, "count": reference_count}
+                )
+        elif observed_count == 0 and observed_values is not None:
+            status = "CHANGED"
+        else:
+            status = "MISSING"
+        entry = {
+            "name": name,
+            "reference_asset": reference_asset,
+            "observed_asset": observed_asset,
+            "status": status,
+            "semantic_basis": semantic_basis,
+            "reference_anchor_present": reference_count == 1,
+            "observed_anchor_present": observed_count == 1,
+            "reference_count": reference_count,
+            "observed_count": observed_count,
+            "observed_assets": observed_locations,
+        }
+        surface_status.append(entry)
+        if status == "MISSING":
+            missing = result["missing_anchors"]
+            assert isinstance(missing, list)
+            missing.append({"name": name, "asset": observed_asset, "count": observed_count})
+        elif status == "AMBIGUOUS":
+            ambiguous = result["ambiguous_anchors"]
+            assert isinstance(ambiguous, list)
+            ambiguous.append({"name": name, "asset": observed_asset, "count": observed_count})
+        elif status == "CHANGED":
+            changes = result["semantic_changes"]
+            assert isinstance(changes, list)
+            changes.append({"name": name, "semantic_basis": semantic_basis})
+    result["exact_replacement_anchor_matches"] = exact_replacements
+    result["surface_status"] = surface_status
+    result["surfaces"] = {str(item["name"]): item["status"] for item in surface_status}
+    result["compatible"] = bool(
+        observed is not None
+        and not result["missing_anchors"]
+        and not result["ambiguous_anchors"]
+        and not result["semantic_changes"]
+    )
+    host_scoped = next(
+        (item for item in surface_status if item["name"] == "app-server request bridge"),
+        None,
+    )
+    result["host_scoped_rpc"] = {
+        "surface": "app-server request bridge",
+        "status": host_scoped["status"] if host_scoped is not None else "MISSING",
+        "semantic_basis": "same host-scoped AppServerManager.forHost(hostId) bridge",
+        "read_only": True,
+    }
+    return result
+
+
+def _plugin_mapping_anchors(rpc_wrapper: str, status_rpc_wrapper: str) -> tuple[str, ...]:
+    return (
+        f'"list-apps":{rpc_wrapper}((e,{{priority:t,source:n,timeoutMs:r,'
+        "trace:i,...a})=>e.sendRequest(`app/list`,a,",
+        f'"list-installed-apps":{rpc_wrapper}((e,t)=>'
+        "e.sendRequest(`app/installed`,t))",
+        f'"read-apps":{rpc_wrapper}((e,t)=>e.sendRequest(`app/read`,t))',
+        f'"login-mcp-server":{rpc_wrapper}((e,t)=>'
+        "e.sendRequest(`mcpServer/oauth/login`,t))",
+        f'"list-mcp-server-status":{status_rpc_wrapper}((e,{{priority:t,'
+        "source:n,timeoutMs:r,trace:i,...a})=>e.listMcpServers(a,",
+        "listMcpServers(e,t){let n=JSON.stringify({options:t,params:e})",
+        "let i=this.sendRequest(`mcpServerStatus/list`,e,t);",
+    )
+
+
+def _patch_legacy_renderer(
+    extracted: Path,
+    token: str,
+    variant: RendererVariant,
+    audit: list[AnchorAudit],
+) -> list[AnchorAudit]:
+    """Patch the two historical renderer contracts."""
+    values = variant.values
+    build_6662 = bool(values["build_6662"])
+    webview = extracted / "webview"
+    index_path = webview / "index.html"
+    index = index_path.read_text(encoding="utf-8")
+    connect_anchor = "connect-src &#39;self&#39;"
+    _require_unique(index, connect_anchor, "could not find ChatGPT renderer CSP connect-src")
+    index_path.write_text(index.replace(connect_anchor, f"{connect_anchor} http://127.0.0.1:{CONTROL_PORT}", 1), encoding="utf-8")
+
+    initial_bundles = list((webview / "assets").glob("app-initial-*.js"))
+    if len(initial_bundles) != 1:
+        raise RuntimeError(f"expected one ChatGPT initial renderer bundle, found {len(initial_bundles)}")
+    bundle_path = initial_bundles[0]
+    bundle = bundle_path.read_text(encoding="utf-8")
+    if "function CodexMuxAccountMenu(" in bundle:
+        raise RuntimeError("source app already contains the Codex multiplexer menu")
+    component = (PROJECT_ROOT / "ui" / "account-menu.js").read_text(encoding="utf-8")
+    component = component.replace("__CODEX_MUX_CONTROL_PORT__", str(CONTROL_PORT))
+    component = component.replace("__CODEX_MUX_CONTROL_TOKEN__", token)
+    replacements = values["component_replacements"] if "component_replacements" in values else (
+        {"e7": "$5", "kXc": "Hcl", "Lo": "Fo", "BW": "RU", "QLs": "E$s", "_H": "GV", "S2": "E0", "CH": "ZV", "jLa": "x$a", "lt": "ct"}
+        if build_6662
+        else {}
+    )
+    if replacements:
+        component = replace_javascript_identifiers(component, replacements)
+    component_anchor = str(values["component_anchor"])
+    _require_unique(bundle, component_anchor, "could not find the native ChatGPT profile menu component")
+    bundle = bundle.replace(component_anchor, component + "\n" + component_anchor, 1)
+
+    for mapping_anchor in _plugin_mapping_anchors(str(values["rpc_wrapper"]), str(values["status_rpc_wrapper"])):
+        _require_unique(bundle, mapping_anchor, "could not verify the native Plugins request-to-RPC mapping")
+    app_server_anchor = str(values["app_server_anchor"])
+    _require_unique(bundle, app_server_anchor, "could not find the native app-server request bridge")
+    bundle = bundle.replace(app_server_anchor, str(values["app_server_replacement"]), 1)
+
+    profile_query_anchor = str(values["profile_query"])
+    _require_unique(bundle, profile_query_anchor, "could not find the native profile stats request")
+    bundle = bundle.replace(profile_query_anchor, "let e=await codexMuxProfileData(globalThis.__codexMuxSelectedProfileAccountId??null)", 1)
+
+    usage_modal_anchor = str(values["usage_modal"])
+    _require_unique(bundle, usage_modal_anchor, "could not find the native Usage modal component")
+    bundle = bundle.replace(
+        usage_modal_anchor,
+        usage_modal_anchor.replace("{", "{CodexMuxUseResetAccountState();", 1),
+        1,
+    )
+
+    reset_query_anchor = str(values["reset_query"])
+    _require_unique(bundle, reset_query_anchor, "could not find the native reset-credit query")
+    reset_query_replacement = (
+        "function Ooi(){let e=window.__codexMuxResetAccountId;return It({queryKey:[`rate-limit-reset-credits`,e??`primary`],queryFn:e?()=>codexMuxRateLimitResets(e):koi,refetchInterval:Wp.ONE_MINUTE,staleTime:Wp.FIVE_SECONDS})}"
+        if build_6662
+        else "function l6r(){let e=window.__codexMuxResetAccountId;return Lt({queryKey:[`rate-limit-reset-credits`,e??`primary`],queryFn:e?()=>codexMuxRateLimitResets(e):u6r,refetchInterval:vm.ONE_MINUTE,staleTime:vm.FIVE_SECONDS})}"
+    )
+    bundle = bundle.replace(reset_query_anchor, reset_query_replacement, 1)
+
+    reset_mutation_anchor = str(values["reset_mutation"])
+    _require_unique(bundle, reset_mutation_anchor, "could not find the native reset-credit mutation")
+    reset_mutation_replacement = (
+        "function Aoi(){let e=ct(),t=Uw(),n=window.__codexMuxResetAccountId,r=[`rate-limit-reset-credits`,n??`primary`];return Qt({mutationFn:n?i=>codexMuxConsumeRateLimitReset(n,i):joi,onSuccess:(n,i)=>{let{creditId:a}=i,o=n.code;if(o===`reset`||o===`already_redeemed`){let t=o===`reset`?n.credit?.id??a:a;e.setQueryData(r,e=>eoi(e,o,t))}Promise.all([t([`rate-limit-status`]),t(r)])}})}"
+        if build_6662
+        else "function d6r(){let e=lt(),t=zO(),n=window.__codexMuxResetAccountId,r=[`rate-limit-reset-credits`,n??`primary`];return $t({mutationFn:n?i=>codexMuxConsumeRateLimitReset(n,i):f6r,onSuccess:(n,i)=>{let{creditId:a}=i,o=n.code;if(o===`reset`||o===`already_redeemed`){let t=o===`reset`?n.credit?.id??a:a;e.setQueryData(r,e=>F3r(e,o,t))}Promise.all([t([`rate-limit-status`]),t(r)])}})}"
+    )
+    bundle = bundle.replace(reset_mutation_anchor, reset_mutation_replacement, 1)
+
+    selected_usage_anchor = "let y=v;if(g!=null){"
+    _require_unique(bundle, selected_usage_anchor, "could not find the native usage-window selection")
+    bundle = bundle.replace(selected_usage_anchor, "let y=window.__codexMuxSelectedUsageWindows??v;if(g!=null){", 1)
+    usage_header_anchor = str(values["usage_header"])
+    _require_unique(bundle, usage_header_anchor, "could not find the native Usage sheet header")
+    bundle = bundle.replace(usage_header_anchor, str(values["usage_header_replacement"]), 1)
+    usage_anchor = _require_usage_value_anchor(bundle, values)
+    bundle = bundle.replace(usage_anchor, str(values["usage_slot_replacement"]), 1)
+
+    for anchor in values["open_change"]:
+        _require_unique(bundle, anchor, "could not find a native profile menu open-state hook")
+        open_name = str(values["open_name"])
+        bundle = bundle.replace(anchor, anchor.replace(f"onOpenChange:{open_name}", f"onOpenChange:CodexMuxProfileMenuOpenChange({open_name})"), 1)
+    for depleted_anchor in (
+        "defaultMessage:`You’re out of Codex and Work usage`",
+        "defaultMessage:`You’ve used all Codex and Work usage`",
+        "defaultMessage:`You’ve reached your usage limit`",
+    ):
+        _require_unique(bundle, depleted_anchor, "could not find a native subscription depletion alert")
+        bundle = bundle.replace(depleted_anchor, "defaultMessage:`All connected subscriptions are depleted`", 1)
+    bundle_path.write_text(bundle, encoding="utf-8")
+
+    profile_assets = list((webview / "assets").glob("profile-*.js"))
+    if len(profile_assets) != 1:
+        raise RuntimeError(f"expected one native Profile settings bundle, found {len(profile_assets)}")
+    profile_path = profile_assets[0]
+    profile = profile_path.read_text(encoding="utf-8")
+    for key, message in (
+        ("profile_avatar", "could not find the native Profile avatar"),
+        ("profile_name", "could not find the native Profile display name"),
+        ("profile_identity", "could not find the native Profile username and plan badge"),
+    ):
+        _require_unique(profile, str(values[key]), message)
+    profile = profile.replace(str(values["profile_avatar"]), str(values["profile_avatar_replacement"]), 1)
+    profile = profile.replace(str(values["profile_name"]), str(values["profile_name_replacement"]), 1)
+    profile = profile.replace(str(values["profile_identity"]), str(values["profile_identity_replacement"]), 1)
+    profile_path.write_text(profile, encoding="utf-8")
+
+    plugin_assets = list((webview / "assets").glob(str(values["plugin_glob"])))
+    plugin_path = _require_asset(plugin_assets, str(values["plugin_anchor"]), "could not find the native Plugins settings bundle")
+    plugin = plugin_path.read_text(encoding="utf-8")
+    _require_unique(plugin, str(values["plugin_anchor"]), "could not find the native Plugins settings content")
+    plugin_path.write_text(plugin.replace(str(values["plugin_anchor"]), str(values["plugin_replacement"]), 1), encoding="utf-8")
+
+    thread_assets = list((webview / "assets").glob("local-conversation-thread-*.js"))
+    thread_path = _require_asset(thread_assets, str(values["thread_anchor"]), "could not find the native local conversation renderer bundle")
+    thread = thread_path.read_text(encoding="utf-8")
+    thread_component = (PROJECT_ROOT / "ui" / "thread-subscription.js").read_text(encoding="utf-8")
+    thread_component = thread_component.replace("__CODEX_MUX_CONTROL_PORT__", str(CONTROL_PORT)).replace("__CODEX_MUX_CONTROL_TOKEN__", token)
+    thread_component = thread_component.replace(
+        "__CODEX_MUX_ROUTE__", "jf(Pa)" if build_6662 else "$n(sr)"
+    )
+    thread_component = thread_component.replace(
+        "__CODEX_MUX_REACT__", "jy" if build_6662 else "TE"
+    )
+    thread_component = thread_component.replace(
+        "__CODEX_MUX_JSX__", "CE" if build_6662 else "zE"
+    )
+    thread_component = thread_component.replace(
+        "__CODEX_MUX_SECTION__", "q" if build_6662 else "K"
+    )
+    _require_unique(thread, str(values["thread_anchor"]), "could not find the native thread summary sources component")
+    thread = thread.replace(str(values["thread_anchor"]), thread_component + "\n" + str(values["thread_anchor"]), 1)
+    summary_anchor = "children:[c,l,u,d,f,p,m,h,g,_,v,y,b,x]"
+    _require_unique(thread, summary_anchor, "could not find the native thread summary section list")
+    thread = thread.replace(summary_anchor, "children:[c,l,u,d,f,(0," + str(values["summary_component"]) + ".jsx)(CodexMuxThreadSubscription,{}),p,m,h,g,_,v,y,b,x]", 1)
+    thread_path.write_text(thread, encoding="utf-8")
+    return audit
+
+
+def _patch_windows_26_820_renderer(
+    extracted: Path,
+    token: str,
+    variant: RendererVariant,
+    audit: list[AnchorAudit],
+) -> list[AnchorAudit]:
+    """Patch the exact 26.820 renderer contract with fail-closed replacements."""
+    values = variant.values
+    webview = extracted / "webview"
+    index_path = webview / "index.html"
+    index = index_path.read_text(encoding="utf-8")
+    connect_anchor = "connect-src &#39;self&#39;"
+    _require_unique(index, connect_anchor, "could not find ChatGPT renderer CSP connect-src")
+    index_path.write_text(
+        index.replace(connect_anchor, f"{connect_anchor} http://127.0.0.1:{CONTROL_PORT}", 1),
+        encoding="utf-8",
+    )
+
+    assets = webview / "assets"
+    initial_bundles = list(assets.glob("app-initial-*.js"))
+    if len(initial_bundles) != 1:
+        raise RuntimeError(f"expected one ChatGPT initial renderer bundle, found {len(initial_bundles)}")
+    bundle_path = initial_bundles[0]
+    bundle = bundle_path.read_text(encoding="utf-8")
+    if "function CodexMuxAccountMenu(" in bundle:
+        raise RuntimeError("source app already contains the Codex multiplexer menu")
+
+    component = (PROJECT_ROOT / "ui" / "account-menu.js").read_text(encoding="utf-8")
+    component = component.replace("__CODEX_MUX_CONTROL_PORT__", str(CONTROL_PORT))
+    component = component.replace("__CODEX_MUX_CONTROL_TOKEN__", token)
+    component = replace_javascript_identifiers(
+        component,
+        dict(values["component_replacements"]),
+    )
+    component_anchor = str(values["component_anchor"])
+    _require_unique(bundle, component_anchor, "could not find the native ChatGPT profile menu component")
+    bundle = bundle.replace(component_anchor, component + "\n" + component_anchor, 1)
+
+    app_server_anchor = str(values["app_server_anchor"])
+    _require_unique(bundle, app_server_anchor, "could not find the native app-server request bridge")
+    # qg(scope, hostId) is deliberately left host-scoped. Account routing is
+    # added only to the explicit plugin parameter objects below.
+    bundle = bundle.replace(app_server_anchor, str(values["app_server_replacement"]), 1)
+
+    for spec in values["plugin_mappings"]:
+        current = str(spec["current"])
+        replacement = str(spec["replacement"])
+        _require_unique(bundle, current, f"could not verify the native {spec['name']}")
+        bundle = bundle.replace(current, replacement, 1)
+
+    profile_query_anchor = str(values["profile_query"])
+    _require_unique(bundle, profile_query_anchor, "could not find the native profile stats request")
+    bundle = bundle.replace(
+        profile_query_anchor,
+        "let e=await codexMuxProfileData(globalThis.__codexMuxSelectedProfileAccountId??null)",
+        1,
+    )
+
+    usage_modal_anchor = str(values["usage_modal"])
+    _require_unique(bundle, usage_modal_anchor, "could not find the native Usage modal component")
+    bundle = bundle.replace(
+        usage_modal_anchor,
+        usage_modal_anchor.replace("{", "{CodexMuxUseResetAccountState();", 1),
+        1,
+    )
+
+    reset_query_anchor = str(values["reset_query"])
+    _require_unique(bundle, reset_query_anchor, "could not find the native reset-credit query")
+    reset_query_replacement = (
+        "function WAa(){let e=window.__codexMuxResetAccountId;return "
+        "Lt({queryKey:[`rate-limit-reset-credits`,e??`primary`],"
+        "queryFn:e?()=>codexMuxRateLimitResets(e):GAa,"
+        "refetchInterval:nm.ONE_MINUTE,staleTime:nm.FIVE_SECONDS})}"
+    )
+    bundle = bundle.replace(reset_query_anchor, reset_query_replacement, 1)
+
+    reset_mutation_anchor = str(values["reset_mutation"])
+    _require_unique(bundle, reset_mutation_anchor, "could not find the native reset-credit mutation")
+    reset_mutation_replacement = (
+        "function KAa(){let e=lt(),t=AS(),n=window.__codexMuxResetAccountId,"
+        "r=[`rate-limit-reset-credits`,n??`primary`];return $t({"
+        "mutationFn:n?i=>codexMuxConsumeRateLimitReset(n,i):qAa,"
+        "onSuccess:(a,o)=>{let{creditId:s}=o,c=a.code;"
+        "if(c===`reset`||c===`already_redeemed`){let n=c===`reset`?"
+        "a.credit?.id??s:s;e.setQueryData(r,e=>gAa(e,c,n))}"
+        "Promise.all([t([`rate-limit-status`]),t(r)])}})}"
+    )
+    bundle = bundle.replace(reset_mutation_anchor, reset_mutation_replacement, 1)
+
+    selected_usage_anchor = "let y=v;if(g!=null){"
+    _require_unique(bundle, selected_usage_anchor, "could not find the native usage-window selection")
+    bundle = bundle.replace(
+        selected_usage_anchor,
+        "let y=window.__codexMuxSelectedUsageWindows??v;if(g!=null){",
+        1,
+    )
+    usage_header_anchor = str(values["usage_header"])
+    _require_unique(bundle, usage_header_anchor, "could not find the native Usage sheet header")
+    bundle = bundle.replace(
+        usage_header_anchor,
+        str(values["usage_header_replacement"]),
+        1,
+    )
+    usage_anchor = _require_usage_value_anchor(bundle, values)
+    bundle = bundle.replace(usage_anchor, str(values["usage_slot_replacement"]), 1)
+
+    for anchor in values["open_change"]:
+        _require_unique(bundle, anchor, "could not find the native profile menu open-state hook")
+        open_name = str(values["open_name"])
+        bundle = bundle.replace(
+            anchor,
+            anchor.replace(
+                f"onOpenChange:{open_name}",
+                f"onOpenChange:CodexMuxProfileMenuOpenChange({open_name})",
+            ),
+            1,
+        )
+    for depleted_anchor in (
+        "defaultMessage:`You’re out of Codex and Work usage`",
+        "defaultMessage:`You’ve used all Codex and Work usage`",
+        "defaultMessage:`You’ve reached your usage limit`",
+    ):
+        _require_unique(bundle, depleted_anchor, "could not find a native subscription depletion alert")
+        bundle = bundle.replace(
+            depleted_anchor,
+            "defaultMessage:`All connected subscriptions are depleted`",
+            1,
+        )
+    bundle_path.write_text(bundle, encoding="utf-8")
+
+    profile_assets = list(assets.glob("profile-*.js"))
+    if len(profile_assets) != 1:
+        raise RuntimeError(f"expected one native Profile settings bundle, found {len(profile_assets)}")
+    profile_path = profile_assets[0]
+    profile = profile_path.read_text(encoding="utf-8")
+    for key, message in (
+        ("profile_avatar", "could not find the native Profile avatar"),
+        ("profile_name", "could not find the native Profile display name"),
+        ("profile_identity", "could not find the native Profile username and plan badge"),
+    ):
+        _require_unique(profile, str(values[key]), message)
+    profile = profile.replace(str(values["profile_avatar"]), str(values["profile_avatar_replacement"]), 1)
+    profile = profile.replace(str(values["profile_name"]), str(values["profile_name_replacement"]), 1)
+    profile = profile.replace(str(values["profile_identity"]), str(values["profile_identity_replacement"]), 1)
+    profile_path.write_text(profile, encoding="utf-8")
+
+    plugin_assets = list(assets.glob(str(values["plugin_glob"])))
+    plugin_path = _require_asset(
+        plugin_assets,
+        str(values["plugin_anchor"]),
+        "could not find the native Plugins settings bundle",
+    )
+    plugin = plugin_path.read_text(encoding="utf-8")
+    _require_unique(plugin, str(values["plugin_anchor"]), "could not find the native Plugins settings content")
+    plugin_path.write_text(
+        plugin.replace(str(values["plugin_anchor"]), str(values["plugin_replacement"]), 1),
+        encoding="utf-8",
+    )
+
+    thread_assets = list(assets.glob("local-conversation-thread-*.js"))
+    thread_path = _require_asset(
+        thread_assets,
+        str(values["thread_anchor"]),
+        "could not find the exact 26.820 local conversation renderer bundle",
+    )
+    thread = thread_path.read_text(encoding="utf-8")
+    thread_component = (PROJECT_ROOT / "ui" / "thread-subscription.js").read_text(encoding="utf-8")
+    thread_component = thread_component.replace("__CODEX_MUX_CONTROL_PORT__", str(CONTROL_PORT))
+    thread_component = thread_component.replace("__CODEX_MUX_CONTROL_TOKEN__", token)
+    thread_component = thread_component.replace("__CODEX_MUX_ROUTE__", str(values["thread_route"]))
+    thread_component = thread_component.replace("__CODEX_MUX_REACT__", str(values["thread_react"]))
+    thread_component = thread_component.replace("__CODEX_MUX_JSX__", str(values["thread_jsx"]))
+    thread_component = thread_component.replace("__CODEX_MUX_SECTION__", str(values["thread_section"]))
+    _require_unique(thread, str(values["thread_anchor"]), "could not find the exact 26.820 thread component anchor")
+    thread = thread.replace(str(values["thread_anchor"]), thread_component + "\n" + str(values["thread_anchor"]), 1)
+    summary_anchor = str(values["thread_summary_anchor"])
+    _require_unique(thread, summary_anchor, "could not find the exact 26.820 thread summary insertion point")
+    summary_replacement = (
+        "(0,aE.jsxs)(aE.Fragment,{children:["
+        + summary_anchor
+        + ",(0,aE.jsx)(CodexMuxThreadSubscription,{conversationId:a})]})"
+    )
+    thread = thread.replace(summary_anchor, summary_replacement, 1)
+    thread_path.write_text(thread, encoding="utf-8")
+    return audit
+
+
+def _patch_windows_26_825_renderer(
+    extracted: Path,
+    token: str,
+    variant: RendererVariant,
+    audit: list[AnchorAudit],
+) -> list[AnchorAudit]:
+    """Patch the separately reviewed Windows 26.825 renderer contract."""
+
+    values = variant.values
+    webview = extracted / "webview"
+    index_path = webview / "index.html"
+    index = index_path.read_text(encoding="utf-8")
+    connect_anchor = "connect-src &#39;self&#39;"
+    _require_unique(index, connect_anchor, "could not find ChatGPT renderer CSP connect-src")
+    index_path.write_text(
+        index.replace(connect_anchor, f"{connect_anchor} http://127.0.0.1:{CONTROL_PORT}", 1),
+        encoding="utf-8",
+    )
+
+    assets = webview / "assets"
+    initial_bundles = list(assets.glob("app-initial-*.js"))
+    if len(initial_bundles) != 1:
+        raise RuntimeError(f"expected one ChatGPT initial renderer bundle, found {len(initial_bundles)}")
+    bundle_path = initial_bundles[0]
+    bundle = bundle_path.read_text(encoding="utf-8")
+    if "function CodexMuxAccountMenu(" in bundle:
+        raise RuntimeError("source app already contains the Codex multiplexer menu")
+
+    component = (PROJECT_ROOT / "ui" / "account-menu.js").read_text(encoding="utf-8")
+    component = component.replace("__CODEX_MUX_CONTROL_PORT__", str(CONTROL_PORT))
+    component = component.replace("__CODEX_MUX_CONTROL_TOKEN__", token)
+    component = replace_javascript_identifiers(
+        component,
+        dict(values["component_replacements"]),
+    )
+    component_anchor = str(values["component_anchor"])
+    _require_unique(bundle, component_anchor, "could not find the native ChatGPT profile menu component")
+    bundle = bundle.replace(component_anchor, component + "\n" + component_anchor, 1)
+
+    app_server_anchor = str(values["app_server_anchor"])
+    _require_unique(bundle, app_server_anchor, "could not find the native app-server request bridge")
+    bundle = bundle.replace(app_server_anchor, str(values["app_server_replacement"]), 1)
+
+    for spec in values["plugin_mappings"]:
+        current = str(spec["current"])
+        replacement = str(spec["replacement"])
+        _require_unique(bundle, current, f"could not verify the native {spec['name']}")
+        bundle = bundle.replace(current, replacement, 1)
+
+    profile_query_anchor = str(values["profile_query"])
+    _require_unique(bundle, profile_query_anchor, "could not find the native profile stats request")
+    bundle = bundle.replace(
+        profile_query_anchor,
+        str(
+            values.get(
+                "profile_query_replacement",
+                "async function Mbc(){let e=await "
+                "codexMuxProfileData(globalThis.__codexMuxSelectedProfileAccountId??null)",
+            )
+        ),
+        1,
+    )
+
+    usage_modal_anchor = str(values["usage_modal"])
+    _require_unique(bundle, usage_modal_anchor, "could not find the native Usage modal component")
+    bundle = bundle.replace(
+        usage_modal_anchor,
+        usage_modal_anchor.replace("{", "{CodexMuxUseResetAccountState();", 1),
+        1,
+    )
+
+    reset_query_anchor = str(values["reset_query"])
+    _require_unique(bundle, reset_query_anchor, "could not find the native reset-credit query")
+    bundle = bundle.replace(reset_query_anchor, str(values["reset_query_replacement"]), 1)
+
+    reset_mutation_anchor = str(values["reset_mutation"])
+    _require_unique(bundle, reset_mutation_anchor, "could not find the native reset-credit mutation")
+    bundle = bundle.replace(
+        reset_mutation_anchor,
+        str(values["reset_mutation_replacement"]),
+        1,
+    )
+
+    selected_usage_anchor = "let y=v;if(g!=null){"
+    _require_unique(bundle, selected_usage_anchor, "could not find the native usage-window selection")
+    bundle = bundle.replace(
+        selected_usage_anchor,
+        "let y=window.__codexMuxSelectedUsageWindows??v;if(g!=null){",
+        1,
+    )
+    usage_header_anchor = str(values["usage_header"])
+    _require_unique(bundle, usage_header_anchor, "could not find the native Usage sheet header")
+    bundle = bundle.replace(
+        usage_header_anchor,
+        str(values["usage_header_replacement"]),
+        1,
+    )
+    usage_anchor = _require_usage_value_anchor(bundle, values)
+    bundle = bundle.replace(usage_anchor, str(values["usage_slot_replacement"]), 1)
+
+    for anchor in values["open_change"]:
+        _require_unique(bundle, anchor, "could not find the native profile menu open-state hook")
+        open_name = str(values["open_name"])
+        bundle = bundle.replace(
+            anchor,
+            anchor.replace(
+                f"onOpenChange:{open_name}",
+                f"onOpenChange:CodexMuxProfileMenuOpenChange({open_name})",
+            ),
+            1,
+        )
+    for depleted_anchor in (
+        "defaultMessage:`You’re out of Codex and Work usage`",
+        "defaultMessage:`You’ve used all Codex and Work usage`",
+        "defaultMessage:`You’ve reached your usage limit`",
+    ):
+        _require_unique(bundle, depleted_anchor, "could not find a native subscription depletion alert")
+        bundle = bundle.replace(
+            depleted_anchor,
+            "defaultMessage:`All connected subscriptions are depleted`",
+            1,
+        )
+    bundle_path.write_text(bundle, encoding="utf-8")
+
+    profile_assets = list(assets.glob("profile-*.js"))
+    if len(profile_assets) != 1:
+        raise RuntimeError(f"expected one native Profile settings bundle, found {len(profile_assets)}")
+    profile_path = profile_assets[0]
+    profile = profile_path.read_text(encoding="utf-8")
+    for key, message in (
+        ("profile_avatar", "could not find the native Profile avatar"),
+        ("profile_name", "could not find the native Profile display name"),
+        ("profile_identity", "could not find the native Profile username and plan badge"),
+    ):
+        _require_unique(profile, str(values[key]), message)
+    profile = profile.replace(str(values["profile_avatar"]), str(values["profile_avatar_replacement"]), 1)
+    profile = profile.replace(str(values["profile_name"]), str(values["profile_name_replacement"]), 1)
+    profile = profile.replace(str(values["profile_identity"]), str(values["profile_identity_replacement"]), 1)
+    profile_path.write_text(profile, encoding="utf-8")
+
+    plugin_assets = list(assets.glob(str(values["plugin_glob"])))
+    plugin_path = _require_asset(
+        plugin_assets,
+        str(values["plugin_anchor"]),
+        "could not find the native Plugins settings bundle",
+    )
+    plugin = plugin_path.read_text(encoding="utf-8")
+    _require_unique(plugin, str(values["plugin_anchor"]), "could not find the native Plugins settings content")
+    plugin_path.write_text(
+        plugin.replace(str(values["plugin_anchor"]), str(values["plugin_replacement"]), 1),
+        encoding="utf-8",
+    )
+
+    thread_assets = list(assets.glob("local-conversation-thread-*.js"))
+    thread_path = _require_asset(
+        thread_assets,
+        str(values["thread_anchor"]),
+        "could not find the exact 26.825 local conversation renderer bundle",
+    )
+    thread = thread_path.read_text(encoding="utf-8")
+    thread_component = (PROJECT_ROOT / "ui" / "thread-subscription.js").read_text(encoding="utf-8")
+    thread_component = thread_component.replace("__CODEX_MUX_CONTROL_PORT__", str(CONTROL_PORT))
+    thread_component = thread_component.replace("__CODEX_MUX_CONTROL_TOKEN__", token)
+    thread_component = thread_component.replace("__CODEX_MUX_ROUTE__", str(values["thread_route"]))
+    thread_component = thread_component.replace("__CODEX_MUX_REACT__", str(values["thread_react"]))
+    thread_component = thread_component.replace("__CODEX_MUX_JSX__", str(values["thread_jsx"]))
+    thread_component = thread_component.replace("__CODEX_MUX_SECTION__", str(values["thread_section"]))
+    _require_unique(thread, str(values["thread_anchor"]), "could not find the exact 26.825 thread component anchor")
+    thread = thread.replace(str(values["thread_anchor"]), thread_component + "\n" + str(values["thread_anchor"]), 1)
+    summary_anchor = str(values["thread_summary_anchor"])
+    _require_unique(thread, summary_anchor, "could not find the exact 26.825 thread summary insertion point")
+    summary_component = str(values["summary_component"])
+    summary_replacement = (
+        f"(0,{summary_component}.jsxs)({summary_component}.Fragment,{{children:["
+        + summary_anchor
+        + f",(0,{summary_component}.jsx)(CodexMuxThreadSubscription,{{conversationId:{values['thread_conversation_id']}}})]}})"
+    )
+    thread = thread.replace(summary_anchor, summary_replacement, 1)
+    thread_path.write_text(thread, encoding="utf-8")
+    return audit
+
+
+def _syntax_error_details(output: str) -> tuple[int | None, int | None, str]:
+    """Extract only a safe location and concise parser message from Node."""
+
+    lines = output.splitlines()
+    line_number: int | None = None
+    column_number: int | None = None
+    for index, line in enumerate(lines):
+        location = re.search(r":(?P<line>\d+)(?::(?P<column>\d+))?\s*$", line.strip())
+        if location is None:
+            continue
+        line_number = int(location.group("line"))
+        if location.group("column") is not None:
+            column_number = int(location.group("column"))
+        for following in lines[index + 1 : index + 4]:
+            caret = following.find("^")
+            if caret >= 0:
+                column_number = caret + 1
+                break
+        break
+    message = "syntax check failed"
+    for line in lines:
+        match = re.search(r"SyntaxError:\s*(?P<message>.+)", line)
+        if match:
+            message = " ".join(match.group("message").split())[:300]
+            break
+    return line_number, column_number, message
+
+
+def _syntax_asset_name(path: Path, root: Path | None) -> str:
+    """Return a source-safe asset label without exposing source contents."""
+
+    if root is not None:
+        try:
+            return path.resolve(strict=False).relative_to(root.resolve(strict=False)).as_posix()
+        except ValueError:
+            pass
+    return path.name
+
+
+def validate_patched_javascript_syntax(
+    assets: Iterable[Path],
+    *,
+    root: Path | None = None,
+) -> dict[str, object]:
+    """Parse patched JavaScript assets with Node without executing them.
+
+    Renderer chunks are copied to temporary ``.mjs`` files so Node uses its
+    module grammar for the ESM-shaped assets. CommonJS bridge files retain a
+    ``.cjs`` suffix. Only a bounded parser error is returned to callers; the
+    minified source is never included in the failure message.
+    """
+
+    unique_assets: list[Path] = []
+    seen: set[Path] = set()
+    for asset in assets:
+        path = Path(asset)
+        if path.suffix.casefold() not in {".js", ".mjs", ".cjs"}:
+            continue
+        resolved = path.resolve(strict=False)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique_assets.append(path)
+    if not unique_assets:
+        raise RuntimeError(f"{RENDERER_SYNTAX_BLOCKED}: no JavaScript assets were supplied")
+
+    node = shutil.which("node")
+    if node is None:
+        raise RuntimeError(
+            f"{RENDERER_SYNTAX_BLOCKED}: asset={_syntax_asset_name(unique_assets[0], root)}; "
+            "parser=node; version=unavailable; line=unknown; column=unknown; "
+            "error=Node runtime not found"
+        )
+    try:
+        version_result = subprocess.run(
+            [node, "--version"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+        parser_version = (version_result.stdout or version_result.stderr).strip().splitlines()
+        parser_version = parser_version[0] if parser_version else "unknown"
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError(
+            f"{RENDERER_SYNTAX_BLOCKED}: asset={_syntax_asset_name(unique_assets[0], root)}; "
+            f"parser=node; version=unavailable; line=unknown; column=unknown; "
+            f"error=unable to query Node version: {' '.join(str(error).split())[:240]}"
+        ) from error
+
+    validated: list[str] = []
+    with tempfile.TemporaryDirectory(prefix=".codex-router-js-check-") as temporary:
+        temporary_root = Path(temporary)
+        for index, asset in enumerate(unique_assets):
+            display_name = _syntax_asset_name(asset, root)
+            if not asset.is_file():
+                raise RuntimeError(
+                    f"{RENDERER_SYNTAX_BLOCKED}: asset={display_name}; parser=node; version={parser_version}; "
+                    "line=unknown; column=unknown; error=asset not found"
+                )
+            suffix = ".cjs" if asset.suffix.casefold() == ".cjs" else ".mjs"
+            parse_path = temporary_root / f"asset-{index}{suffix}"
+            try:
+                shutil.copyfile(asset, parse_path)
+                checked = subprocess.run(
+                    [node, "--check", str(parse_path)],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=60,
+                )
+            except (OSError, subprocess.SubprocessError) as error:
+                raise RuntimeError(
+                    f"{RENDERER_SYNTAX_BLOCKED}: asset={display_name}; parser=node; version={parser_version}; "
+                    "line=unknown; column=unknown; "
+                    f"error=parser invocation failed: {' '.join(str(error).split())[:240]}"
+                ) from error
+            if checked.returncode != 0:
+                parser_output = checked.stderr or checked.stdout
+                line_number, column_number, message = _syntax_error_details(parser_output)
+                line_text = str(line_number) if line_number is not None else "unknown"
+                column_text = str(column_number) if column_number is not None else "unknown"
+                raise RuntimeError(
+                    f"{RENDERER_SYNTAX_BLOCKED}: asset={display_name}; parser=node; version={parser_version}; "
+                    f"line={line_text}; column={column_text}; error={message}"
+                )
+            validated.append(display_name)
+    return {
+        "status": "PASS",
+        "parser": "node",
+        "version": parser_version,
+        "validated_assets": validated,
+    }
+
+
+def patch_renderer(
+    extracted: Path,
+    token: str,
+    *,
+    renderer_variant: str | None = None,
+    package_name: str | None = None,
+    package_version: str | None = None,
+    app_asar_sha256: str | None = None,
+) -> list[AnchorAudit]:
+    """Patch renderer account/routing surfaces after exact semantic validation."""
+    audit = audit_renderer_anchors(
+        extracted,
+        renderer_variant=renderer_variant,
+        package_name=package_name,
+        package_version=package_version,
+        app_asar_sha256=app_asar_sha256,
+    )
+    failed_audit = [
+        item
+        for item in audit
+        if item.status in {"MISSING", "SEMANTICALLY_CHANGED", "CHANGED", "AMBIGUOUS"}
+    ]
+    if failed_audit:
+        details = "; ".join(
+            f"{item.name}: {item.status} ({item.asset})" for item in failed_audit
+        )
+        raise RuntimeError(f"renderer anchor audit failed: {details}")
+    if renderer_variant == renderer_26_901.CONTRACT_ID:
+        renderer_26_901.patch(extracted, token, PROJECT_ROOT, replace_javascript_identifiers)
+        return audit
+    webview = extracted / "webview"
+    initial_bundles = list((webview / "assets").glob("app-initial-*.js"))
+    if len(initial_bundles) != 1:
+        raise RuntimeError(f"expected one ChatGPT initial renderer bundle, found {len(initial_bundles)}")
+    bundle = initial_bundles[0].read_text(encoding="utf-8")
+    variant = (
+        select_renderer_contract(bundle, renderer_variant)
+        if renderer_variant is not None
+        else select_renderer_variant(
+            bundle,
+            package_name=package_name,
+            package_version=package_version,
+            app_asar_sha256=app_asar_sha256,
+        )
+    )
+    if variant.variant_id == "windows-26.820":
+        return _patch_windows_26_820_renderer(extracted, token, variant, audit)
+    if variant.variant_id == "windows-26.825":
+        return _patch_windows_26_825_renderer(extracted, token, variant, audit)
+    return _patch_legacy_renderer(extracted, token, variant, audit)
+
+
+def sha256(path: Path) -> str:
+    """Hash a generated artifact without reading any credential-bearing files."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()

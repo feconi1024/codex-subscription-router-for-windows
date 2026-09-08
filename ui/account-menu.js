@@ -1,8 +1,208 @@
+globalThis.__codexMuxRendererPatchLoaded = true;
+
 const CODEX_MUX_API = "http://127.0.0.1:__CODEX_MUX_CONTROL_PORT__/v1";
 const CODEX_MUX_TOKEN = "__CODEX_MUX_CONTROL_TOKEN__";
 let codexMuxLoginActive = false;
 
+globalThis.__codexMuxDesktopAuth = "UNKNOWN";
+globalThis.__codexMuxProfileMenuControllerReady = false;
+globalThis.__codexMuxNativeDesktopAuth = "UNKNOWN";
+const codexMuxNativeAuthHosts = new Map();
+
+// Called unconditionally by the reviewed native profile host, before its menu
+// is opened. The host also exists when signed out, so mounting is not evidence.
+function CodexMuxUseNativeAuth(auth, setOpen) {
+  const owner = kXc.useRef(null);
+  if (owner.current === null) owner.current = {};
+  const state = auth?.isLoading === false
+    ? auth.authMethod === "chatgpt"
+      ? "AUTHENTICATED"
+      : auth.requiresAuth === true && auth.authMethod == null && auth.openAIAuth == null
+        ? "AUTH_REQUIRED"
+        : "UNKNOWN"
+    : "UNKNOWN";
+  kXc.useEffect(() => {
+    function publish() {
+      const hosts = [...codexMuxNativeAuthHosts.values()];
+      const ready = hosts.find(host => host.state === "AUTHENTICATED");
+      globalThis.__codexMuxNativeDesktopAuth = ready ? "AUTHENTICATED"
+        : hosts.length > 0 && hosts.every(host => host.state === "AUTH_REQUIRED")
+          ? "AUTH_REQUIRED" : "UNKNOWN";
+      const controller = ready || hosts.at(-1);
+      globalThis.__codexMuxProfileMenuControllerReady = typeof controller?.setOpen === "function";
+      globalThis.__codexMuxOpenProfileMenuForTest = controller
+        ? () => { controller.setOpen(true); return true; } : undefined;
+      codexMuxDetectDesktopAuth();
+    }
+    codexMuxNativeAuthHosts.set(owner.current, { state, setOpen });
+    publish();
+    return () => { codexMuxNativeAuthHosts.delete(owner.current); publish(); };
+  }, [state, setOpen]);
+  return auth;
+}
+
+function codexMuxSafeRuntimeName(value, fallback) {
+  const name = typeof value === "string" ? value.trim() : "";
+  return /^[A-Za-z_$][\w$.-]{0,79}$/.test(name) ? name : fallback;
+}
+
+function codexMuxSafeSourceAsset(value) {
+  if (typeof value !== "string") return null;
+  const source = value.split(/[?#]/, 1)[0];
+  const pieces = source.split(/[\\/]/);
+  const basename = pieces[pieces.length - 1] || "";
+  return basename.length > 0 && basename.length <= 200 ? basename : null;
+}
+
+function codexMuxSafeRuntimeError(kind, errorLike) {
+  const metadata = {
+    kind: codexMuxSafeRuntimeName(kind, "error"),
+    name: "Error",
+    source_asset: null,
+    line: null,
+    column: null,
+  };
+  const candidate = errorLike && typeof errorLike === "object" ? errorLike : {};
+  metadata.name = codexMuxSafeRuntimeName(candidate.name, "Error");
+  metadata.source_asset = codexMuxSafeSourceAsset(
+    candidate.filename || candidate.sourceURL || candidate.fileName,
+  );
+  const line = candidate.lineno ?? candidate.lineNumber ?? candidate.line;
+  const column = candidate.colno ?? candidate.columnNumber ?? candidate.column;
+  if (Number.isSafeInteger(line) && line >= 0) metadata.line = line;
+  if (Number.isSafeInteger(column) && column >= 0) metadata.column = column;
+  return metadata;
+}
+
+function codexMuxRendererRuntimeSnapshot() {
+  const body = typeof document === "object" ? document.body : null;
+  const root = document.querySelector("#root") || body?.firstElementChild || null;
+  const composer = document.querySelector(
+    'textarea[placeholder],[contenteditable="true"]',
+  );
+  let visibleInteractiveCount = 0;
+  for (const element of document.querySelectorAll(
+    'button,a,input,textarea,[role="button"],[contenteditable="true"]',
+  )) {
+    const rect = element.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) visibleInteractiveCount += 1;
+  }
+  return {
+    readyState:
+      document.readyState === "loading" ||
+      document.readyState === "interactive" ||
+      document.readyState === "complete"
+        ? document.readyState
+        : "unknown",
+    rootPresent: root != null,
+    rootChildCount: root?.children?.length ?? 0,
+    bodyChildCount: body?.children?.length ?? 0,
+    buttonCount: document.querySelectorAll("button").length,
+    visibleInteractiveCount,
+    composerPresent: composer != null,
+    profileControllerReady:
+      globalThis.__codexMuxProfileMenuControllerReady === true,
+    runtimeErrorCount: Array.isArray(globalThis.__codexMuxRuntimeErrors)
+      ? globalThis.__codexMuxRuntimeErrors.length
+      : 0,
+    lastSafeRuntimeError:
+      Array.isArray(globalThis.__codexMuxRuntimeErrors) &&
+      globalThis.__codexMuxRuntimeErrors.length > 0
+        ? globalThis.__codexMuxRuntimeErrors.at(-1)
+        : null,
+  };
+}
+
+function codexMuxSetRendererRuntime(snapshot = codexMuxRendererRuntimeSnapshot()) {
+  globalThis.__codexMuxRendererRuntime = snapshot;
+  return snapshot;
+}
+
+function codexMuxSetDesktopAuth(state) {
+  globalThis.__codexMuxDesktopAuth =
+    state === "AUTHENTICATED" || state === "AUTH_REQUIRED" || state === "UNKNOWN"
+      ? state
+      : "UNKNOWN";
+  return globalThis.__codexMuxDesktopAuth;
+}
+
+function codexMuxDetectDesktopAuth() {
+  const runtime = codexMuxRendererRuntimeSnapshot();
+  const pathname =
+    typeof globalThis.location?.pathname === "string"
+      ? globalThis.location.pathname.toLowerCase()
+      : "";
+  if (/(^|\/)(auth|login|signin|sign-in)(\/|$)/.test(pathname)) {
+    return codexMuxSetDesktopAuth("AUTH_REQUIRED");
+  }
+  if (codexMuxNativeAuthHosts.size > 0) {
+    return codexMuxSetDesktopAuth(globalThis.__codexMuxNativeDesktopAuth);
+  }
+  if (
+    runtime.composerPresent && runtime.profileControllerReady
+  ) {
+    return codexMuxSetDesktopAuth("AUTHENTICATED");
+  }
+  return codexMuxSetDesktopAuth("UNKNOWN");
+}
+
+function codexMuxRecordRuntimeError(kind, errorLike) {
+  if (!Array.isArray(globalThis.__codexMuxRuntimeErrors)) {
+    globalThis.__codexMuxRuntimeErrors = [];
+  }
+  globalThis.__codexMuxRuntimeErrors.push(
+    codexMuxSafeRuntimeError(kind, errorLike),
+  );
+  if (globalThis.__codexMuxRuntimeErrors.length > 20) {
+    globalThis.__codexMuxRuntimeErrors.splice(
+      0,
+      globalThis.__codexMuxRuntimeErrors.length - 20,
+    );
+  }
+  codexMuxSetRendererRuntime();
+}
+
+function codexMuxInstallRuntimeDiagnostics() {
+  if (globalThis.__codexMuxRuntimeDiagnosticsInstalled === true) return;
+  globalThis.__codexMuxRuntimeDiagnosticsInstalled = true;
+  globalThis.__codexMuxRuntimeErrors = [];
+  globalThis.addEventListener?.("error", (event) =>
+    codexMuxRecordRuntimeError("error", {
+      name: event?.error?.name || event?.name,
+      filename: event?.filename,
+      lineno: event?.lineno,
+      colno: event?.colno,
+    }),
+  );
+  globalThis.addEventListener?.("unhandledrejection", (event) =>
+    codexMuxRecordRuntimeError("unhandledrejection", {
+      name: event?.reason?.name,
+      sourceURL: null,
+    }),
+  );
+  codexMuxSetRendererRuntime();
+}
+
+codexMuxInstallRuntimeDiagnostics();
+codexMuxSetDesktopAuth(codexMuxDetectDesktopAuth());
+globalThis.__codexMuxReadDesktopAuth = codexMuxDetectDesktopAuth;
+
 function CodexMuxProfileMenuOpenChange(setOpen) {
+  const controllerReady = typeof setOpen === "function";
+  globalThis.__codexMuxProfileMenuControllerReady = controllerReady;
+  if (controllerReady) {
+    globalThis.__codexMuxOpenProfileMenuForTest = () => {
+      try {
+        setOpen(true);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+  } else {
+    globalThis.__codexMuxOpenProfileMenuForTest = undefined;
+  }
+  codexMuxSetRendererRuntime();
   return (nextOpen) => {
     if (!nextOpen && codexMuxLoginActive) return;
     setOpen(nextOpen);
@@ -44,6 +244,26 @@ function codexMuxScopePluginRequest(method, params) {
   return { ...(params || {}), codexMuxAccountId: accountId };
 }
 
+function codexMuxSetAccountMenuState({
+  mounted,
+  accountsLoaded,
+  accountCount,
+  requestFailed,
+}) {
+  const safeAccountCount =
+    typeof accountCount === "number" &&
+    Number.isSafeInteger(accountCount) &&
+    accountCount >= 0
+      ? accountCount
+      : 0;
+  globalThis.__codexMuxAccountMenuState = {
+    mounted: mounted === true,
+    accountsLoaded: accountsLoaded === true,
+    accountCount: safeAccountCount,
+    requestFailed: requestFailed === true,
+  };
+}
+
 async function codexMuxProfileData(accountId = null) {
   const query = accountId
     ? `?accountId=${encodeURIComponent(accountId)}`
@@ -60,7 +280,7 @@ async function codexMuxRateLimitResets(accountId) {
 }
 
 async function codexMuxConsumeRateLimitReset(accountId, input) {
-  return codexMuxRequest(
+  const result = await codexMuxRequest(
     `/accounts/${encodeURIComponent(accountId)}/rate-limit-resets/consume`,
     {
       method: "POST",
@@ -70,6 +290,10 @@ async function codexMuxConsumeRateLimitReset(accountId, input) {
       }),
     },
   );
+  if (result.code === "reset" || result.code === "already_redeemed") {
+    globalThis.dispatchEvent(new Event("codex-mux-reset-updated"));
+  }
+  return result;
 }
 
 function CodexMuxUsageModal({
@@ -90,7 +314,6 @@ function CodexMuxUseResetAccountState() {
   );
   const [accounts, setAccounts] = kXc.useState(cachedAccounts);
   const [selectedId, setSelectedId] = kXc.useState("primary");
-  const [resetCounts, setResetCounts] = kXc.useState({});
   const [loading, setLoading] = kXc.useState(cachedAccounts.length === 0);
 
   const loadAccounts = kXc.useCallback(async () => {
@@ -105,21 +328,11 @@ function CodexMuxUseResetAccountState() {
         : connected[0]?.id || "primary",
     );
     setLoading(false);
-    const entries = await Promise.all(
-      connected.map(async (account) => {
-        try {
-          const resets = await codexMuxRateLimitResets(account.id);
-          return [account.id, Math.max(0, resets.available_count || 0)];
-        } catch {
-          return [account.id, null];
-        }
-      }),
-    );
-    setResetCounts(Object.fromEntries(entries));
   }, []);
 
   kXc.useEffect(() => {
-    loadAccounts().catch(() => setLoading(false));
+    const refresh = () => loadAccounts().catch(() => setLoading(false));
+    refresh();
   }, [loadAccounts]);
 
   kXc.useEffect(
@@ -143,7 +356,6 @@ function CodexMuxUseResetAccountState() {
     {
       accounts,
       loading,
-      resetCounts,
       selectedId: activeId,
       onSelect: setSelectedId,
     },
@@ -155,9 +367,33 @@ function CodexMuxResetAccountSelector({
   accounts,
   loading,
   onSelect,
-  resetCounts,
   selectedId,
 }) {
+  // The native modal memoizes its heading, including this element. Own the
+  // asynchronous counts here so they can update without a parent rerender.
+  const [resetCounts, setResetCounts] = kXc.useState({});
+  kXc.useEffect(() => {
+    let active = true;
+    let revision = 0;
+    const refresh = async () => {
+      const current = ++revision;
+      const entries = await Promise.all(accounts.map(async (account) => {
+        try {
+          const resets = await codexMuxRateLimitResets(account.id);
+          return [account.id, Math.max(0, resets.available_count || 0)];
+        } catch {
+          return [account.id, null];
+        }
+      }));
+      if (active && current === revision) setResetCounts(Object.fromEntries(entries));
+    };
+    globalThis.addEventListener("codex-mux-reset-updated", refresh);
+    refresh();
+    return () => {
+      active = false;
+      globalThis.removeEventListener("codex-mux-reset-updated", refresh);
+    };
+  }, [accounts]);
   return (0, e7.jsxs)("div", {
     className: "pt-4",
     children: [
@@ -236,19 +472,58 @@ function CodexMuxAccountMenu() {
   const [codeCopied, setCodeCopied] = kXc.useState(false);
   const loginAccountId = login?.accountId || null;
 
+  kXc.useEffect(() => {
+    codexMuxInstallRuntimeDiagnostics();
+    codexMuxSetDesktopAuth(codexMuxDetectDesktopAuth());
+    codexMuxSetRendererRuntime();
+    globalThis.__codexMuxAccountMenuMounted = true;
+    codexMuxSetAccountMenuState({
+      mounted: true,
+      accountsLoaded: false,
+      accountCount: 0,
+      requestFailed: false,
+    });
+    return () => {
+      globalThis.__codexMuxAccountMenuMounted = false;
+      codexMuxSetDesktopAuth(codexMuxDetectDesktopAuth());
+      codexMuxSetRendererRuntime();
+      codexMuxSetAccountMenuState({
+        mounted: false,
+        accountsLoaded: false,
+        accountCount: 0,
+        requestFailed: false,
+      });
+    };
+  }, []);
+
   const refresh = kXc.useCallback(async () => {
     try {
       const result = await codexMuxRequest("/accounts");
-      const nextAccounts = result.accounts || [];
-      globalThis.__codexMuxConnectedAccounts = nextAccounts.filter(
+      const nextAccounts = Array.isArray(result.accounts) ? result.accounts : [];
+      const connectedAccounts = nextAccounts.filter(
         (account) => account.connected && account.enabled,
       );
+      if (globalThis.__codexMuxAccountMenuMounted !== true) return;
+      globalThis.__codexMuxConnectedAccounts = connectedAccounts;
       setAccounts(nextAccounts);
       setError("");
+      codexMuxSetAccountMenuState({
+        mounted: true,
+        accountsLoaded: true,
+        accountCount: nextAccounts.length,
+        requestFailed: false,
+      });
       if (nextAccounts.some((account) => account.connected)) setLoading(false);
     } catch (requestError) {
+      if (globalThis.__codexMuxAccountMenuMounted !== true) return;
       setError(requestError.message);
       setLoading(false);
+      codexMuxSetAccountMenuState({
+        mounted: true,
+        accountsLoaded: false,
+        accountCount: 0,
+        requestFailed: true,
+      });
     }
   }, []);
 
@@ -424,6 +699,28 @@ function CodexMuxAccountMenu() {
         `codex-mux-account-${account.id}`,
       ),
     );
+    if (account.id !== "primary") {
+      rows.push((0, e7.jsx)(_H, {
+        disabled: busy,
+        onSelect: async (event) => {
+          event.preventDefault();
+          if (busy) return;
+          setBusy(true);
+          setError("");
+          try {
+            await codexMuxRequest(`/accounts/${encodeURIComponent(account.id)}/logout`, {
+              method: "POST",
+            });
+            await refresh();
+          } catch (requestError) {
+            setError(requestError.message);
+          } finally {
+            setBusy(false);
+          }
+        },
+        children: `Log out ${account.label}`,
+      }, `codex-mux-logout-${account.id}`));
+    }
   }
 
   if (login) {
@@ -606,6 +903,52 @@ function CodexMuxOverlappingAvatars({ accounts, size = "size-20" }) {
   });
 }
 
+function codexMuxDepletionMessage(error) {
+  const message = typeof error === "string" ? error : error?.message;
+  return typeof message === "string" &&
+    /^All connected subscriptions are depleted\.(?: Add another subscription or wait for usage to reset\.| Usage resets on [^\r\n]{1,160}\.)$/.test(message)
+    ? message : null;
+}
+
+globalThis.codexMuxDepletionMessage = codexMuxDepletionMessage;
+
+function codexMuxPublishProfileSelection(accountId) {
+  globalThis.__codexMuxSelectedProfileAccountId = accountId;
+  globalThis.dispatchEvent(new Event("codex-mux-profile-selection"));
+}
+
+function codexMuxProfileSelection() {
+  const selectedId = globalThis.__codexMuxSelectedProfileAccountId || null;
+  const accounts = globalThis.__codexMuxCombinedProfileAccounts || [];
+  return { selectedId, account: accounts.find(account => account.id === selectedId) || null };
+}
+
+function CodexMuxUseProfileSelection() {
+  const [selection, setSelection] = kXc.useState(codexMuxProfileSelection);
+  kXc.useEffect(() => {
+    const refresh = () => setSelection(codexMuxProfileSelection());
+    globalThis.addEventListener("codex-mux-profile-selection", refresh);
+    refresh();
+    return () => globalThis.removeEventListener("codex-mux-profile-selection", refresh);
+  }, []);
+  return selection;
+}
+
+function CodexMuxProfilePlanBadge() {
+  const { selectedId, account } = CodexMuxUseProfileSelection();
+  return (0, e7.jsx)("span", {
+    className: "text-xs text-token-text-secondary",
+    children: selectedId ? account?.planLabel || account?.planType || "" : "Combined profile",
+  });
+}
+
+function CodexMuxProfileActions({ children }) {
+  const { selectedId } = CodexMuxUseProfileSelection();
+  // Native profile writes still target the Desktop's primary credentials.
+  // Only expose those actions while actually viewing that account.
+  return selectedId === "primary" ? children : null;
+}
+
 function CodexMuxProfileAvatarStack({ onSelect }) {
   const [accounts, setAccounts] = kXc.useState(
     globalThis.__codexMuxCombinedProfileAccounts || [],
@@ -623,6 +966,7 @@ function CodexMuxProfileAvatarStack({ onSelect }) {
         );
         globalThis.__codexMuxCombinedProfileAccounts = connected;
         setAccounts(connected);
+        codexMuxPublishProfileSelection(globalThis.__codexMuxSelectedProfileAccountId || null);
       })
       .catch(() => {});
     return () => {
@@ -630,11 +974,12 @@ function CodexMuxProfileAvatarStack({ onSelect }) {
     };
   }, []);
   kXc.useEffect(() => {
-    globalThis.__codexMuxSelectedProfileAccountId = null;
+    codexMuxPublishProfileSelection(null);
     setSelectedId(null);
     onSelect?.();
     return () => {
-      globalThis.__codexMuxSelectedProfileAccountId = null;
+      codexMuxPublishProfileSelection(null);
+      onSelect?.();
     };
   }, []);
   if (accounts.length === 0) return null;
@@ -666,7 +1011,7 @@ function CodexMuxProfileAvatarStack({ onSelect }) {
               : account.label,
             onClick: () => {
               const nextId = selectedId === account.id ? null : account.id;
-              globalThis.__codexMuxSelectedProfileAccountId = nextId;
+              codexMuxPublishProfileSelection(nextId);
               setSelectedId(nextId);
               onSelect?.();
             },
@@ -683,10 +1028,24 @@ function CodexMuxProfileAvatarStack({ onSelect }) {
   });
 }
 
+function codexMuxPluginQueryFilter() {
+  return { predicate: query => ["apps", "plugins", "mcp"].includes(query.queryKey?.[0]) };
+}
+
+async function codexMuxChangePluginScope(queryClient, accountId) {
+  const filter = codexMuxPluginQueryFilter();
+  // Cancel old account requests before clearing cached connection data. An
+  // invalidation alone leaves the previous account's connections on screen.
+  await queryClient.cancelQueries(filter);
+  globalThis.__codexMuxPluginAccountId = accountId;
+  await queryClient.resetQueries(filter);
+}
+
 function CodexMuxPluginScope() {
   const [accounts, setAccounts] = kXc.useState([]);
   const [selectedId, setSelectedId] = kXc.useState("primary");
   const [loading, setLoading] = kXc.useState(true);
+  const [switching, setSwitching] = kXc.useState(false);
   const queryClient = lt();
   kXc.useEffect(() => {
     let live = true;
@@ -709,22 +1068,23 @@ function CodexMuxPluginScope() {
   }, []);
 
   kXc.useEffect(() => {
-    globalThis.__codexMuxPluginAccountId = selectedId;
+    globalThis.__codexMuxPluginAccountId = "primary";
     return () => {
       delete globalThis.__codexMuxPluginAccountId;
+      // Returning to native screens must not reuse a secondary account cache.
+      queryClient.resetQueries(codexMuxPluginQueryFilter()).catch(() => {});
     };
-  }, [selectedId]);
+  }, [queryClient]);
 
   async function selectAccount(accountId) {
-    if (accountId === selectedId) return;
-    globalThis.__codexMuxPluginAccountId = accountId;
-    setSelectedId(accountId);
-    await queryClient.invalidateQueries({
-      predicate: (query) => {
-        const root = query.queryKey?.[0];
-        return root === "apps" || root === "plugins" || root === "mcp";
-      },
-    });
+    if (accountId === selectedId || switching) return;
+    setSwitching(true);
+    try {
+      await codexMuxChangePluginScope(queryClient, accountId);
+      setSelectedId(accountId);
+    } finally {
+      setSwitching(false);
+    }
   }
 
   const selected =
@@ -769,6 +1129,7 @@ function CodexMuxPluginScope() {
                       : "text-token-text-secondary hover:bg-token-foreground/5",
                   ].join(" "),
                   "aria-pressed": active,
+                  disabled: switching,
                   onClick: () => selectAccount(account.id),
                   children: [
                     (0, e7.jsx)(CodexMuxAccountAvatar, {
@@ -798,5 +1159,10 @@ globalThis.CodexMuxAccountAvatar = CodexMuxAccountAvatar;
 globalThis.codexMuxProfileData = codexMuxProfileData;
 globalThis.CodexMuxProfileAvatarStack = (props) =>
   (0, e7.jsx)(CodexMuxProfileAvatarStack, props || {});
+
+globalThis.CodexMuxProfilePlanBadge = () =>
+  (0, e7.jsx)(CodexMuxProfilePlanBadge, {});
+globalThis.CodexMuxProfileActions = (children) =>
+  (0, e7.jsx)(CodexMuxProfileActions, { children });
 globalThis.CodexMuxPluginScope = () =>
   (0, e7.jsx)(CodexMuxPluginScope, {});

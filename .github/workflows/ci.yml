@@ -2,8 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - "codex/**"
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -61,7 +64,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31d06c5925ef5d2fc7ad053ef454303e # v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
           cache: false
@@ -72,5 +75,41 @@ jobs:
       - name: Vet Go packages
         run: go vet ./...
 
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "22.12"
+          package-manager-cache: false
+
+      - name: Install ASAR build dependency
+        run: npm ci --ignore-scripts
+
       - name: Build codex-mux
         run: go build ./cmd/codex-mux
+
+      - name: Build Windows launcher
+        run: go build ./cmd/codex-router-launcher
+
+      - name: Check Windows patcher syntax
+        run: python -m compileall -q scripts
+
+      - name: Test Windows patcher helpers
+        shell: pwsh
+        run: |
+          $output = @(& python -m unittest discover -s scripts/tests -p "test_*.py" 2>&1)
+          $exitCode = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          if ($exitCode -ne 0) {
+            $details = ($output |
+              Where-Object { $_ -match 'FAIL|ERROR|Traceback|AssertionError|Ran |FAILED' } |
+              ForEach-Object { $_.ToString().Trim() }) -join ' | '
+            if ([string]::IsNullOrWhiteSpace($details)) {
+              $details = "Windows helper tests exited with code $exitCode"
+            }
+            $details = $details.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            if ($details.Length -gt 6000) {
+              $details = $details.Substring(0, 6000)
+            }
+            Write-Output "::error file=scripts/tests/test_windows_desktop.py::$details"
+            exit $exitCode
+          }

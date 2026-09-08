@@ -1,0 +1,227 @@
+{
+  "schema_version": 1,
+  "package_version": "26.901.4073.0",
+  "initial_sha256": "06091fcbb8bb045acb081d0efb9aae67864c4e6313685b04ee30ed231cf0fd35",
+  "assets": {
+    "webview/assets/app-initial-d2e74794629d.js": "06091fcbb8bb045acb081d0efb9aae67864c4e6313685b04ee30ed231cf0fd35",
+    "webview/assets/app-primary-809d1fa17f2d.js": "266a0e23ae0bca2069a97e5783c9dc98f3119d229923b061f44a2cbfa8fb24cf",
+    "webview/assets/profile-4f666da923e4.js": "33d4e46175eec6f6248d98165eeeb119cd5a900326dc2d47d8699b5f2f7e0d3c",
+    "webview/assets/plugins-page-9d09e36b8f32.js": "859bc6d6d555688d104902268dfd29e40c9c9c087d342e6bebfdfe704f8d6910",
+    "webview/assets/local-conversation-thread-981fc52ad9d4.js": "76ea2d972dfbf1f4885d061e8b034d3194c4e86951e9bc9ee71aac957516a8e7"
+  },
+  "primary": "webview/assets/app-primary-809d1fa17f2d.js",
+  "thread": "webview/assets/local-conversation-thread-981fc52ad9d4.js",
+  "component_replacements": {
+    "e7": "dY",
+    "kXc": "Rmn",
+    "Lo": "Dv",
+    "Q": "Nb",
+    "BW": "tu",
+    "QLs": "oq",
+    "_H": "ia",
+    "S2": "Iq",
+    "CH": "yo",
+    "jLa": "yV",
+    "lt": "cv"
+  },
+  "operations": [
+    {
+      "asset": "webview/assets/app-primary-809d1fa17f2d.js",
+      "name": "native authentication provider lifecycle",
+      "old": "openAIAuth:v}=Np(),{data:y}=tm()",
+      "new": "openAIAuth:v}=CodexMuxUseNativeAuth(Np(),c),{data:y}=tm()"
+    },
+    {
+      "asset": "webview/assets/app-primary-809d1fa17f2d.js",
+      "name": "native account menu value",
+      "old": "usageItems:wt",
+      "new": "usageItems:(globalThis.__codexMuxAccountMenuInjected=true,(0,dY.jsx)(CodexMuxAccountMenu,{}))"
+    },
+    {
+      "asset": "webview/assets/app-primary-809d1fa17f2d.js",
+      "name": "native menu login dismissal",
+      "old": "sideOffset:6,triggerButton:Ot,onOpenChange:c,children:[F,null]",
+      "new": "sideOffset:6,triggerButton:Ot,onOpenChange:CodexMuxProfileMenuOpenChange(c),children:[F,null]"
+    },
+    {
+      "asset": "webview/assets/app-primary-809d1fa17f2d.js",
+      "name": "native usage dialog lifecycle",
+      "old": "function oq(e){let t=(0,Ion.c)(20),",
+      "new": "function oq(e){CodexMuxUseResetAccountState();let t=[],"
+    },
+    {
+      "asset": "webview/assets/app-primary-809d1fa17f2d.js",
+      "name": "selected subscription usage",
+      "old": "let y=v;if(g!=null){",
+      "new": "let y=window.__codexMuxSelectedUsageWindows??v;if(g!=null){"
+    },
+    {
+      "asset": "webview/assets/app-primary-809d1fa17f2d.js",
+      "name": "usage dialog remount on subscription selection",
+      "old": "onClose:g,onResetCredit:v}),t[13]=n",
+      "new": "onClose:g,onResetCredit:v},window.__codexMuxResetAccountId??`primary`),t[13]=n"
+    },
+    {
+      "asset": "webview/assets/app-primary-809d1fa17f2d.js",
+      "name": "usage account selector",
+      "old": "he=(0,aq.jsx)(by,{title:(0,aq.jsx)(dw,{asChild:!0,children:(0,aq.jsx)(`h2`,{className:`m-0`,children:(0,aq.jsx)(Q,{id:`codex.rateLimitResetPromptModal.usageTrackingHeading`,defaultMessage:`Usage`,description:`Heading for the Codex usage limit modal`})})})}),",
+      "new": "he=(0,aq.jsxs)(aq.Fragment,{children:[(0,aq.jsx)(by,{title:(0,aq.jsx)(dw,{asChild:!0,children:(0,aq.jsx)(`h2`,{className:`m-0`,children:(0,aq.jsx)(Q,{id:`codex.rateLimitResetPromptModal.usageTrackingHeading`,defaultMessage:`Usage`,description:`Heading for the Codex usage limit modal`})})})}),globalThis.__codexMuxResetAccountSelector??null]}),"
+    },
+    {
+      "asset": "webview/assets/app-primary-809d1fa17f2d.js",
+      "name": "pooled depletion message: You’re out of Codex and Work usage",
+      "old": "defaultMessage:`You’re out of Codex and Work usage`",
+      "new": "defaultMessage:`All connected subscriptions are depleted`"
+    },
+    {
+      "asset": "webview/assets/app-primary-809d1fa17f2d.js",
+      "name": "pooled depletion message: You’ve used all Codex and Work usage",
+      "old": "defaultMessage:`You’ve used all Codex and Work usage`",
+      "new": "defaultMessage:`All connected subscriptions are depleted`"
+    },
+    {
+      "asset": "webview/assets/app-primary-809d1fa17f2d.js",
+      "name": "pooled depletion message: You’ve reached your usage limit",
+      "old": "defaultMessage:`You’ve reached your usage limit`",
+      "new": "defaultMessage:`All connected subscriptions are depleted`"
+    },
+    {
+      "asset": "webview/assets/app-initial-d2e74794629d.js",
+      "name": "account scoped profile data",
+      "old": "async function qzs(){let e=await SO.safeGet(`/wham/profiles/me`)",
+      "new": "async function qzs(){let e=await globalThis.codexMuxProfileData(globalThis.__codexMuxSelectedProfileAccountId??null)"
+    },
+    {
+      "asset": "webview/assets/app-initial-d2e74794629d.js",
+      "name": "account scoped reset query",
+      "old": "function y2i(){let e=(0,NK.c)(1);qR(),xb(null);let t;return e[0]===Symbol.for(`react.memo_cache_sentinel`)?(t={queryKey:[`rate-limit-reset-credits`],queryFn:x2i,select:b2i,refetchInterval:lD.ONE_MINUTE,staleTime:lD.FIVE_SECONDS},e[0]=t):t=e[0],Ab(t)}",
+      "new": "function y2i(){qR();xb(null);let e=window.__codexMuxResetAccountId;return Ab({queryKey:[`rate-limit-reset-credits`,e??`primary`],queryFn:e?()=>globalThis.codexMuxRateLimitResets(e):x2i,select:b2i,refetchInterval:lD.ONE_MINUTE,staleTime:lD.FIVE_SECONDS})}"
+    },
+    {
+      "asset": "webview/assets/app-initial-d2e74794629d.js",
+      "name": "account scoped reset mutation",
+      "old": "function S2i(){let e=(0,NK.c)(3),t=Eb(),n=sD(),r;return e[0]!==n||e[1]!==t?(r={mutationFn:C2i,onSuccess:(e,r)=>{let{creditId:i}=r,a=e.code;if(a===`reset`||a===`already_redeemed`){let n=e.code===`reset`?e.credit?.id??i:i;t.setQueryData([`rate-limit-reset-credits`],e=>a0i(e,a,n))}Promise.all([n([`rate-limit-status`]),n([`rate-limit-reset-credits`])])}},e[0]=n,e[1]=t,e[2]=r):r=e[2],Nb(r)}",
+      "new": "function S2i(){let e=Eb(),t=sD(),n=window.__codexMuxResetAccountId,r=[`rate-limit-reset-credits`,n??`primary`];return Nb({mutationFn:n?i=>globalThis.codexMuxConsumeRateLimitReset(n,i):C2i,onSuccess:(a,o)=>{let{creditId:i}=o,c=a.code;if(c===`reset`||c===`already_redeemed`){let n=c===`reset`?a.credit?.id??i:i;e.setQueryData(r,e=>a0i(e,c,n))}Promise.all([t([`rate-limit-status`]),t(r)])}})}"
+    },
+    {
+      "asset": "webview/assets/app-initial-d2e74794629d.js",
+      "name": "list-installed-apps account scope",
+      "old": "Ib(e,n).sendRequest(`app/installed`,t?{forceRefresh:!0}:{})",
+      "new": "Ib(e,n).sendRequest(`app/installed`,globalThis.codexMuxScopePluginRequest(\"list-installed-apps\",t?{forceRefresh:!0}:{}))"
+    },
+    {
+      "asset": "webview/assets/app-initial-d2e74794629d.js",
+      "name": "read-apps account scope",
+      "old": "Ib(e,n).sendRequest(`app/read`,{appIds:t})",
+      "new": "Ib(e,n).sendRequest(`app/read`,globalThis.codexMuxScopePluginRequest(\"read-apps\",{appIds:t}))"
+    },
+    {
+      "asset": "webview/assets/app-initial-d2e74794629d.js",
+      "name": "list-apps account scope",
+      "old": "Ib(e,n).sendRequest(`app/list`,{cursor:i,limit:abi,forceRefetch:t},{trace:a})",
+      "new": "Ib(e,n).sendRequest(`app/list`,globalThis.codexMuxScopePluginRequest(\"list-apps\",{cursor:i,limit:abi,forceRefetch:t}),{trace:a})"
+    },
+    {
+      "asset": "webview/assets/app-initial-d2e74794629d.js",
+      "name": "login-mcp-server account scope",
+      "old": "t.sendRequest(`mcpServer/oauth/login`,e)",
+      "new": "t.sendRequest(`mcpServer/oauth/login`,globalThis.codexMuxScopePluginRequest(\"login-mcp-server\",e))"
+    },
+    {
+      "asset": "webview/assets/app-initial-d2e74794629d.js",
+      "name": "list-mcp-server-status account scope",
+      "old": "Ib(e,t).listMcpServers({cursor:i,detail:n,limit:100},r===void 0?void 0:{trace:r})",
+      "new": "Ib(e,t).listMcpServers(globalThis.codexMuxScopePluginRequest(\"list-mcp-server-status\",{cursor:i,detail:n,limit:100}),r===void 0?void 0:{trace:r})"
+    },
+    {
+      "asset": "webview/assets/plugins-page-9d09e36b8f32.js",
+      "name": "plugin account picker",
+      "old": "contentAfterConnected:(0,$.jsxs)($.Fragment,{children:[",
+      "new": "contentAfterConnected:(0,$.jsxs)($.Fragment,{children:[globalThis.CodexMuxPluginScope?.()??null,"
+    },
+    {
+      "asset": "webview/assets/profile-4f666da923e4.js",
+      "name": "profile account picker",
+      "old": "avatar:(0,$.jsxs)($.Fragment,{children:[(0,$.jsxs)(`label`,{\"aria-disabled\":I.isPending,className:T(`group relative flex size-20 rounded-full outline-none focus-within:ring-1 focus-within:ring-ring`,",
+      "new": "avatar:(0,$.jsxs)($.Fragment,{children:[globalThis.CodexMuxProfileAvatarStack?.({onSelect:()=>A.refetch()})??null,(0,$.jsxs)(`label`,{\"aria-disabled\":I.isPending,className:T(globalThis.CodexMuxProfileAvatarStack?`hidden`:`group relative flex size-20 rounded-full outline-none focus-within:ring-1 focus-within:ring-ring`,"
+    },
+    {
+      "asset": "webview/assets/profile-4f666da923e4.js",
+      "name": "combined profile name",
+      "old": "displayName:Re??(0,$.jsx)(J,{id:`profile.nameFallback`,defaultMessage:`ChatGPT user`,description:`Fallback profile display name`})",
+      "new": "displayName:globalThis.__codexMuxSelectedProfileAccountId?Re??(0,$.jsx)(J,{id:`profile.nameFallback`,defaultMessage:`ChatGPT user`,description:`Fallback profile display name`}):null"
+    },
+    {
+      "asset": "webview/assets/profile-4f666da923e4.js",
+      "name": "combined profile username",
+      "old": "username:Ie==null?null:(0,$.jsx)(J,{id:`profile.usernameValue`,defaultMessage:`@{username}`,description:`Profile username shown with an at-sign prefix`,values:{username:Ie}})",
+      "new": "username:globalThis.__codexMuxSelectedProfileAccountId&&Ie!=null?(0,$.jsx)(J,{id:`profile.usernameValue`,defaultMessage:`@{username}`,description:`Profile username shown with an at-sign prefix`,values:{username:Ie}}):null"
+    },
+    {
+      "asset": "webview/assets/local-conversation-thread-981fc52ad9d4.js",
+      "name": "thread owner independent of source count",
+      "old": "function Zw(e){let t=(0,tT.c)(58),",
+      "new": "function Zw(e){return (0,rT.jsxs)(rT.Fragment,{children:[(0,rT.jsx)(CodexMuxNativeSources,e),(0,rT.jsx)(CodexMuxThreadSubscription,{})]})}function CodexMuxNativeSources(e){let t=(0,tT.c)(58),"
+    },
+    {
+      "name": "manage plugins account picker",
+      "asset": "webview/assets/plugins-page-9d09e36b8f32.js",
+      "old": "children:U?(0,$.jsxs)(Te,{embedded:!0,fullWidth:d,className:Se(!d&&`h-full overflow-y-auto p-panel [scrollbar-gutter:stable]`),children:[",
+      "new": "children:U?(0,$.jsxs)(Te,{embedded:!0,fullWidth:d,className:Se(!d&&`h-full overflow-y-auto p-panel [scrollbar-gutter:stable]`),children:[globalThis.CodexMuxPluginScope?.()??null,"
+    },
+    {
+      "name": "selected profile plan badge",
+      "asset": "webview/assets/profile-4f666da923e4.js",
+      "old": "account:We==null?null:(0,$.jsx)(la,{accountLabel:We}),avatar:",
+      "new": "account:globalThis.CodexMuxProfilePlanBadge?.()??null,avatar:"
+    },
+    {
+      "name": "primary only profile mutation controls",
+      "asset": "webview/assets/profile-4f666da923e4.js",
+      "old": "className:`-me-2 flex items-center gap-2 no-drag`,children:[st,ct,ft,_t]",
+      "new": "className:`-me-2 flex items-center gap-2 no-drag`,children:globalThis.CodexMuxProfileActions?.([st,ct,ft,_t])??null"
+    },
+    {
+      "asset": "webview/assets/app-primary-809d1fa17f2d.js",
+      "name": "preserve settled depletion error j",
+      "old": "e.set(Qa,o,{...j,status:`failed`})",
+      "new": "e.set(Qa,o,{...j,status:`failed`,codexMuxError:globalThis.codexMuxDepletionMessage(t.message)})"
+    },
+    {
+      "asset": "webview/assets/app-primary-809d1fa17f2d.js",
+      "name": "preserve settled depletion error N",
+      "old": "e.set(Qa,o,{...N,status:`failed`})",
+      "new": "e.set(Qa,o,{...N,status:`failed`,codexMuxError:globalThis.codexMuxDepletionMessage(t.message)})"
+    },
+    {
+      "asset": "webview/assets/app-primary-809d1fa17f2d.js",
+      "name": "preserve local task depletion error",
+      "old": "catch(t){if(L||await U(),o!=null&&!L){let t=e.get(Qa,o);t!=null&&e.set(Qa,o,e.get(dTe,o)==null?{...t,status:`failed`}:null)}",
+      "new": "catch(codexMuxError){let t=codexMuxError;if(L||await U(),o!=null&&!L){let t=e.get(Qa,o);t!=null&&e.set(Qa,o,e.get(dTe,o)==null?{...t,status:`failed`,codexMuxError:globalThis.codexMuxDepletionMessage(codexMuxError)}:null)}"
+    },
+    {
+      "asset": "webview/assets/app-primary-809d1fa17f2d.js",
+      "name": "preserve projectless depletion error",
+      "old": "catch(t){throw y||(await E(),o!=null&&x!=null&&e.get(Qa,o)===x&&e.set(Qa,o,{...x,status:`failed`})),t}",
+      "new": "catch(t){throw y||(await E(),o!=null&&x!=null&&e.get(Qa,o)===x&&e.set(Qa,o,{...x,status:`failed`,codexMuxError:globalThis.codexMuxDepletionMessage(t)})),t}"
+    },
+    {
+      "asset": "webview/assets/local-conversation-thread-981fc52ad9d4.js",
+      "name": "render actionable subscription depletion reason",
+      "old": "(0,dO.jsx)(J,{id:`localConversation.pendingProjectless.failed`,defaultMessage:`Could not start this chat`,description:`Error shown when a pending projectless conversation cannot be created`})",
+      "new": "(l.codexMuxError??(0,dO.jsx)(J,{id:`localConversation.pendingProjectless.failed`,defaultMessage:`Could not start this chat`,description:`Error shown when a pending projectless conversation cannot be created`}))"
+    },
+    {
+      "asset": "webview/assets/local-conversation-thread-981fc52ad9d4.js",
+      "name": "refresh failed task reason when pending state changes",
+      "old": "t[22]!==l.status||t[23]!==o?",
+      "new": "t[22]!==l||t[23]!==o?"
+    },
+    {
+      "asset": "webview/assets/local-conversation-thread-981fc52ad9d4.js",
+      "name": "cache failed task state with its reason",
+      "old": "t[22]=l.status,t[23]=o,t[24]=b",
+      "new": "t[22]=l,t[23]=o,t[24]=b"
+    }
+  ]
+}

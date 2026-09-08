@@ -2,7 +2,8 @@
 
 ![Multi-subscription account menu](screenshots/account-menu.png)
 
-Use multiple ChatGPT subscriptions from one independent macOS desktop app.
+Use multiple ChatGPT subscriptions from one independent macOS desktop app or
+the Windows Desktop MVP.
 
 Codex Subscription Router creates a locally patched copy of the official
 ChatGPT app, balances new chats across connected subscriptions, and keeps every
@@ -155,6 +156,30 @@ python3 scripts/patch_app.py --allow-adhoc-signing
 ```
 
 Appshots and Computer Use may not function with an ad-hoc signature.
+
+## Windows Desktop MVP (development build)
+
+The Windows Desktop MVP creates a writable local copy without modifying the
+official installation or taking ownership of `WindowsApps`. It discovers the
+per-user native Codex binary automatically when possible; explicit paths are
+useful for development:
+
+```powershell
+npm ci --ignore-scripts
+python scripts/patch_app_windows.py `
+  --source 'C:\path\to\package' `
+  --real-codex "$env:LOCALAPPDATA\OpenAI\Codex\bin\<version>\codex.exe" `
+  --destination "$env:LOCALAPPDATA\Codex Subscription Router" `
+  --allow-untested-source
+```
+
+The development override is required until the exact Windows package/version
+and `app.asar` hash have been manually audited and recorded in
+[WINDOWS-COMPATIBILITY.md](docs/WINDOWS-COMPATIBILITY.md). The generated tree
+contains `Codex Subscription Router.exe`, the patched desktop under `app\`,
+and `codex-mux.exe` plus the byte-identical real Codex binary under `runtime\`.
+Windows signing, Computer Use, Appshots, and final GUI validation are deferred
+to later phases.
 
 ## Grant macOS permissions
 
