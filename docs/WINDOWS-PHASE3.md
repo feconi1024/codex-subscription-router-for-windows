@@ -53,7 +53,7 @@ contracts without changing the official installation.
 
 | Area | Required evidence | Current result |
 | --- | --- | --- |
-| Source review | Exact identity, anchors, integrity, immutable input | Pending |
+| Source review | Exact identity, anchors, integrity, immutable input | 26.901.6511.0 static review passes; see source report |
 | Core | Phase 2 matrix on final build | Pending |
 | Native runtime | Matching content, signatures, sandbox, helper lifecycle | Pending |
 | Computer Use | Primary/secondary, sticky follow-ups, concurrency, recovery | Pending |
@@ -77,7 +77,21 @@ keeps official sandbox/code-mode siblings next to the CLI.
 
 At this checkpoint all Go tests/vet and 159 Python tests pass. Official staged
 Node/module resolution smoke passes. This is not native Desktop or two-account
-acceptance. 26.901.6511.0 still needs a new reviewed renderer binding.
+acceptance. 26.901.6511.0 has an exact reviewed renderer binding, with all 33
+replacement anchors matched and all five patched JavaScript assets passing
+syntax checks. See [the source review](WINDOWS-PHASE3-SOURCE-6511.md).
+
+The per-user installer, Start Menu ownership checks, optional project signing,
+and persistent signing/native requirements are implemented. Native installation
+testing found Store-host filesystem redirection and PowerShell ACL writes that
+requested audit privileges. Initialization now reports redirected roots; private
+state uses the DACL-only Windows API, with read-back verification.
+
+On 2026-09-08, the current host's Computer Use JavaScript tool failed before
+initialization with `failed to write kernel assets: ... (os error 3)`. Reset and
+one retry produced the same result. The session was reset again; no UI input or
+authentication occurred. This is a host-tool blocker, not evidence that the
+Router helper passed or failed native operations.
 
 Generated host evidence belongs in ignored docs/generated. Never commit tokens,
 profiles, OpenAI executables, ASAR archives or runtime payloads. Log out accounts

@@ -1907,12 +1907,16 @@ def build_windows_desktop(
         raise
     with tempfile.TemporaryDirectory(prefix=".codex-router-windows-", dir=destination.parent) as temporary:
         temporary_root = Path(temporary)
-        staged = temporary_root / destination.name
+        # Managed builds have a unique final directory and remain unreachable
+        # until maintenance seals them and atomically replaces current.json.
+        # Do not rename an entire native runtime tree after executing its Node
+        # smoke: Windows scanners may retain handles to those binaries.
+        staged = destination if production_data_root is not None else temporary_root / destination.name
         staged_app = staged / "app"
         staged_resources = staged_app / "resources"
         staged_runtime = staged / "runtime"
         extracted = temporary_root / "asar"
-        staged.mkdir(parents=True, exist_ok=True)
+        staged.mkdir(parents=True, exist_ok=production_data_root is None)
         try:
             mirror_report = mirror_desktop_source(source, staged_app, plan=mirror_plan)
         except StorageBlockedError as error:
@@ -2145,13 +2149,15 @@ def build_windows_desktop(
             "control_token": staged_control_token,
         }
         validate_staged_layout(required_layout)
-        backup = _atomic_install(
-            staged,
-            destination,
-            force,
-            policy=install_policy,
-            router_root=(destination.parent if persistent_mux_home is not None else None),
-        )
+        backup = None
+        if production_data_root is None:
+            backup = _atomic_install(
+                staged,
+                destination,
+                force,
+                policy=install_policy,
+                router_root=(destination.parent if persistent_mux_home is not None else None),
+            )
     print(f"Windows Desktop staged at {destination}")
     if backup is not None:
         print(f"Previous local build moved to {backup}")

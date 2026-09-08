@@ -12,7 +12,7 @@ import urllib.error
 import urllib.request
 
 from .discovery import inventory_processes_under_root, terminate_processes_under_root
-from .managed_paths import reject_reparse
+from .managed_paths import atomic_json, reject_reparse
 from .private_state import secure_directory
 
 
@@ -23,6 +23,8 @@ def startup_smoke(layout, build, *, timeout: float = 60) -> dict:
             if probe.connect_ex(("127.0.0.1", port)) == 0:
                 raise RuntimeError(f"startup smoke requires an unused local port {port}")
     reject_reparse(layout.data)
+    diagnostics = layout.data / "logs"
+    secure_directory(diagnostics)
     # This profile has no OAuth material. Only the renderer's shared local
     # control token is used to verify the bridge, and is never logged.
     with tempfile.TemporaryDirectory(prefix=".startup-smoke-", dir=layout.data) as temporary:
@@ -53,6 +55,7 @@ def startup_smoke(layout, build, *, timeout: float = 60) -> dict:
                                        cwd=build / "app", env=env, stdout=log, stderr=log,
                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             observed = None
+            last_debug = {}
             graceful = False
             try:
                 deadline = time.monotonic() + timeout
@@ -62,8 +65,9 @@ def startup_smoke(layout, build, *, timeout: float = 60) -> dict:
                     try:
                         state = request("/v1/test/app-state?debug=1&delayMs=0")
                         debug = state.get("debug", {})
+                        last_debug = debug
                         runtime = debug.get("renderer_runtime") or {}
-                        if debug.get("runtime_errors"):
+                        if debug.get("runtime_errors") or runtime.get("runtimeErrorCount", 0):
                             raise RuntimeError("staged Desktop reported renderer errors")
                         if debug.get("readyState") == "complete" and runtime.get("rootChildCount", 0) > 0:
                             observed = {"status": "PASS", "renderer": "READY", "profile": "ISOLATED_UNAUTHENTICATED",
@@ -89,6 +93,12 @@ def startup_smoke(layout, build, *, timeout: float = 60) -> dict:
                         pass
                 if inventory_processes_under_root(build):
                     raise RuntimeError("staged Desktop cleanup failed; build was not activated")
+                log.flush()
+                shutil.copyfile(root / "desktop.log", diagnostics / (build.name + "-startup.log"))
+                atomic_json(diagnostics / (build.name + "-startup.json"), {
+                    "status": "PASS" if observed and graceful else "FAIL",
+                    "graceful_exit": graceful, "renderer_debug": last_debug,
+                    "profile": "ISOLATED_UNAUTHENTICATED"})
             if not graceful:
                 raise RuntimeError("staged Desktop required forced cleanup; build was not activated")
             return {**observed, "graceful_exit": "PASS"}

@@ -23,6 +23,13 @@ The state root is mode `0700`; state, config, and control-token files are mode
 `0600`. Existing control tokens are validated as 256-bit hexadecimal values and
 their permissions are repaired on startup.
 
+On Windows, Router state directories and token/state files use protected DACLs
+granting access to the current Windows user and SYSTEM. Managed account and
+desktop data live outside versioned builds. The account boundary is logical
+isolation within one Windows user; it is not protection against that same user
+or an administrator. The local renderer necessarily contains its loopback
+control token; build inventories must not be published.
+
 Plugin and MCP configuration is deliberately synchronized from the Primary
 account so installed definitions remain consistent. Inline environment values
 inside those definitions are therefore copied into every isolated account home
@@ -49,6 +56,21 @@ application-group and keychain entitlements are removed from modified callers.
 The native helper's caller allowlist is patched to the selected team and the
 independent desktop bundle ID. This is required for the helper's peer checks;
 it does not bypass macOS Accessibility or Screen Recording consent.
+
+The Windows path preserves the official native helper and runtime bytes and
+verifies their signatures and complete file inventory. It does not change the
+helper protocol or bypass official feature gates. Optional Windows signing
+applies only to the project launcher and multiplexer, with a user-supplied
+code-signing certificate. A patched official desktop executable may no longer
+have a valid original Authenticode signature; its reviewed ASAR integrity
+metadata is updated locally and its sealed build inventory is checked during
+maintenance. The official installation is never modified.
+
+Windows updates create a new build, run an isolated unauthenticated startup
+probe, and atomically select it only after validation. Unknown official sources
+require review. Failed builds cannot be selected by rollback without a passing
+seal. These checks detect accidental corruption; a locally writable manifest
+is not a signature or a defense against an attacker already running as the user.
 
 ## Diagnostics
 

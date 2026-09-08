@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.windows.managed_paths import Layout, atomic_json, build_id, maintenance_lock
-from scripts.windows.maintenance import activate, seal_build, verify_build, uninstall, rollback, initialize
+from scripts.windows.maintenance import activate, seal_build, verify_build, uninstall, rollback, initialize, install_launcher
 from scripts.windows.computer_use import identity, validate
 
 
@@ -146,6 +146,23 @@ class MaintenanceTests(unittest.TestCase):
         atomic_json(root / "build-manifest.json", manifest)
         with self.assertRaisesRegex(RuntimeError, "invalid manifest"):
             verify_build(root)
+
+    def test_launcher_update_is_deferred_only_during_launch(self):
+        old, new = self.build("old"), self.build("new")
+        install_launcher(self.layout, old)
+        installed = self.layout.root / "Codex Subscription Router.exe"
+        install_launcher(self.layout, new, on_launch=True)
+        self.assertEqual(installed.read_text(), "old")
+        install_launcher(self.layout, new)
+        self.assertEqual(installed.read_text(), "new")
+
+    def test_failed_private_directory_setup_can_be_retried(self):
+        other = self.layout.root / "fresh"
+        with mock.patch("scripts.windows.maintenance.secure_directory", side_effect=RuntimeError("DACL failure")):
+            with self.assertRaisesRegex(RuntimeError, "DACL failure"):
+                initialize(other)
+        self.assertEqual(initialize(other), Layout(other))
+        self.assertIsNone(Layout.load(other).current())
 
 
 class RuntimeTests(unittest.TestCase):
