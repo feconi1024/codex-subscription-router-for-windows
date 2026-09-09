@@ -2067,10 +2067,12 @@ def build_windows_desktop(
         if include_computer_use:
             try:
                 try:
-                    from .windows.computer_use import acquire, smoke
+                    from .windows.computer_use import acquire, acquire_codex_resources, smoke
                 except ImportError:
-                    from windows.computer_use import acquire, smoke
+                    from windows.computer_use import acquire, acquire_codex_resources, smoke
+                codex_resources = acquire_codex_resources(real.path, staged_resources, real.sha256)
                 native_runtime = acquire(source.resources_dir, staged_resources / "cua_node", source.package.architecture)
+                native_runtime["codex_resources"] = codex_resources
                 native_runtime["smoke"] = smoke(staged_resources / "cua_node")
             except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
                 # Preserve multi-account Desktop availability if an optional

@@ -121,6 +121,16 @@ of that authentication, two-account routing and Router-originated Computer Use
 remain pending. Earlier unknown authentication and minimized-window HTTP 500
 results are not evidence of a missing renderer patch.
 
+Two authenticated accounts (Plus and Free) subsequently appeared in the menu.
+The usage selector changed from the primary account's weekly/short windows to
+the secondary account's monthly window and correctly separated their available
+reset counts; no reset was consumed. Both accounts and the test conversation
+survived a normal quit/restart. The Router-originated native test could not run
+because bundled skills/tools were absent. Its old scratch result is not counted
+as a new pass. Investigation found the missing `resources/codex.exe` lookup
+described in the source review. The resource-layout fix passes 166 Python tests
+(three skipped); rebuilt native acceptance remains required.
+
 Generated host evidence belongs in ignored docs/generated. Never commit tokens,
 profiles, OpenAI executables, ASAR archives or runtime payloads. Log out accounts
 added during acceptance and release desktop control after each native test run.

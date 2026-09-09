@@ -10,7 +10,7 @@ from unittest import mock
 from scripts.windows.managed_paths import Layout, atomic_json, build_id, maintenance_lock
 from scripts.windows.maintenance import activate, seal_build, verify_build, uninstall, rollback, initialize, install_launcher, reconcile
 from scripts.windows.discovery import sha256_file
-from scripts.windows.computer_use import identity, validate
+from scripts.windows.computer_use import identity, validate, acquire_codex_resources, CODEX_RESOURCE_FILES
 
 
 class MaintenanceTests(unittest.TestCase):
@@ -209,6 +209,52 @@ class MaintenanceTests(unittest.TestCase):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_bundled_plugin_cli_lookup_has_complete_matching_runtime(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "official"
+            destination = Path(temporary) / "app/resources"
+            source.mkdir()
+            destination.mkdir(parents=True)
+            for name in CODEX_RESOURCE_FILES:
+                (source / name).write_text("official " + name)
+            # The shell mirror can already contain the sibling executables.
+            sibling = "codex-code-mode-host.exe"
+            (destination / sibling).write_bytes((source / sibling).read_bytes())
+            with mock.patch("scripts.windows.computer_use.read_authenticode",
+                            return_value=SimpleNamespace(status="Valid", signer="OpenAI")):
+                report = acquire_codex_resources(source / "codex.exe", destination,
+                                                 sha256_file(source / "codex.exe"))
+            self.assertEqual(report["status"], "VERIFIED")
+            for name in CODEX_RESOURCE_FILES:
+                self.assertEqual((destination / name).read_bytes(), (source / name).read_bytes())
+
+    def test_bundled_cli_rejects_mixed_runtime_before_copying(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "official"
+            destination = Path(temporary) / "resources"
+            source.mkdir()
+            destination.mkdir()
+            for name in CODEX_RESOURCE_FILES:
+                (source / name).write_text(name)
+            (destination / "codex-code-mode-host.exe").write_text("different version")
+            with mock.patch("scripts.windows.computer_use.read_authenticode",
+                            return_value=SimpleNamespace(status="Valid", signer="OpenAI")):
+                with self.assertRaisesRegex(RuntimeError, "differs"):
+                    acquire_codex_resources(source / "codex.exe", destination,
+                                            sha256_file(source / "codex.exe"))
+            self.assertFalse((destination / "codex.exe").exists())
+
+    def test_bundled_cli_rejects_untrusted_signature(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "codex.exe"
+            source.write_text("untrusted")
+            destination = Path(temporary) / "resources"
+            with mock.patch("scripts.windows.computer_use.read_authenticode",
+                            return_value=SimpleNamespace(status="Valid", signer="Other")):
+                with self.assertRaisesRegex(RuntimeError, "signature"):
+                    acquire_codex_resources(source, destination, sha256_file(source))
+            self.assertFalse(destination.exists())
+
     def test_runtime_identity_changes_when_repl_changes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

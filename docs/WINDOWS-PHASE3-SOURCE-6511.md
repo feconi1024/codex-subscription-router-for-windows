@@ -27,6 +27,17 @@ identity is b474a88d5d105afa, matching the manifest/Node/REPL fingerprints of
 this official package. Executable signatures validate as OpenAI. Node can
 resolve @oai/sky from that runtime.
 
+Authenticated testing also exposed a second native lookup: bundled plugin
+reconciliation prepares the Chrome app-server runtime before installing any
+plugin. `main-DpnWwRdP.js` calls the shared module's `ln` export (`LX`), which
+resolves `resources/codex.exe` through `pZ` and `nL`. The routed app-server
+environment override does not satisfy this lookup. Omitting that executable
+left the marketplace present but all bundled plugins, including Computer Use,
+uninstalled. Native builds now supply the selected official CLI and its three
+Windows helper siblings in `app/resources`, checking OpenAI signatures and
+byte identity and rejecting mixed versions. The Desktop app-server entry point
+continues to use the Router multiplexer.
+
 Windows Appshots code exists, including capture, frontmost-window and hotkey
 handlers. Current source disables appshotsEnabled for non-internal Windows
 builds. Router preserves that official availability decision; no feature gate

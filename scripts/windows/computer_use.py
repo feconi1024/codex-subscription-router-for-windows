@@ -17,6 +17,41 @@ from .discovery import read_authenticode, sha256_file
 from .managed_paths import reject_reparse
 
 IDENTITY_FILES = ("manifest.json", "bin/node.exe", "bin/node_repl.exe")
+CODEX_RESOURCE_FILES = ("codex.exe", "codex-code-mode-host.exe",
+                        "codex-windows-sandbox-setup.exe", "codex-command-runner.exe")
+
+
+def acquire_codex_resources(real: Path, destination: Path, expected_cli_sha256: str) -> dict:
+    """Preserve the native CLI lookup used before bundled plugin installation.
+
+    Desktop's plugin reconciler resolves resources/codex.exe independently of
+    the routed app-server override. Its Chrome runtime preparation runs before
+    *any* bundled plugin is installed, including Computer Use.
+    """
+    reject_reparse(destination)
+    sources = {name: real if name == "codex.exe" else real.parent / name
+               for name in CODEX_RESOURCE_FILES}
+    expected = {}
+    for name, source in sources.items():
+        reject_reparse(source)
+        signature = read_authenticode(source)
+        if signature.status.casefold() != "valid" or "openai" not in (signature.signer or "").casefold():
+            raise RuntimeError(f"invalid official bundled CLI signature: {name}")
+        expected[name] = sha256_file(source)
+        target = destination / name
+        reject_reparse(target)
+        if target.exists() and sha256_file(target) != expected[name]:
+            raise RuntimeError(f"bundled CLI resource differs from selected runtime: {name}")
+    if expected["codex.exe"] != expected_cli_sha256:
+        raise RuntimeError("selected Codex CLI changed before resource acquisition")
+    destination.mkdir(parents=True, exist_ok=True)
+    for name, source in sources.items():
+        target = destination / name
+        if not target.exists():
+            protected_copy(source, target)
+        if sha256_file(target) != expected[name] or sha256_file(source) != expected[name]:
+            raise RuntimeError(f"bundled CLI resource changed during acquisition: {name}")
+    return {"status": "VERIFIED", "layout": "app/resources", "files": expected}
 
 
 def inventory(root: Path) -> dict[str, str]:
