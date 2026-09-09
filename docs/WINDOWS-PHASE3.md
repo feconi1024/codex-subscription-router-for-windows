@@ -131,6 +131,24 @@ as a new pass. Investigation found the missing `resources/codex.exe` lookup
 described in the source review. The resource-layout fix passes 166 Python tests
 (three skipped); rebuilt native acceptance remains required.
 
+Commit `29a1b93` passes CI. Its rebuilt native installation passed startup,
+sandbox and graceful-exit checks; authenticated startup then installed the
+bundled plugins successfully, including Computer Use. The resumed original
+test retained its primary-account ownership and loaded `@oai/sky`, but restoring
+the scratch window failed with `GetCursorPos` access denied (`0x80070005`).
+No native text-entry result was produced. The supervising official helper also
+failed initialization with deny-read ACL / incomplete sandbox setup errors.
+The input desktop was `Default` and the screen saver was not running. These
+failures remain unresolved; native acceptance is not marked PASS.
+
+Both test subscriptions were logged out through Router's account API and
+verified with `connected=false` and no authentication type. The secondary
+logout reset the HTTP connection, so its side effect was checked before any
+retry; it had succeeded. The scratch process was closed, Computer Use sessions
+were reset, and the logged-out Router received a normal quit request. Unexpected
+`%SystemDrive%` sandbox artifacts were moved from the repository root into
+ignored diagnostics after checking their paths and absence of reparse points.
+
 Generated host evidence belongs in ignored docs/generated. Never commit tokens,
 profiles, OpenAI executables, ASAR archives or runtime payloads. Log out accounts
 added during acceptance and release desktop control after each native test run.
