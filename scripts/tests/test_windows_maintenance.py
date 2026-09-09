@@ -1,5 +1,6 @@
 """Failure-oriented tests using synthetic payloads, never official binaries."""
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -163,6 +164,23 @@ class MaintenanceTests(unittest.TestCase):
                 initialize(other)
         self.assertEqual(initialize(other), Layout(other))
         self.assertIsNone(Layout.load(other).current())
+
+    @unittest.skipUnless(os.name == "nt", "Windows short paths")
+    def test_short_path_parent_is_not_mistaken_for_store_redirection(self):
+        import ctypes
+        parent = self.layout.root / "Long Router Installation Parent"
+        parent.mkdir()
+        api = ctypes.WinDLL("kernel32", use_last_error=True).GetShortPathNameW
+        api.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+        api.restype = ctypes.c_uint32
+        buffer = ctypes.create_unicode_buffer(32768)
+        if not api(str(parent), buffer, len(buffer)) or "~" not in buffer.value:
+            self.skipTest("volume does not provide 8.3 names")
+        short_root = Path(buffer.value) / "fresh"
+        with mock.patch("scripts.windows.maintenance.secure_directory"):
+            installed = initialize(short_root)
+        self.assertEqual(installed.root, parent / "fresh")
+        self.assertEqual(Layout.load(short_root), installed)
 
 
 class RuntimeTests(unittest.TestCase):

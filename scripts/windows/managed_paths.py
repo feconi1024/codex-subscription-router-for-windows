@@ -14,6 +14,28 @@ PRODUCT = "Codex Subscription Router"
 BUILD_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}\Z")
 
 
+def expand_short_path(path: Path) -> Path:
+    """Expand Windows 8.3 names without resolving filesystem redirection."""
+    if os.name != "nt" or not any("~" in part for part in path.parts):
+        return path
+    import ctypes
+    existing, missing = path, []
+    while not existing.exists() and existing.parent != existing:
+        missing.append(existing.name)
+        existing = existing.parent
+    api = ctypes.WinDLL("kernel32", use_last_error=True).GetLongPathNameW
+    api.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+    api.restype = ctypes.c_uint32
+    size = api(str(existing), None, 0)
+    if not size:
+        raise ctypes.WinError(ctypes.get_last_error())
+    buffer = ctypes.create_unicode_buffer(size)
+    written = api(str(existing), buffer, size)
+    if not written or written >= size:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return Path(buffer.value).joinpath(*reversed(missing))
+
+
 def reject_reparse(path: Path) -> None:
     """Inspect lexical components before resolve() can conceal a junction."""
     for candidate in (path, *path.parents):
@@ -57,6 +79,7 @@ class Layout:
     def __post_init__(self):
         root = Path(os.path.abspath(self.root.expanduser()))
         reject_reparse(root)
+        root = expand_short_path(root)
         if root == Path(root.anchor) or any(p.casefold() == "windowsapps" for p in root.parts):
             raise ValueError("installation must be outside WindowsApps and filesystem roots")
         if self.data_directory not in {"Data", "_validation-profile"}:
