@@ -108,8 +108,18 @@ layout and private DACL checks with zero remaining processes. Running-process
 maintenance refusal also passed. An explicit update of an unchanged pinned
 build exposed a resume bug, now fixed with a regression test.
 
-CI for commit `6f4b3dd` passed on both macOS and Windows. Final authenticated
+CI for commit `f112072` passed on both macOS and Windows. Final authenticated
 account/native acceptance and CI for subsequent changes remain required.
+
+After restoring the minimized test window on 2026-09-09, the authenticated
+Codex-mode profile menu passed native observation and click checks. The Router
+menu rendered one connected subscription and its usage. The diagnostic bridge
+confirmed the renderer patch, mounted account menu, successful account loading,
+`AUTHENTICATED` state, a ready profile controller and zero renderer runtime
+errors. The second-subscription device sign-in entry also appeared. Completion
+of that authentication, two-account routing and Router-originated Computer Use
+remain pending. Earlier unknown authentication and minimized-window HTTP 500
+results are not evidence of a missing renderer patch.
 
 Generated host evidence belongs in ignored docs/generated. Never commit tokens,
 profiles, OpenAI executables, ASAR archives or runtime payloads. Log out accounts
