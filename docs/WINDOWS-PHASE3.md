@@ -58,8 +58,8 @@ contracts without changing the official installation.
 | Native runtime | Matching content, signatures, sandbox, helper lifecycle | Pending |
 | Computer Use | Primary/secondary, sticky follow-ups, concurrency, recovery | Pending |
 | Appshots | Official availability comparison and capture where available | Pending |
-| Maintenance | Install, reconcile, interrupted update, rollback, repair | Transaction fixtures pass; native pending |
-| State | No credentials in builds; private DACLs; state survives update | Pending |
+| Maintenance | Install, reconcile, interrupted update, rollback, repair | Native install, repair, rollback, rollback pin and running-process refusal pass; full matrix in progress |
+| State | No credentials in builds; private DACLs; state survives update | Native private DACLs and sealed payload checks pass; authenticated persistence pending |
 | Uninstall | Keep-data default; explicit purge; active-process refusal | Pending |
 | Release | CI, source-only packaging, signing verification if configured | Pending |
 
@@ -75,7 +75,7 @@ Reconciliation compares exact source, native CLI, Router tooling and control-tok
 digests. Runtime acquisition verifies the whole CUA tree and signatures, and
 keeps official sandbox/code-mode siblings next to the CLI.
 
-At this checkpoint all Go tests/vet and 159 Python tests pass. Official staged
+At this checkpoint all Go tests/vet and 163 Python tests pass. Official staged
 Node/module resolution smoke passes. This is not native Desktop or two-account
 acceptance. 26.901.6511.0 has an exact reviewed renderer binding, with all 33
 replacement anchors matched and all five patched JavaScript assets passing
@@ -92,6 +92,24 @@ initialization with `failed to write kernel assets: ... (os error 3)`. Reset and
 one retry produced the same result. The session was reset again; no UI input or
 authentication occurred. This is a host-tool blocker, not evidence that the
 Router helper passed or failed native operations.
+
+On 2026-09-09, initialization recovered. A disposable local window passed
+observation, click and text-entry checks through the official helper after app
+access approval. Importing the copied JavaScript package still used the host's
+official helper, so it is not counted as Router helper end-to-end acceptance.
+Scratch windows were closed and the Computer Use session was reset.
+
+Native managed installs of 26.901.6511.0 passed the isolated unauthenticated
+renderer startup and graceful-exit checks without disabling the sandbox. A
+real repair produced a second sealed build; rollback selected the earlier build,
+launch-time reconcile returned `ROLLBACK_PINNED`, and the newer build could be
+selected again. `doctor` passed payload, CLI signature, stable launcher, state
+layout and private DACL checks with zero remaining processes. Running-process
+maintenance refusal also passed. An explicit update of an unchanged pinned
+build exposed a resume bug, now fixed with a regression test.
+
+CI for commit `6f4b3dd` passed on both macOS and Windows. Final authenticated
+account/native acceptance and CI for subsequent changes remain required.
 
 Generated host evidence belongs in ignored docs/generated. Never commit tokens,
 profiles, OpenAI executables, ASAR archives or runtime payloads. Log out accounts

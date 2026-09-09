@@ -181,6 +181,11 @@ def reconcile(layout: Layout, *, source_path: Path | None = None, real_path: Pat
                     and (not require_native or metadata.get("computer_use", {}).get("status") == "VERIFIED")
                     and metadata.get("control_token_sha256") == sha256_file(layout.data / "mux-home/control-token")):
                 install_launcher(layout, layout.build(previous["build"]), on_launch=on_launch)
+                if not on_launch and previous.get("auto_update") is False:
+                    # An explicit update also resumes updates when the selected
+                    # build already matches every input. Reuse the inventory
+                    # verification performed above under this same lock.
+                    previous = activate(layout, previous["build"], validate=lambda _: current)
                 return {"status": "UNCHANGED", "current": previous}
         require_idle(layout)
         _verify_official(source.executable)

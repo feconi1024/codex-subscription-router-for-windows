@@ -3,11 +3,13 @@ import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
 from scripts.windows.managed_paths import Layout, atomic_json, build_id, maintenance_lock
-from scripts.windows.maintenance import activate, seal_build, verify_build, uninstall, rollback, initialize, install_launcher
+from scripts.windows.maintenance import activate, seal_build, verify_build, uninstall, rollback, initialize, install_launcher, reconcile
+from scripts.windows.discovery import sha256_file
 from scripts.windows.computer_use import identity, validate
 
 
@@ -156,6 +158,29 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(installed.read_text(), "old")
         install_launcher(self.layout, new)
         self.assertEqual(installed.read_text(), "new")
+
+    def test_explicit_unchanged_update_releases_rollback_pin(self):
+        root = self.build("same")
+        token = self.layout.data / "mux-home/control-token"
+        token.parent.mkdir()
+        token.write_text("synthetic-test-token")
+        atomic_json(root / "metadata.json", {
+            "real_codex_sha256": "real", "tooling_sha256": "tools",
+            "control_token_sha256": sha256_file(token)})
+        identity = {"version": "same"}
+        seal_build(root, identity, {"status": "PASS"})
+        activate(self.layout, "same", auto_update=False)
+        with mock.patch.multiple("scripts.windows.maintenance",
+                locate_desktop_source=mock.Mock(return_value=object()),
+                source_identity=mock.Mock(return_value=identity),
+                find_reviewed_source=mock.Mock(return_value={}),
+                reviewed_source_is_patchable=mock.Mock(return_value=(True, "reviewed")),
+                discover_real_codex=mock.Mock(return_value=(SimpleNamespace(sha256="real"), None)),
+                tooling_digest=mock.Mock(return_value="tools")):
+            result = reconcile(self.layout)
+        self.assertEqual(result["status"], "UNCHANGED")
+        self.assertNotEqual(result["current"].get("auto_update"), False)
+        self.assertEqual(self.layout.current(), result["current"])
 
     def test_failed_private_directory_setup_can_be_retried(self):
         other = self.layout.root / "fresh"
