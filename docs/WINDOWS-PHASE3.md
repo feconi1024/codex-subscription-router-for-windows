@@ -59,8 +59,8 @@ contracts without changing the official installation.
 | Computer Use | Primary/secondary, sticky follow-ups, concurrency, recovery | Pending |
 | Appshots | Official availability comparison and capture where available | Pending |
 | Maintenance | Install, reconcile, interrupted update, rollback, repair | Native install, repair, rollback, rollback pin and running-process refusal pass; full matrix in progress |
-| State | No credentials in builds; private DACLs; state survives update | Native private DACLs and sealed payload checks pass; authenticated persistence pending |
-| Uninstall | Keep-data default; explicit purge; active-process refusal | Pending |
+| State | No credentials in builds; private DACLs; state survives update | Native private DACLs and sealed payload checks pass; two authenticated accounts and task survived restart; final-build regression pending |
+| Uninstall | Keep-data default; explicit purge; active-process refusal | Actual keep-data uninstall/reinstall preserved 11,610 entries; native synthetic purge passed; active maintenance refusal covered earlier |
 | Release | CI, source-only packaging, signing verification if configured | Pending |
 
 ## Implementation checkpoint
@@ -161,3 +161,21 @@ That version-specific binding is corrected, and a generated-component execution
 test exercises populated subscription data across all three reviewed versions.
 All 167 Python tests pass in the native user context. Full authenticated UI and
 Computer Use acceptance remain pending; this does not authorize a merge.
+
+Commit `1dc3bdc` passes CI. The logged-out native installation was uninstalled
+with data retention: all 11,610 data files and links matched the prior inventory,
+and an unknown sentinel file survived. Plugin links were recorded without
+following their targets. A separate native Windows fixture passed explicit
+data purge and unknown-file preservation; that result is not a real-profile
+purge test. Reinstallation into the retained installation selected build
+`26.901.6511.0-e75bae2b-ce75edb120f2`; isolated unauthenticated startup, enabled
+sandbox and normal exit passed. Post-reinstall comparison found zero missing
+or changed entries in the 11,610-entry baseline, and the unknown file survived.
+Doctor passed payload, official CLI signature, launcher, state layout and DACL
+checks, with zero remaining processes. Project signing remains unconfigured.
+
+On the next resumed run, supervising Computer Use failed before initialization
+with `failed to write kernel assets: ... (os error 3)`. Reset and one retry
+returned the same error; the session was reset again. No desktop input or new
+authentication occurred. The final native and authenticated regression gates
+remain incomplete.
