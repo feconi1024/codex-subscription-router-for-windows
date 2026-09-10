@@ -152,3 +152,12 @@ ignored diagnostics after checking their paths and absence of reparse points.
 Generated host evidence belongs in ignored docs/generated. Never commit tokens,
 profiles, OpenAI executables, ASAR archives or runtime payloads. Log out accounts
 added during acceptance and release desktop control after each native test run.
+
+The corrected runtime's post-exit doctor reports PASS for payload, official CLI
+signature, launcher, state layout and private DACL, with zero processes.
+Inspection of the authenticated local-thread log found React error 130 in the
+subscription section: the 6511 binding used `Q.Section` instead of `Z.Section`.
+That version-specific binding is corrected, and a generated-component execution
+test exercises populated subscription data across all three reviewed versions.
+All 167 Python tests pass in the native user context. Full authenticated UI and
+Computer Use acceptance remain pending; this does not authorize a merge.

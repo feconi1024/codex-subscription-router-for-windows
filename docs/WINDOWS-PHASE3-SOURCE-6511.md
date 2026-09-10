@@ -43,6 +43,13 @@ handlers. Current source disables appshotsEnabled for non-internal Windows
 builds. Router preserves that official availability decision; no feature gate
 or consent is bypassed.
 
+Authenticated local-thread inspection exposed a second binding change:
+the summary section namespace is `Z` in this build, rather than `Q` in the
+two earlier reviewed builds. The thread patch now selects that namespace from
+the version manifest. Executing the generated component with a populated
+account covers the previously missed branch that raised React error 130;
+all three reviewed bindings pass. Native authenticated revalidation is pending.
+
 PATCHABLE records source review only. Native Desktop, two-account Computer Use,
 Appshots availability comparison, and complete Phase 3 acceptance are pending.
 Local detailed audit artifacts remain under ignored docs/generated.

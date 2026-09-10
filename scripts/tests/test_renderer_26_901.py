@@ -1,5 +1,7 @@
 import hashlib
 import json
+import shutil
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -9,6 +11,43 @@ from scripts.windows import renderer_26_901 as renderer
 
 
 class ExactRendererTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('node'), 'Node.js is required for renderer execution')
+    def test_authenticated_thread_renders_with_each_reviewed_section_namespace(self):
+        project = Path(__file__).resolve().parents[2]
+        # Names observed in the reviewed source bundles, independent of the
+        # patcher's binding. An unauthenticated render returns before using it.
+        for manifest, namespace in [('renderer_26_901.json', 'Q'),
+                                    ('renderer_26_901_5280.json', 'Q'),
+                                    ('renderer_26_901_6511.json', 'Z')]:
+            with self.subTest(manifest=manifest), tempfile.TemporaryDirectory() as directory:
+                spec = json.loads(Path(renderer.__file__).with_name(manifest).read_text(encoding='utf-8'))
+                root = Path(directory)
+                for name in spec['assets']:
+                    target = root / name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text('', encoding='utf-8')
+                (root / 'webview/index.html').write_text("connect-src &#39;self&#39;", encoding='utf-8')
+                with patch.object(renderer, 'contract', return_value=spec), patch.object(renderer, 'audit', return_value=[]):
+                    renderer.patch(root, 'test-token', project, lambda text, _: text)
+                component = (root / spec['thread']).read_text(encoding='utf-8')
+                harness = '''
+const assert = require('node:assert/strict');
+const section = () => {};
+const Q = NAMESPACE === 'Q' ? {Section: section} : {};
+const Z = {Section: section};
+const Ei = () => null, Fo = () => null, Ml = () => null, ou = {}, Mr = {}, Cc = {};
+const nT = {useState: () => [{label: 'Test subscription', rateLimits: {primary: {usedPercent: 25}}}, () => {}], useEffect: () => {}};
+const jsx = (type, props) => {assert.ok(type, 'undefined React component'); return {type, props};};
+const rT = {jsx, jsxs: jsx};
+'''.replace('NAMESPACE', json.dumps(namespace))
+                result = subprocess.run(['node', '-e', harness + component + '''
+const rendered = CodexMuxThreadSubscription({conversationId: 'test-thread'});
+assert.equal(rendered.type, section);
+assert.equal(rendered.props.sectionKey, 'codex-mux-subscription');
+assert.equal(rendered.props.children.props.children[1].props.children, '75% remaining');
+'''], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_reviewed_manifests_bind_every_operation_to_a_hashed_asset(self):
         for path in Path(renderer.__file__).parent.glob('renderer_26_901*.json'):
             with self.subTest(binding=path.name):

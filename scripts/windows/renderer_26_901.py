@@ -86,7 +86,7 @@ globalThis.codexMuxScopePluginRequest = (method, params) => {
     thread = (project_root / "ui/thread-subscription.js").read_text(encoding="utf-8")
     for old, new in {"__CODEX_MUX_CONTROL_PORT__": "48123", "__CODEX_MUX_CONTROL_TOKEN__": token,
                      "__CODEX_MUX_ROUTE__": spec.get("thread_route", "Ei(ou)"), "__CODEX_MUX_REACT__": "nT",
-                     "__CODEX_MUX_JSX__": "rT", "__CODEX_MUX_SECTION__": "Q"}.items():
+                     "__CODEX_MUX_JSX__": "rT", "__CODEX_MUX_SECTION__": spec.get("thread_section", "Q")}.items():
         thread = thread.replace(old, new)
     texts[spec["thread"]] += "\n" + thread
     index_path = extracted / "webview/index.html"

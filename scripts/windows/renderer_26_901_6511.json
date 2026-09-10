@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "package_version": "26.901.6511.0",
+  "thread_section": "Z",
   "initial_sha256": "44ceeb9cadac569f6217e288c0e09fceeca712d749862887ea36baf6019ea966",
   "assets": {
     "webview/assets/app-initial-f87238153a19.js": "44ceeb9cadac569f6217e288c0e09fceeca712d749862887ea36baf6019ea966",
