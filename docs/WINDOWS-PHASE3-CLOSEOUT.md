@@ -35,6 +35,12 @@ anchors and has not been promoted into the reviewed registry.
   rules were preserved. Evidence: `docs/generated/phase3-shortcut-native.json`.
 - Confirmed this Windows test process is not an elevated administrator. This
   establishes the context for these native checks, not a new clean-install pass.
+- Exercised uninstall against the running real test installation: it refused
+  before mutation and retained the pointer and Data. Expanded doctor returned
+  payload/DACL/signature health PASS while correctly reporting unreviewed 4065,
+  occupied ports and maintenance not ready. Evidence:
+  `docs/generated/phase3-busy-uninstall-native.json` and
+  `docs/generated/phase3-closeout-doctor.json`.
 - Added a Windows release checklist and a Windows CI dependency before creation
   of a source-only release draft. No version tag or release was created.
 - Generated compatibility documentation now separates source patchability,
@@ -62,3 +68,11 @@ Both test accounts were logged out before this attempt. Authentication is a
 manual user step; the assistant must not automate sign-in dialogs. No usage
 reset credit is consumed merely to claim test completion. Source-only CI does
 not replace these acceptance gates.
+
+Final local verification: all Go tests and vet pass; all 175 Python tests pass
+without skips after releasing the bridge port; all 10 JavaScript behavior tests
+pass. JavaScript syntax, Python compilation, generated compatibility and release
+metadata checks pass. Both account records remained disconnected; the isolated
+Router was closed normally and its remaining process count was zero. No new
+account was authenticated, no reset credit was consumed and no certificate or
+trust setting was created or changed. The code round is commit `3e60fe5`.
