@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import uuid
@@ -243,7 +244,8 @@ def rollback(layout: Layout, identifier: str | None = None) -> dict:
 
 
 def doctor(layout: Layout) -> dict:
-    report = {"status": "PASS", "current": None, "checks": {}}
+    report = {"status": "PASS", "current": None, "checks": {},
+              "acceptance": {"phase3": "NOT_VERIFIED", "computer_use": "NOT_VERIFIED"}}
     try:
         current = layout.current()
         report["current"] = current
@@ -272,6 +274,25 @@ def doctor(layout: Layout) -> dict:
     except (OSError, RuntimeError, ValueError) as error:
         report.update(status="FAIL", reason=str(error))
     report["running_process_count"] = len(inventory_processes_under_root(layout.builds))
+    # Installed-payload health and compatibility with today's Store source are
+    # independent: an unreviewed Store update must not invalidate a good copy.
+    try:
+        source = locate_desktop_source()
+        identity = source_identity(source)
+        reviewed, reason = reviewed_source_is_patchable(identity, find_reviewed_source(identity))
+        report["official_source"] = {"version": source.package.version,
+                                     "status": "REVIEWED" if reviewed else "SOURCE_REVIEW_REQUIRED",
+                                     "reason": reason}
+    except (OSError, RuntimeError, ValueError) as error:
+        report["official_source"] = {"status": "UNAVAILABLE", "reason": str(error)[:300]}
+    report["local_ports"] = {}
+    for port in (48123, 48124):
+        with socket.socket() as probe:
+            probe.settimeout(0.25)
+            occupied = probe.connect_ex(("127.0.0.1", port)) == 0
+        report["local_ports"][str(port)] = "IN_USE" if occupied else "AVAILABLE"
+    report["maintenance_ready"] = (report["running_process_count"] == 0 and
+                                   all(value == "AVAILABLE" for value in report["local_ports"].values()))
     return report
 
 

@@ -10,14 +10,14 @@ fingerprints are rejected. Every fingerprint field must match.
 Phase 2 final acceptance: [WINDOWS-PHASE2-RECOVERY.md](WINDOWS-PHASE2-RECOVERY.md).
 Phase 3 progress: [WINDOWS-PHASE3.md](WINDOWS-PHASE3.md).
 
-| Package version | Architecture | Review | Renderer |
-| --- | --- | --- | --- |
-| 26.820.7780.0 | X64 | PATCHABLE | windows-26.820 |
-| 26.825.5331.0 | X64 | PATCHABLE | windows-26.825 |
-| 26.825.6671.0 | X64 | PATCHABLE | windows-26.825 |
-| 26.901.4073.0 | X64 | PATCHABLE | windows-26.901 |
-| 26.901.5280.0 | X64 | PATCHABLE | windows-26.901 |
-| 26.901.6511.0 | X64 | PATCHABLE | windows-26.901 |
+| Package version | Architecture | Review | Renderer | Computer Use acceptance | Appshots | Phase 3 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 26.820.7780.0 | X64 | PATCHABLE | windows-26.820 | NOT_RECORDED | NOT_RECORDED | NOT_RECORDED |
+| 26.825.5331.0 | X64 | PATCHABLE | windows-26.825 | NOT_RECORDED | NOT_RECORDED | NOT_RECORDED |
+| 26.825.6671.0 | X64 | PATCHABLE | windows-26.825 | NOT_RECORDED | NOT_RECORDED | NOT_RECORDED |
+| 26.901.4073.0 | X64 | PATCHABLE | windows-26.901 | NOT_RECORDED | NOT_RECORDED | NOT_RECORDED |
+| 26.901.5280.0 | X64 | PATCHABLE | windows-26.901 | NOT_RECORDED | NOT_RECORDED | NOT_RECORDED |
+| 26.901.6511.0 | X64 | PATCHABLE | windows-26.901 | BLOCKED | UPSTREAM_GATED | INCOMPLETE |
 
 ## Derived legacy diagnostic records
 

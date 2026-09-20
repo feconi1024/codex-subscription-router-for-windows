@@ -25,6 +25,7 @@ func New(address, token string, multiplexer *mux.Multiplexer, uiTests bool) *Ser
 	server := &Server{token: token, mux: multiplexer, uiTests: uiTests}
 	router := http.NewServeMux()
 	router.HandleFunc("/v1/health", server.health)
+	router.HandleFunc("/v1/installation-status", server.installationStatus)
 	router.HandleFunc("/v1/accounts", server.accounts)
 	router.HandleFunc("/v1/accounts/", server.accountAction)
 	router.HandleFunc("/v1/thread-account", server.threadAccount)

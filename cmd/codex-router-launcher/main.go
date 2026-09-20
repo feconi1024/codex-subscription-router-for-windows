@@ -124,6 +124,9 @@ func run() int {
 		})
 	}
 	arguments := isolatedArguments(os.Args[1:], userData)
+	if paths.dataRoot != "" {
+		environment = buildEnvironment(environment, map[string]string{"CODEX_MUX_INSTALLATION_ROOT": installationRoot})
+	}
 	command := exec.Command(paths.chatGPT, arguments...)
 	command.Dir = paths.appDir
 	command.Env = environment

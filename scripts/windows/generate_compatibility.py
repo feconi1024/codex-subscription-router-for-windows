@@ -19,10 +19,14 @@ def render() -> str:
             "fingerprints are rejected. Every fingerprint field must match.", "",
             "Phase 2 final acceptance: [WINDOWS-PHASE2-RECOVERY.md](WINDOWS-PHASE2-RECOVERY.md).",
             "Phase 3 progress: [WINDOWS-PHASE3.md](WINDOWS-PHASE3.md).", "",
-            "| Package version | Architecture | Review | Renderer |",
-            "| --- | --- | --- | --- |"]
+            "| Package version | Architecture | Review | Renderer | Computer Use acceptance | Appshots | Phase 3 |",
+            "| --- | --- | --- | --- | --- | --- | --- |"]
     for record in records:
-        rows.append(f"| {record['package_version']} | {record['architecture']} | {record['review_status']} | {record['renderer_variant']} |")
+        capabilities = record.get('capabilities', {})
+        native = capabilities.get('computer_use', {}).get('native_acceptance', 'NOT_RECORDED')
+        appshots = capabilities.get('appshots', {}).get('status', 'NOT_RECORDED')
+        acceptance = record.get('acceptance', {}).get('phase3', 'NOT_RECORDED')
+        rows.append(f"| {record['package_version']} | {record['architecture']} | {record['review_status']} | {record['renderer_variant']} | {native} | {appshots} | {acceptance} |")
     # Retain the historical diagnostic document schema for readers of older
     # tools; these rows are derived, never independently edited or trusted.
     derived = [{key: record[key] for key in ("architecture", "package_name", "package_version", "app_file_version", "app_asar_sha256")} |

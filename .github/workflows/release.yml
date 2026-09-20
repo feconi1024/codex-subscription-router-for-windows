@@ -9,7 +9,34 @@ permissions:
   contents: write
 
 jobs:
+  windows-checks:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: "22.12"
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts
+      - run: go test ./...
+      - run: go vet ./...
+      - run: go build ./cmd/codex-router-launcher
+      - run: go build ./cmd/codex-mux
+      - run: python -m unittest discover -s scripts/tests -p "test_*.py"
+      - run: node --test scripts/tests/desktop_auth.test.cjs
+      - run: npm run check:js
+      - run: python -m scripts.windows.generate_compatibility --check
+      - run: python scripts/check_release.py
+
   source-release:
+    needs: windows-checks
     runs-on: macos-latest
     environment: release
     timeout-minutes: 15

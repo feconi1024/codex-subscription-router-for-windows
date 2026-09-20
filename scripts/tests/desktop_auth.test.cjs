@@ -7,6 +7,19 @@ const root = path.resolve(__dirname, '../..');
 const menu = fs.readFileSync(path.join(root, 'ui/account-menu.js'), 'utf8');
 const bridge = fs.readFileSync(path.join(root, 'ui/ui-test-bridge.cjs'), 'utf8');
 
+test('installation notices distinguish unavailable runtime from unreviewed source', () => {
+  const start = menu.indexOf('function codexMuxInstallationNotices(');
+  const end = menu.indexOf('function CodexMuxAccountMenu(', start);
+  const notices = vm.runInNewContext(menu.slice(start, end) + '\ncodexMuxInstallationNotices');
+  assert.equal(notices(null).length, 0);
+  assert.equal(notices({computerUse: 'VERIFIED', update: 'UNCHANGED'}).length, 0);
+  const result = notices({computerUse: 'UNAVAILABLE', update: 'SOURCE_REVIEW_REQUIRED', reason: 'private'});
+  assert.equal(result.length, 2);
+  assert.match(result[0][1], /previous build/);
+  assert.match(result[1][1], /routing remains available/);
+  assert.ok(!JSON.stringify(result).includes('private'));
+});
+
 function renderer() {
   const root = { children: [{}] };
   return vm.createContext({

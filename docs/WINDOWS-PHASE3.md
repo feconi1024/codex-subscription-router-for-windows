@@ -2,6 +2,10 @@
 
 Status: implementation in progress on `codex/phase3-windows-parity`.
 
+Latest continuation: [2026-09-21 closeout attempt](WINDOWS-PHASE3-CLOSEOUT.md).
+The installed official source has advanced to unreviewed 26.915.4065.0.
+Historical 6511 checks below do not validate that new source or later code edits.
+
 ## Baseline and scope
 
 Phase 2 closed at `2c91a93`. The final acceptance in

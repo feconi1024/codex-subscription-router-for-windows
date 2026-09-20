@@ -1,7 +1,11 @@
 """Failure-oriented tests using synthetic payloads, never official binaries."""
 import json
 import os
+import subprocess
+import sys
+import time
 import tempfile
+from contextlib import ExitStack
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
@@ -56,6 +60,40 @@ class MaintenanceTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "differs"):
             activate(self.layout, "new")
         self.assertEqual((self.layout.root / "current.json").read_bytes(), before)
+
+    def test_terminated_staging_process_releases_lock_and_keeps_old_build(self):
+        self.build('old')
+        self.build('staged')
+        activate(self.layout, 'old')
+        before = (self.layout.root / 'current.json').read_bytes()
+        barrier = self.layout.root / 'staging-ready'
+        worker = '''
+import sys,time
+from pathlib import Path
+from scripts.windows.managed_paths import Layout,maintenance_lock
+from scripts.windows.maintenance import verify_build
+layout=Layout.load(Path(sys.argv[1]))
+with maintenance_lock(layout):
+    verify_build(layout.build('staged'))
+    (layout.root/'staging-ready').write_text('ready')
+    time.sleep(30)
+'''
+        process = subprocess.Popen([sys.executable, '-c', worker, str(self.layout.root)],
+                                   cwd=Path(__file__).resolve().parents[2],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 10
+            while not barrier.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(barrier.exists(), 'staging worker did not reach the pre-activation barrier')
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=10)
+        with maintenance_lock(self.layout):
+            self.assertEqual((self.layout.root / 'current.json').read_bytes(), before)
+            verify_build(self.layout.build('old'))
+        self.assertEqual((self.layout.data / 'private-sentinel').read_text(), 'private-original')
 
     def test_pointer_replace_failure_retains_previous_bytes(self):
         self.build("old")
@@ -208,7 +246,102 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(Layout.load(short_root), installed)
 
 
+class ReconcileScenarios(unittest.TestCase):
+    setUp = MaintenanceTests.setUp
+    build = MaintenanceTests.build
+    def scenario(self, *, reviewed=True, changed=False, newer_source=False, native='VERIFIED', smoke='PASS'):
+        old = self.build('old')
+        token = self.layout.data / 'mux-home/control-token'
+        token.parent.mkdir()
+        token.write_text('synthetic token')
+        identity = {'app_asar_sha256': 'a' * 64, 'version': '1'}
+        atomic_json(old / 'metadata.json', {'real_codex_sha256': 'old-cli', 'tooling_sha256': 'tools',
+                    'control_token_sha256': sha256_file(token), 'computer_use': {'status': 'VERIFIED'}})
+        seal_build(old, identity, {'status': 'PASS'})
+        activate(self.layout, 'old')
+        real = self.layout.root / 'official/codex.exe'
+        real.parent.mkdir()
+        real.write_text('new-cli' if changed else 'old-cli')
+        for name in CODEX_RESOURCE_FILES[1:]:
+            (real.parent / name).write_text(name)
+        real_hash = sha256_file(real)
+        # Match unchanged CLI by actual digest, not a mocked hash function.
+        metadata = json.loads((old / 'metadata.json').read_text())
+        metadata['real_codex_sha256'] = real_hash if not changed else 'different'
+        atomic_json(old / 'metadata.json', metadata)
+        seal_build(old, identity, {'status': 'PASS'})
+        if newer_source:
+            identity = {'app_asar_sha256': 'b' * 64, 'version': '2'}
+        source = SimpleNamespace(package=SimpleNamespace(version='1'), executable=real)
+        def build(source, cli, destination, **kwargs):
+            self.build(destination.name)
+            return {'computer_use': {'status': native}}
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        for name, value in {'locate_desktop_source': source, 'source_identity': identity,
+                            'find_reviewed_source': {'authoritative_shell': 'app/ChatGPT.exe', 'payload_acl_strategy': 'NONE'},
+                            'reviewed_source_is_patchable': (reviewed, 'fixture review'),
+                            'discover_real_codex': (SimpleNamespace(path=real, sha256=real_hash), []),
+                            'tooling_digest': 'tools', 'require_idle': None, '_verify_official': None}.items():
+            stack.enter_context(mock.patch('scripts.windows.maintenance.' + name, return_value=value))
+        builder = stack.enter_context(mock.patch('scripts.patch_app_windows.build_windows_desktop', side_effect=build))
+        stack.enter_context(mock.patch('scripts.windows.startup_smoke.startup_smoke', return_value={'status': smoke}))
+        return builder
+
+    def test_unknown_source_retains_current_without_building(self):
+        builder = self.scenario(reviewed=False)
+        before = (self.layout.root / 'current.json').read_bytes()
+        self.assertEqual(reconcile(self.layout)['status'], 'SOURCE_REVIEW_REQUIRED')
+        builder.assert_not_called()
+        self.assertEqual(before, (self.layout.root / 'current.json').read_bytes())
+
+    def test_same_source_does_not_rebuild(self):
+        builder = self.scenario()
+        self.assertEqual(reconcile(self.layout)['status'], 'UNCHANGED')
+        builder.assert_not_called()
+
+    def test_changed_cli_rebuilds_and_preserves_old_payload_and_state(self):
+        self.scenario(changed=True)
+        result = reconcile(self.layout)
+        self.assertEqual(result['status'], 'UPDATED')
+        self.assertNotEqual(result['current']['build'], 'old')
+        verify_build(self.layout.build('old'))
+        self.assertEqual((self.layout.data / 'private-sentinel').read_text(), 'private-original')
+
+    def test_reviewed_newer_source_rebuilds_and_records_new_identity(self):
+        self.scenario(newer_source=True)
+        result = reconcile(self.layout)
+        self.assertEqual(result['status'], 'UPDATED')
+        manifest = verify_build(self.layout.build(result['current']['build']))
+        self.assertEqual(manifest['source']['version'], '2')
+        self.assertEqual(verify_build(self.layout.build('old'))['source']['version'], '1')
+
+    def test_failed_smoke_never_switches_current(self):
+        self.scenario(changed=True, smoke='FAIL')
+        with self.assertRaisesRegex(RuntimeError, 'startup smoke'):
+            reconcile(self.layout)
+        self.assertEqual(self.layout.current()['build'], 'old')
+        verify_build(self.layout.build('old'))
+
+    def test_optional_native_failure_can_activate_but_required_native_cannot(self):
+        self.scenario(changed=True, native='UNAVAILABLE')
+        with self.assertRaisesRegex(RuntimeError, 'required Computer Use'):
+            reconcile(self.layout, require_native=True)
+        self.assertEqual(self.layout.current()['build'], 'old')
+        self.assertEqual(reconcile(self.layout)['status'], 'UPDATED')
+
+
 class RuntimeTests(unittest.TestCase):
+    def test_protected_copy_preserves_bytes_and_refuses_overwrite(self):
+        from scripts.windows.computer_use import protected_copy
+        with tempfile.TemporaryDirectory() as directory:
+            source, destination = Path(directory) / 'source', Path(directory) / 'nested/copy'
+            source.write_bytes(bytes(range(256)))
+            protected_copy(source, destination)
+            self.assertEqual(source.read_bytes(), destination.read_bytes())
+            with self.assertRaises(FileExistsError):
+                protected_copy(source, destination)
+
     def test_bundled_plugin_cli_lookup_has_complete_matching_runtime(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "official"

@@ -89,9 +89,10 @@
     "payload_acl_strategy": "UNRESOLVED",
     "review_status": "PATCHABLE",
     "capabilities": {
-      "computer_use": {"status": "RUNTIME_DISCOVERED", "native_acceptance": "NOT_RUN"},
+      "desktop": {"startup": "PASS", "authenticated_regression": "INCOMPLETE"},
+      "computer_use": {"status": "RUNTIME_VERIFIED", "runtime_strategy": "OPENAI_STAGED", "native_acceptance": "BLOCKED", "pipe_contract": "NOT_VERIFIED"},
       "appshots": {"status": "UPSTREAM_GATED", "native_acceptance": "NOT_RUN"}
     },
-    "acceptance": {"phase3": "NOT_RUN"}
+    "acceptance": {"phase3": "INCOMPLETE", "evidence": "docs/WINDOWS-PHASE3.md"}
   }
 ]

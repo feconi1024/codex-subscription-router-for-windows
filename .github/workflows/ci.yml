@@ -116,3 +116,6 @@ jobs:
 
       - name: Check generated Windows compatibility documentation
         run: python -m scripts.windows.generate_compatibility --check
+
+      - name: Execute renderer behavior tests
+        run: node --test scripts/tests/desktop_auth.test.cjs

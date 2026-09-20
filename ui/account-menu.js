@@ -462,6 +462,17 @@ function CodexMuxResetAccountSelector({
   });
 }
 
+function codexMuxInstallationNotices(status) {
+  const notices = [];
+  if (status?.update === "SOURCE_REVIEW_REQUIRED") {
+    notices.push(["router-update", "The new official version has not been reviewed yet. Router is using your previous build."]);
+  }
+  if (["UNAVAILABLE", "NOT_REQUESTED"].includes(status?.computerUse)) {
+    notices.push(["router-native", "Computer Use is unavailable in this build. Subscription routing remains available. Run Router doctor for details."]);
+  }
+  return notices;
+}
+
 function CodexMuxAccountMenu() {
   const modalScope = Lo(Q);
   const [accounts, setAccounts] = kXc.useState([]);
@@ -470,7 +481,16 @@ function CodexMuxAccountMenu() {
   const [error, setError] = kXc.useState("");
   const [login, setLogin] = kXc.useState(null);
   const [codeCopied, setCodeCopied] = kXc.useState(false);
+  const [installation, setInstallation] = kXc.useState(null);
   const loginAccountId = login?.accountId || null;
+
+  kXc.useEffect(() => {
+    let active = true;
+    codexMuxRequest("/installation-status")
+      .then(result => { if (active) setInstallation(result); })
+      .catch(() => {});
+    return () => { active = false; };
+  }, []);
 
   kXc.useEffect(() => {
     codexMuxInstallRuntimeDiagnostics();
@@ -641,6 +661,13 @@ function CodexMuxAccountMenu() {
   }
 
   const rows = [];
+  for (const [key, message] of codexMuxInstallationNotices(installation)) {
+    rows.push((0, e7.jsx)("div", {
+      role: "status",
+      className: "max-w-72 px-3 py-2 text-xs text-token-description-foreground",
+      children: message,
+    }, key));
+  }
   rows.push(
     (0, e7.jsx)(
       _H,
